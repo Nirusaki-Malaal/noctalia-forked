@@ -3,7 +3,6 @@
 #include "core/deferred_call.h"
 #include "core/process.h"
 #include "i18n/i18n.h"
-#include "net/url_open.h"
 #include "util/string_utils.h"
 
 #include <algorithm>
@@ -128,7 +127,10 @@ std::vector<LauncherResult> BalooProvider::query(std::string_view text) const {
 }
 
 bool BalooProvider::activate(const LauncherResult& result) {
-  return net::openInBrowser(result.id);
+  if (result.id.empty()) {
+    return false;
+  }
+  return process::runAsync(std::vector<std::string>{"xdg-open", result.id});
 }
 
 void BalooProvider::startSearch(const std::string& queryText) const {
@@ -150,29 +152,21 @@ void BalooProvider::startSearch(const std::string& queryText) const {
       std::string line;
       int index = 0;
       while (std::getline(ss, line) && index < 50) {
-        if (line.empty()) {
+        // Trim trailing whitespace/newlines
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+          line.pop_back();
+        }
+
+        if (line.empty() || line.front() != '/') {
           continue;
         }
 
-        auto spaceIdx = line.find(' ');
-        if (spaceIdx == std::string::npos) {
-          continue;
-        }
-
-        std::string pathStr = line.substr(spaceIdx + 1);
-        while (!pathStr.empty() && (pathStr.back() == '\r' || pathStr.back() == '\n' || pathStr.back() == ' ')) {
-          pathStr.pop_back();
-        }
-
-        if (pathStr.empty()) {
-          continue;
-        }
-
-        std::filesystem::path path(pathStr);
+        std::filesystem::path path(line);
         LauncherResult r;
-        r.id = pathStr;
+        r.id = line;
         r.title = path.filename().string();
         r.subtitle = path.parent_path().string();
+
         r.category = "Files";
         r.iconName = std::string(iconForPath(path));
         r.score = 100.0 - (index * 0.5);
