@@ -7,6 +7,8 @@ namespace session_action {
         || action == "logout"
         || action == "suspend"
         || action == "lock_and_suspend"
+        || action == "hibernate"
+        || action == "lock_and_hibernate"
         || action == "reboot"
         || action == "shutdown"
         || action == "command";
@@ -24,6 +26,12 @@ namespace session_action {
     }
     if (action == "lock_and_suspend") {
       return "session.actions.lock-and-suspend";
+    }
+    if (action == "hibernate") {
+      return "session.actions.hibernate";
+    }
+    if (action == "lock_and_hibernate") {
+      return "session.actions.lock-and-hibernate";
     }
     if (action == "reboot") {
       return "session.actions.reboot";
@@ -46,6 +54,12 @@ namespace session_action {
     }
     if (action == "lock_and_suspend") {
       return "suspend";
+    }
+    if (action == "hibernate") {
+      return "hibernate";
+    }
+    if (action == "lock_and_hibernate") {
+      return "hibernate";
     }
     if (action == "reboot") {
       return "reboot";

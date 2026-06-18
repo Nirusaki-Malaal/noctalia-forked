@@ -203,6 +203,8 @@ namespace settings {
         {"logout", i18n::tr("session.actions.logout"), {}},
         {"suspend", i18n::tr("session.actions.suspend"), {}},
         {"lock_and_suspend", i18n::tr("session.actions.lock-and-suspend"), {}},
+        {"hibernate", i18n::tr("session.actions.hibernate"), {}},
+        {"lock_and_hibernate", i18n::tr("session.actions.lock-and-hibernate"), {}},
         {"reboot", i18n::tr("session.actions.reboot"), {}},
         {"shutdown", i18n::tr("session.actions.shutdown"), {}},
         {"command", i18n::tr("session.actions.custom"), {}},

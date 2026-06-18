@@ -106,12 +106,16 @@ std::vector<SessionPanelActionConfig> defaultSessionPanelActions() {
           KeyChord{XKB_KEY_3, 0}
       },
       SessionPanelActionConfig{
-          "reboot", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Default,
+          "lock_and_hibernate", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Default,
           KeyChord{XKB_KEY_4, 0}
       },
       SessionPanelActionConfig{
-          "shutdown", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Destructive,
+          "reboot", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Default,
           KeyChord{XKB_KEY_5, 0}
+      },
+      SessionPanelActionConfig{
+          "shutdown", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Destructive,
+          KeyChord{XKB_KEY_6, 0}
       },
   };
 }

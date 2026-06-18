@@ -1681,6 +1681,7 @@ namespace noctalia::config::schema {
       using Power = ShellSessionConfig::ShellSessionPowerConfig;
       static const Schema<Power> s = {
           optionalTrimmedStringField(&Power::suspend, "suspend"),
+          optionalTrimmedStringField(&Power::hibernate, "hibernate"),
           optionalTrimmedStringField(&Power::reboot, "reboot"),
           optionalTrimmedStringField(&Power::shutdown, "shutdown"),
       };

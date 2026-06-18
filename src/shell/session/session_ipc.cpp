@@ -30,7 +30,7 @@ void registerSessionIpc(IpcService& ipc, SessionActionRunner& runner, LockScreen
   const auto dispatch = [&runner, &lockScreen, &config](const std::string& args) -> std::string {
     const auto parts = noctalia::ipc::splitWords(args);
     if (parts.empty()) {
-      return "error: session requires <lock|suspend|lock-and-suspend|logout|reboot|shutdown>\n";
+      return "error: session requires <lock|suspend|lock-and-suspend|hibernate|lock-and-hibernate|logout|reboot|shutdown>\n";
     }
 
     const std::string& action = parts[0];
@@ -61,6 +61,24 @@ void registerSessionIpc(IpcService& ipc, SessionActionRunner& runner, LockScreen
       }
       return "error: failed to lock and suspend\n";
     }
+    if (action == "hibernate") {
+      if (runner.requestHibernateDetached()) {
+        return "ok\n";
+      }
+      return "error: failed to hibernate\n";
+    }
+    if (action == "lock-and-hibernate") {
+      if (!config.isLockScreenEnabled()) {
+        if (runner.requestHibernateDetached()) {
+          return "ok\n";
+        }
+        return "error: failed to hibernate\n";
+      }
+      if (runner.lockThenHibernateDetached()) {
+        return "ok\n";
+      }
+      return "error: failed to lock and hibernate\n";
+    }
     if (action == "logout" || action == "reboot" || action == "shutdown") {
       runner.invoke(sessionActionConfig(action));
       return "ok\n";
@@ -70,7 +88,7 @@ void registerSessionIpc(IpcService& ipc, SessionActionRunner& runner, LockScreen
   };
 
   ipc.registerHandler(
-      "session", dispatch, "session <lock|suspend|lock-and-suspend|logout|reboot|shutdown>",
+      "session", dispatch, "session <lock|suspend|lock-and-suspend|hibernate|lock-and-hibernate|logout|reboot|shutdown>",
       "Run a built-in session action"
   );
 }

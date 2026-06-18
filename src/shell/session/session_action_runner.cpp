@@ -85,6 +85,22 @@ namespace {
     return variants;
   }
 
+  [[nodiscard]] const std::vector<std::vector<std::string>>& hibernateCommandVariants() {
+    static const std::vector<std::vector<std::string>> variants = {
+        {"systemctl", "hibernate"},
+        {"loginctl", "hibernate"},
+        {"pm-hibernate"},
+        {"hibernate"},
+        {"pkexec", "pm-hibernate"},
+        {"run0", "pm-hibernate"},
+        {"pkexec", "sh", "-c", "echo disk > /sys/power/state"},
+        {"run0", "sh", "-c", "echo disk > /sys/power/state"},
+        {"sudo", "-n", "pm-hibernate"},
+        {"sudo", "-n", "sh", "-c", "echo disk > /sys/power/state"},
+    };
+    return variants;
+  }
+
   [[nodiscard]] const std::vector<std::vector<std::string>>& rebootCommandVariants() {
     static const std::vector<std::vector<std::string>> variants = {
         {"systemctl", "reboot"}, {"loginctl", "reboot"}, {"reboot"},         {"/sbin/reboot"},
@@ -229,9 +245,11 @@ void SessionActionRunner::setHooks(SessionActionHooks hooks) { m_hooks = std::mo
 void SessionActionRunner::setPowerConfig(const ShellSessionConfig::ShellSessionPowerConfig& power) {
   std::scoped_lock lock(m_powerMutex);
   m_suspendCommandOverride = power.suspend;
+  m_hibernateCommandOverride = power.hibernate;
   m_rebootCommandOverride = power.reboot;
   m_shutdownCommandOverride = power.shutdown;
   m_cachedSuspendAutoStartIdx.reset();
+  m_cachedHibernateAutoStartIdx.reset();
   m_cachedRebootAutoStartIdx.reset();
   m_cachedShutdownAutoStartIdx.reset();
 }
@@ -257,6 +275,16 @@ void SessionActionRunner::invoke(const SessionPanelActionConfig& cfg) const {
   }
   if (cfg.action == "lock_and_suspend") {
     if (!lockThenSuspendDetached()) {
+      notify::error("Noctalia", i18n::tr("session.errors.lock-title"), i18n::tr("session.errors.lock-body"));
+    }
+    return;
+  }
+  if (cfg.action == "hibernate") {
+    runPowerAction({}, [this]() { return hibernateBlocking(); }, "hibernate");
+    return;
+  }
+  if (cfg.action == "lock_and_hibernate") {
+    if (!lockThenHibernateDetached()) {
       notify::error("Noctalia", i18n::tr("session.errors.lock-title"), i18n::tr("session.errors.lock-body"));
     }
     return;
@@ -311,6 +339,29 @@ bool SessionActionRunner::suspendBlocking() const {
   std::scoped_lock lock(m_powerMutex);
   return runPowerActionResolved(
       "suspend", m_suspendCommandOverride, suspendCommandVariants(), m_cachedSuspendAutoStartIdx,
+      PowerLaunchMode::Blocking
+  );
+}
+
+bool SessionActionRunner::requestHibernateDetached() const {
+  logActionContext("hibernate");
+  std::scoped_lock lock(m_powerMutex);
+  return runPowerActionResolved(
+      "hibernate", m_hibernateCommandOverride, hibernateCommandVariants(), m_cachedHibernateAutoStartIdx,
+      PowerLaunchMode::Detached
+  );
+}
+
+bool SessionActionRunner::lockThenHibernateDetached() const {
+  m_lockScreen.runAfterSessionLocked([this]() { (void)requestHibernateDetached(); });
+  return true;
+}
+
+bool SessionActionRunner::hibernateBlocking() const {
+  logActionContext("hibernate");
+  std::scoped_lock lock(m_powerMutex);
+  return runPowerActionResolved(
+      "hibernate", m_hibernateCommandOverride, hibernateCommandVariants(), m_cachedHibernateAutoStartIdx,
       PowerLaunchMode::Blocking
   );
 }

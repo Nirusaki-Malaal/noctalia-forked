@@ -185,6 +185,7 @@ struct ShellSessionConfig {
     // Shell strings run with `/bin/sh -lc` (shell=True).
     // When unset, Noctalia tries a prioritized backend list (systemd/logind/privileged helpers).
     std::optional<std::string> suspend;
+    std::optional<std::string> hibernate;
     std::optional<std::string> reboot;
     std::optional<std::string> shutdown;
 

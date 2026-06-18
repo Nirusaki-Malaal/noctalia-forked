@@ -25,10 +25,13 @@ public:
   [[nodiscard]] bool lock() const;
   [[nodiscard]] bool requestSuspendDetached() const;
   [[nodiscard]] bool lockThenSuspendDetached() const;
+  [[nodiscard]] bool requestHibernateDetached() const;
+  [[nodiscard]] bool lockThenHibernateDetached() const;
 
 private:
   [[nodiscard]] std::function<bool()> hookFor(std::string_view action) const;
   [[nodiscard]] bool suspendBlocking() const;
+  [[nodiscard]] bool hibernateBlocking() const;
   [[nodiscard]] bool rebootBlocking() const;
   [[nodiscard]] bool shutdownBlocking() const;
 
@@ -40,11 +43,13 @@ private:
   // (panel/IPC/lock-and-suspend), so keep it internally synchronized.
   mutable std::mutex m_powerMutex;
   mutable std::optional<std::string> m_suspendCommandOverride;
+  mutable std::optional<std::string> m_hibernateCommandOverride;
   mutable std::optional<std::string> m_rebootCommandOverride;
   mutable std::optional<std::string> m_shutdownCommandOverride;
 
   // Auto-detection cache: where to start scanning fallback variants next time.
   mutable std::optional<std::size_t> m_cachedSuspendAutoStartIdx;
+  mutable std::optional<std::size_t> m_cachedHibernateAutoStartIdx;
   mutable std::optional<std::size_t> m_cachedRebootAutoStartIdx;
   mutable std::optional<std::size_t> m_cachedShutdownAutoStartIdx;
 };
