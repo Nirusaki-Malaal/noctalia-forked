@@ -515,6 +515,9 @@
       "applications": {
         "title": "Applications"
       },
+      "baloo": {
+        "title": "Files"
+      },
       "calculator": {
         "title": "Calculator"
       },
@@ -665,8 +668,6 @@
       "custom": "Custom",
       "lock": "Lock",
       "lock-and-suspend": "Lock & Suspend",
-      "hibernate": "Hibernate",
-      "lock-and-hibernate": "Lock & Hibernate",
       "logout": "Log Out",
       "reboot": "Reboot",
       "shutdown": "Shut Down",

@@ -15,6 +15,7 @@
 #include "i18n/i18n_service.h"
 #include "ipc/ipc_arg_parse.h"
 #include "launcher/app_provider.h"
+#include "launcher/baloo_provider.h"
 #include "launcher/emoji_provider.h"
 #include "launcher/math_provider.h"
 #include "launcher/plugin_launcher_provider.h"
@@ -1471,6 +1472,7 @@ void Application::initUi() {
     launcherPanel->addProvider(std::make_unique<SessionProvider>(&m_configService, &m_sessionActionRunner));
     launcherPanel->addProvider(std::make_unique<MathProvider>(&m_clipboardService, &m_configService, &m_httpClient));
     launcherPanel->addProvider(std::make_unique<EmojiProvider>(&m_clipboardService));
+    launcherPanel->addProvider(std::make_unique<BalooProvider>());
     m_launcherPanel = launcherPanel.get();
     m_panelManager.registerPanel("launcher", std::move(launcherPanel));
   }

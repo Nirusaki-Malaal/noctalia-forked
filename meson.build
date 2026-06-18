@@ -430,6 +430,7 @@ _noctalia_sources = files(
   'src/ipc/ipc_client.cpp',
   'src/ipc/ipc_service.cpp',
   'src/launcher/app_provider.cpp',
+  'src/launcher/baloo_provider.cpp',
   'src/launcher/emoji_provider.cpp',
   'src/launcher/math_provider.cpp',
   'src/launcher/plugin_launcher_provider.cpp',
