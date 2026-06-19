@@ -1,5 +1,7 @@
 #include "shell/wallpaper/wallpaper.h"
 
+#include "core/deferred_call.h"
+#include <cstring>
 #include "config/config_service.h"
 #include "core/log.h"
 #include "core/random.h"
@@ -1041,9 +1043,53 @@ void Wallpaper::loadWallpaper(WallpaperInstance& instance, const std::string& pa
   TextureHandle newTex;
   Color newColor = rgba(0.0f, 0.0f, 0.0f, 1.0f);
   WallpaperSourceKind newSourceKind = WallpaperSourceKind::Image;
-  if (parseColorWallpaperPath(path, newColor)) {
+  
+  bool isVideo = false;
+  std::string lowerPath = path;
+  for (char& c : lowerPath) c = static_cast<char>(std::tolower(c));
+  if (lowerPath.length() >= 4) {
+      std::string ext = lowerPath.substr(lowerPath.length() - 4);
+      if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mov") isVideo = true;
+  }
+  if (lowerPath.length() >= 5 && lowerPath.substr(lowerPath.length() - 5) == ".webm") isVideo = true;
+
+  if (isVideo) {
+    if (!instance.videoPlayer) {
+      instance.videoPlayer = std::make_unique<VideoPlayer>();
+    }
+    instance.videoPlayer->setFrameCallback([this, &instance](const uint8_t* rgba, int w, int h) {
+      {
+        std::scoped_lock lock(instance.videoMutex);
+        const size_t bytes = static_cast<size_t>(w * h * 4);
+        if (instance.videoFrame.size() != bytes) {
+          instance.videoFrame.resize(bytes);
+        }
+        std::memcpy(instance.videoFrame.data(), rgba, bytes);
+        instance.videoW = w;
+        instance.videoH = h;
+        instance.newVideoFrame = true;
+      }
+      DeferredCall::callLater([this, &instance]() {
+        if (instance.surface != nullptr) {
+            instance.surface->requestRedraw();
+        }
+      });
+    });
+    if (!instance.videoPlayer->load(path)) {
+      kLog.warn("failed to load video {}", path);
+      return;
+    }
+    instance.videoPlayer->play();
+    newTex = instance.videoTex; // Will be 0 until first frame, which is fine
+  } else if (parseColorWallpaperPath(path, newColor)) {
     newSourceKind = WallpaperSourceKind::Color;
+    if (instance.videoPlayer) {
+      instance.videoPlayer->stop();
+    }
   } else {
+    if (instance.videoPlayer) {
+      instance.videoPlayer->stop();
+    }
     newTex = acquireTexture(path);
     if (newTex.id == 0) {
       kLog.warn("failed to load {}", path);
@@ -1141,6 +1187,49 @@ void Wallpaper::updateRendererState(WallpaperInstance& instance) {
   auto* wallpaperNode = instance.wallpaperNode;
   if (wallpaperNode == nullptr) {
     return;
+  }
+  
+  if (instance.videoPlayer) {
+    std::scoped_lock lock(instance.videoMutex);
+    if (instance.newVideoFrame && !instance.videoFrame.empty() && instance.videoW > 0 && instance.videoH > 0) {
+      if (m_renderContext) {
+        m_renderContext->makeCurrent(instance.surface->renderTarget());
+        if (instance.videoTex.id == 0 || instance.videoW != instance.videoTex.width || instance.videoH != instance.videoTex.height) {
+          if (instance.videoTex.id != 0) {
+            m_renderContext->backend().textureManager().unload(instance.videoTex);
+          }
+          instance.videoTex = m_renderContext->backend().textureManager().loadFromRgba(instance.videoFrame.data(), instance.videoW, instance.videoH);
+        } else {
+          m_renderContext->backend().textureManager().updateSubImage(instance.videoTex, instance.videoFrame.data(), 0, 0, instance.videoW, instance.videoH, TextureDataFormat::Rgba);
+        }
+      }
+      
+      bool isPendingVideo = false;
+      std::string lowerPending = instance.pendingPath;
+      for (char& c : lowerPending) c = static_cast<char>(std::tolower(c));
+      if (lowerPending.length() >= 4) {
+        std::string ext = lowerPending.substr(lowerPending.length() - 4);
+        if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mov") isPendingVideo = true;
+      }
+      if (lowerPending.length() >= 5 && lowerPending.substr(lowerPending.length() - 5) == ".webm") isPendingVideo = true;
+
+      bool isCurrentVideo = false;
+      std::string lowerCurrent = instance.currentPath;
+      for (char& c : lowerCurrent) c = static_cast<char>(std::tolower(c));
+      if (lowerCurrent.length() >= 4) {
+        std::string ext = lowerCurrent.substr(lowerCurrent.length() - 4);
+        if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mov") isCurrentVideo = true;
+      }
+      if (lowerCurrent.length() >= 5 && lowerCurrent.substr(lowerCurrent.length() - 5) == ".webm") isCurrentVideo = true;
+
+      if (isPendingVideo && !instance.pendingPath.empty()) {
+        instance.nextTexture = instance.videoTex;
+      } else if (isCurrentVideo) {
+        instance.currentTexture = instance.videoTex;
+      }
+      
+      instance.newVideoFrame = false;
+    }
   }
 
   const auto& wpConfig = m_config->config().wallpaper;

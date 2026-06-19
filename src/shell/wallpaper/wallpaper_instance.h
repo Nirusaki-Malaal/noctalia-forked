@@ -8,6 +8,10 @@
 #include "render/scene/node.h"
 #include "render/scene/wallpaper_node.h"
 #include "wayland/layer_surface.h"
+#include "shell/backdrop/video_player.h"
+
+#include <mutex>
+#include <vector>
 
 #include <cstdint>
 #include <memory>
@@ -45,4 +49,12 @@ struct WallpaperInstance {
   AnimationManager::Id transitionAnimId = 0;
   WallpaperTransition activeTransition = WallpaperTransition::Fade;
   TransitionParams transitionParams;
+  
+  std::unique_ptr<VideoPlayer> videoPlayer;
+  std::mutex videoMutex;
+  std::vector<uint8_t> videoFrame;
+  int videoW = 0;
+  int videoH = 0;
+  bool newVideoFrame = false;
+  TextureHandle videoTex;
 };
