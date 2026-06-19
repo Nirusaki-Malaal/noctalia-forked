@@ -265,6 +265,28 @@ void Backdrop::createInstance(const WaylandOutput& output) {
 }
 
 void Backdrop::loadWallpaper(BackdropInstance& inst, const std::string& path) {
+  inst.currentPath = path;
+  std::string lowerPath = path;
+  for (char& c : lowerPath) c = static_cast<char>(std::tolower(c));
+  bool isVideo = false;
+  if (lowerPath.length() >= 4) {
+      std::string ext = lowerPath.substr(lowerPath.length() - 4);
+      if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mov") isVideo = true;
+  }
+  if (lowerPath.length() >= 5 && lowerPath.substr(lowerPath.length() - 5) == ".webm") isVideo = true;
+
+  if (isVideo) {
+    if (inst.surface != nullptr) {
+      inst.surface->playVideo(path);
+      updateRendererState(inst);
+    }
+    return;
+  }
+
+  if (inst.surface != nullptr) {
+    inst.surface->stopVideo();
+  }
+
   auto tex = m_textureCache->acquire(path);
   if (tex.id == 0 && !m_textureCache->shared() && inst.surface != nullptr) {
     auto* renderer = inst.surface->wallpaperRenderer();
@@ -310,6 +332,9 @@ void Backdrop::updateRendererState(BackdropInstance& inst) {
 }
 
 void Backdrop::releaseInstanceTexture(BackdropInstance& inst, bool clearPath) {
+  if (inst.surface != nullptr) {
+    inst.surface->stopVideo();
+  }
   if (inst.currentTexture.id != 0) {
     if (m_textureCache->shared()) {
       m_textureCache->release(inst.currentTexture, inst.currentPath);

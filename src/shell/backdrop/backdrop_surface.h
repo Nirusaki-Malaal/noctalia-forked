@@ -4,8 +4,12 @@
 #include "render/core/texture_handle.h"
 #include "render/wallpaper_renderer.h"
 #include "wayland/layer_surface.h"
+#include "shell/backdrop/video_player.h"
 
 #include <cstdint>
+#include <mutex>
+#include <vector>
+#include <memory>
 
 class GlSharedContext;
 
@@ -19,6 +23,8 @@ public:
   void setTintIntensity(float v) noexcept;
   void setTintColor(float r, float g, float b) noexcept;
   void setWallpaperState(TextureId tex, float imgW, float imgH, WallpaperFillMode fillMode);
+  void playVideo(const std::string& path);
+  void stopVideo();
   void onGpuResourcesInvalidated();
 
   [[nodiscard]] WallpaperRenderer* wallpaperRenderer() noexcept { return &m_wallpaperRenderer; }
@@ -31,6 +37,13 @@ protected:
 
 private:
   WallpaperRenderer m_wallpaperRenderer;
+  std::unique_ptr<VideoPlayer> m_videoPlayer;
+  std::vector<uint8_t> m_videoFrame;
+  std::mutex m_videoMutex;
+  bool m_newVideoFrame = false;
+  int m_videoW = 0;
+  int m_videoH = 0;
+  TextureHandle m_videoTex;
   CachedLayer m_layer;
 
   std::uint32_t m_bufW = 0;

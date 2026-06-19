@@ -74,6 +74,10 @@ libxml2_dep         = dependency('libxml-2.0')
 pam_dep             = cc.find_library('pam')
 dl_dep              = cpp.find_library('dl', required: false)
 
+gst_dep             = dependency('gstreamer-1.0')
+gst_app_dep         = dependency('gstreamer-app-1.0')
+gst_video_dep       = dependency('gstreamer-video-1.0')
+
 jemalloc_option = get_option('jemalloc')
 is_glibc = cpp.get_define('__GLIBC__', prefix: '#include <features.h>') != ''
 jemalloc_deps = []
@@ -621,6 +625,7 @@ _noctalia_sources = files(
   'src/shell/tray/tray_menu.cpp',
   'src/shell/backdrop/backdrop.cpp',
   'src/shell/backdrop/backdrop_surface.cpp',
+  'src/shell/backdrop/video_player.cpp',
   'src/shell/overview/overview_launcher_capture.cpp',
   'src/system/app_identity.cpp',
   'src/shell/wallpaper/wallpaper_paths.cpp',
@@ -872,6 +877,9 @@ noctalia_exe = executable('noctalia',
     stb_dep,
     libwebp_dep,
     luau_dep,
+    gst_dep,
+    gst_app_dep,
+    gst_video_dep,
   ] + jemalloc_deps + (dl_dep.found() ? [dl_dep] : []),
   include_directories: _noctalia_inc,
   cpp_args: [

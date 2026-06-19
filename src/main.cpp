@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <string>
 #include <unistd.h>
+#include <gst/gst.h>
 
 #ifdef __GLIBC__
 #ifdef NOCTALIA_USE_JEMALLOC
@@ -257,6 +258,8 @@ int main(int argc, char* argv[]) {
 
   std::setlocale(LC_ALL, "");
   std::setlocale(LC_NUMERIC, "C");
+  
+  gst_init(nullptr, nullptr);
 
   const bool isDaemonChild = takeDaemonPipeFromEnv();
   bool shouldDaemonize = false;

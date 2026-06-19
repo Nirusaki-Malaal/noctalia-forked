@@ -24,7 +24,8 @@ namespace {
 
   bool hasImageExtension(const std::filesystem::path& path) {
     const auto ext = StringUtils::toLower(path.extension().string());
-    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".bmp" || ext == ".gif";
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".bmp" || ext == ".gif" ||
+           ext == ".mp4" || ext == ".webm" || ext == ".mkv" || ext == ".avi" || ext == ".mov";
   }
 
   std::vector<WallpaperCandidate> collectWallpapers(const std::filesystem::path& directory) {

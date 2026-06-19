@@ -1,10 +1,15 @@
 #include "shell/backdrop/backdrop_surface.h"
 
 #include "render/backend/render_backend.h"
+#include "render/core/texture_manager.h"
 #include "wayland/wayland_connection.h"
+#include "core/deferred_call.h"
 
 #include <stdexcept>
+#include <cstring>
 #include <wayland-client.h>
+#include <GLES2/gl2.h>
+
 
 BackdropSurface::~BackdropSurface() {
   m_wallpaperRenderer.makeCurrent();
@@ -52,6 +57,28 @@ void BackdropSurface::render() {
   }
 
   m_wallpaperRenderer.makeCurrent();
+
+  {
+    std::scoped_lock lock(m_videoMutex);
+    if (m_newVideoFrame && !m_videoFrame.empty() && m_videoW > 0 && m_videoH > 0) {
+      if (!m_videoTex.valid() || m_videoW != m_videoTex.width || m_videoH != m_videoTex.height) {
+        if (m_videoTex.valid()) {
+          m_wallpaperRenderer.backend()->textureManager().unload(m_videoTex);
+        }
+        m_videoTex = m_wallpaperRenderer.backend()->textureManager().loadFromRgba(m_videoFrame.data(), m_videoW, m_videoH);
+      } else {
+        m_wallpaperRenderer.backend()->textureManager().updateSubImage(m_videoTex, m_videoFrame.data(), 0, 0, m_videoW, m_videoH, TextureDataFormat::Rgba);
+      }
+      m_newVideoFrame = false;
+      m_layer.invalidate();
+      
+      // Keep it as the active wallpaper state
+      m_wallpaperRenderer.setTransitionState(
+          m_videoTex.id, {}, static_cast<float>(m_videoW), static_cast<float>(m_videoH), 0.0f, 0.0f, 0.0f, WallpaperTransition::Fade, WallpaperFillMode::Crop, TransitionParams{}
+      );
+    }
+  }
+
   m_layer.resize(*m_wallpaperRenderer.backend(), m_bufW, m_bufH);
 
   if (!m_layer.valid()) {
@@ -113,6 +140,42 @@ void BackdropSurface::setWallpaperState(TextureId tex, float imgW, float imgH, W
       tex, {}, imgW, imgH, 0.0f, 0.0f, 0.0f, WallpaperTransition::Fade, fillMode, TransitionParams{}
   );
   m_layer.invalidate();
+}
+
+void BackdropSurface::playVideo(const std::string& path) {
+  if (!m_videoPlayer) {
+    m_videoPlayer = std::make_unique<VideoPlayer>();
+  }
+  m_videoPlayer->setFrameCallback([this](const uint8_t* rgba, int w, int h) {
+    {
+      std::scoped_lock lock(m_videoMutex);
+      const size_t bytes = static_cast<size_t>(w * h * 4);
+      if (m_videoFrame.size() != bytes) {
+        m_videoFrame.resize(bytes);
+      }
+      std::memcpy(m_videoFrame.data(), rgba, bytes);
+      m_videoW = w;
+      m_videoH = h;
+      m_newVideoFrame = true;
+    }
+    DeferredCall::callLater([this]() {
+      requestRedraw();
+    });
+  });
+  m_videoPlayer->load(path);
+  m_videoPlayer->play();
+}
+
+void BackdropSurface::stopVideo() {
+  if (m_videoPlayer) {
+    m_videoPlayer->stop();
+    m_videoPlayer.reset();
+  }
+  if (m_videoTex.valid()) {
+    m_wallpaperRenderer.makeCurrent();
+    m_wallpaperRenderer.backend()->textureManager().unload(m_videoTex);
+    m_videoTex = TextureHandle{};
+  }
 }
 
 void BackdropSurface::onGpuResourcesInvalidated() {
