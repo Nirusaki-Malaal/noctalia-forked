@@ -15,7 +15,8 @@ namespace {
     for (char& c : ext) {
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".bmp" || ext == ".gif";
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".bmp" || ext == ".gif" ||
+           ext == ".mp4" || ext == ".webm" || ext == ".mkv" || ext == ".avi" || ext == ".mov";
   }
 
   void collectFlat(const std::filesystem::path& dir, std::vector<WallpaperEntry>& out) {

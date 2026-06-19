@@ -64,7 +64,8 @@ namespace {
 
   bool hasImageExtension(const std::filesystem::path& path) {
     const std::string ext = StringUtils::toLower(path.extension().string());
-    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".bmp" || ext == ".gif";
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".bmp" || ext == ".gif" ||
+           ext == ".mp4" || ext == ".webm" || ext == ".mkv" || ext == ".avi" || ext == ".mov";
   }
 
   [[nodiscard]] std::optional<std::string>
