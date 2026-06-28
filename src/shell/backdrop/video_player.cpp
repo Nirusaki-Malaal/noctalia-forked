@@ -1,4 +1,28 @@
 #include "video_player.h"
+#include "core/log.h"
+#include <sstream>
+#include <iomanip>
+#include <cctype>
+
+namespace {
+  constexpr Logger kLog("video-player");
+
+  std::string urlEncodePath(const std::string& path) {
+      std::ostringstream escaped;
+      escaped.fill('0');
+      escaped << std::hex;
+
+      for (char c : path) {
+          if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/' || c == ':') {
+              escaped << c;
+          } else {
+              escaped << '%' << std::setw(2) << int(static_cast<unsigned char>(c));
+          }
+      }
+
+      return escaped.str();
+  }
+}
 
 VideoPlayer::VideoPlayer() {}
 
@@ -9,19 +33,23 @@ VideoPlayer::~VideoPlayer() {
 bool VideoPlayer::load(const std::string& path) {
     stop();
 
-    std::string uri = "file://" + path;
+    std::string uri = "file://" + urlEncodePath(path);
     // We want RGBA to load easily into OpenGL textures
     std::string pipeline_str = "uridecodebin uri=" + uri + " ! videoconvert ! video/x-raw,format=RGBA ! appsink name=sink sync=true";
+
+    kLog.info("loading video pipeline: {}", pipeline_str);
 
     GError* err = nullptr;
     m_pipeline = gst_parse_launch(pipeline_str.c_str(), &err);
     if (err != nullptr) {
+        kLog.error("gst_parse_launch failed: {}", err->message);
         g_error_free(err);
         return false;
     }
 
     m_appsink = gst_bin_get_by_name(GST_BIN(m_pipeline), "sink");
     if (!m_appsink) {
+        kLog.error("failed to find appsink named 'sink' in pipeline");
         stop();
         return false;
     }
@@ -35,12 +63,14 @@ bool VideoPlayer::load(const std::string& path) {
 
 void VideoPlayer::play() {
     if (m_pipeline) {
+        kLog.info("starting playback");
         gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
     }
 }
 
 void VideoPlayer::stop() {
     if (m_pipeline) {
+        kLog.info("stopping playback");
         gst_element_set_state(m_pipeline, GST_STATE_NULL);
         gst_object_unref(m_pipeline);
         m_pipeline = nullptr;
@@ -60,11 +90,13 @@ GstFlowReturn VideoPlayer::onNewSample(GstAppSink* sink, gpointer data) {
     auto* self = static_cast<VideoPlayer*>(data);
     GstSample* sample = gst_app_sink_pull_sample(sink);
     if (!sample) {
+        kLog.error("failed to pull sample from appsink");
         return GST_FLOW_ERROR;
     }
 
     GstCaps* caps = gst_sample_get_caps(sample);
     if (!caps) {
+        kLog.error("failed to get caps from sample");
         gst_sample_unref(sample);
         return GST_FLOW_ERROR;
     }
@@ -72,8 +104,14 @@ GstFlowReturn VideoPlayer::onNewSample(GstAppSink* sink, gpointer data) {
     GstStructure* s = gst_caps_get_structure(caps, 0);
     int w = 0, h = 0;
     if (!gst_structure_get_int(s, "width", &w) || !gst_structure_get_int(s, "height", &h)) {
+        kLog.error("failed to get width/height from caps structure");
         gst_sample_unref(sample);
         return GST_FLOW_ERROR;
+    }
+
+    static int frame_count = 0;
+    if (frame_count++ % 100 == 0) {
+        kLog.info("new sample received: {}x{}", w, h);
     }
 
     GstBuffer* buffer = gst_sample_get_buffer(sample);
@@ -83,6 +121,8 @@ GstFlowReturn VideoPlayer::onNewSample(GstAppSink* sink, gpointer data) {
             self->m_callback(map.data, w, h);
         }
         gst_buffer_unmap(buffer, &map);
+    } else {
+        kLog.error("failed to map buffer info");
     }
 
     gst_sample_unref(sample);
