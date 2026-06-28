@@ -19,6 +19,11 @@
 #include <utility>
 #include <vector>
 #include <webp/encode.h>
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <sstream>
+#include <iomanip>
+#include <cctype>
 
 namespace {
 
@@ -81,6 +86,86 @@ namespace {
         + '\n'
         + std::string(kThumbnailCacheVersion);
     return thumbnailCacheDir() / (hex64(fnv1a64(key)) + ".webp");
+  }
+
+  std::string urlEncodePath(const std::string& path) {
+      std::ostringstream escaped;
+      escaped.fill('0');
+      escaped << std::hex;
+
+      for (char c : path) {
+          if (std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/' || c == ':') {
+              escaped << c;
+          } else {
+              escaped << '%' << std::setw(2) << int(static_cast<unsigned char>(c));
+          }
+      }
+
+      return escaped.str();
+  }
+
+  bool isVideoFile(const std::string& path) {
+      std::string lower = path;
+      for (char& c : lower) c = static_cast<char>(std::tolower(c));
+      if (lower.length() >= 4) {
+          std::string ext = lower.substr(lower.length() - 4);
+          if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" || ext == ".mov") {
+              return true;
+          }
+      }
+      if (lower.length() >= 5 && lower.substr(lower.length() - 5) == ".webm") {
+          return true;
+      }
+      return false;
+  }
+
+  bool decodeVideoFrame(const std::string& path, std::vector<std::uint8_t>& outRgba, int& outW, int& outH) {
+      std::string uri = "file://" + urlEncodePath(path);
+      std::string pipeline_str = "uridecodebin uri=" + uri + " ! videoconvert ! video/x-raw,format=RGBA ! appsink name=sink sync=false";
+
+      GError* err = nullptr;
+      GstElement* pipeline = gst_parse_launch(pipeline_str.c_str(), &err);
+      if (err != nullptr) {
+          g_error_free(err);
+          return false;
+      }
+
+      GstElement* appsink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+      if (!appsink) {
+          gst_object_unref(pipeline);
+          return false;
+      }
+
+      gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+      GstSample* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(appsink), 5 * GST_SECOND);
+      bool success = false;
+
+      if (sample) {
+          GstCaps* caps = gst_sample_get_caps(sample);
+          if (caps) {
+              GstStructure* s = gst_caps_get_structure(caps, 0);
+              int w = 0, h = 0;
+              if (gst_structure_get_int(s, "width", &w) && gst_structure_get_int(s, "height", &h)) {
+                  GstBuffer* buffer = gst_sample_get_buffer(sample);
+                  GstMapInfo map;
+                  if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+                      outRgba.assign(map.data, map.data + map.size);
+                      outW = w;
+                      outH = h;
+                      success = true;
+                      gst_buffer_unmap(buffer, &map);
+                  }
+              }
+          }
+          gst_sample_unref(sample);
+      }
+
+      gst_element_set_state(pipeline, GST_STATE_NULL);
+      gst_object_unref(appsink);
+      gst_object_unref(pipeline);
+
+      return success;
   }
 
   bool writeFile(const std::filesystem::path& path, const std::uint8_t* data, std::size_t size) {
@@ -529,23 +614,36 @@ void ThumbnailService::workerLoop() {
       }
     }
 
-    auto bytes = FileUtils::readBinaryFile(path);
-    if (bytes.empty()) {
-      result.failed = true;
-      pushResult(std::move(result));
-      continue;
+    std::vector<std::uint8_t> decodedPixels;
+    int w = 0;
+    int h = 0;
+
+    if (isVideoFile(path)) {
+      if (!decodeVideoFrame(path, decodedPixels, w, h)) {
+        result.failed = true;
+        pushResult(std::move(result));
+        continue;
+      }
+    } else {
+      auto bytes = FileUtils::readBinaryFile(path);
+      if (bytes.empty()) {
+        result.failed = true;
+        pushResult(std::move(result));
+        continue;
+      }
+
+      auto decoded = decodeRasterImage(bytes.data(), bytes.size());
+      if (!decoded) {
+        result.failed = true;
+        pushResult(std::move(result));
+        continue;
+      }
+      w = decoded->width;
+      h = decoded->height;
+      decodedPixels = std::move(decoded->pixels);
     }
 
-    auto decoded = decodeRasterImage(bytes.data(), bytes.size());
-    if (!decoded) {
-      result.failed = true;
-      pushResult(std::move(result));
-      continue;
-    }
-
-    int w = decoded->width;
-    int h = decoded->height;
-    auto pixels = rgbaToRgb(decoded->pixels);
+    auto pixels = rgbaToRgb(decodedPixels);
 
     if (!resizeThumbnail(pixels, w, h, key.targetPx)) {
       result.failed = true;
