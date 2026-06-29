@@ -131,7 +131,8 @@ GstFlowReturn VideoPlayer::onNewSample(GstAppSink* sink, gpointer data) {
     return GST_FLOW_OK;
 }
 
-GstFlowReturn VideoPlayer::onEos(GstAppSink* sink, gpointer data) {
+void VideoPlayer::onEos(GstAppSink* sink, gpointer data) {
+    (void)sink;
     auto* self = static_cast<VideoPlayer*>(data);
     kLog.info("End of stream (EOS) callback triggered on appsink thread");
 
@@ -142,6 +143,4 @@ GstFlowReturn VideoPlayer::onEos(GstAppSink* sink, gpointer data) {
                 (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0);
         }
     });
-
-    return GST_FLOW_OK;
 }
