@@ -20,6 +20,7 @@ public:
 
 private:
     static GstFlowReturn onNewSample(GstAppSink* sink, gpointer data);
+    static GstFlowReturn onEos(GstAppSink* sink, gpointer data);
 
     GstElement* m_pipeline = nullptr;
     GstElement* m_appsink = nullptr;

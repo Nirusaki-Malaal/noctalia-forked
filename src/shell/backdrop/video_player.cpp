@@ -1,5 +1,6 @@
 #include "video_player.h"
 #include "core/log.h"
+#include "core/deferred_call.h"
 #include <sstream>
 #include <iomanip>
 #include <cctype>
@@ -56,6 +57,7 @@ bool VideoPlayer::load(const std::string& path) {
 
     GstAppSinkCallbacks callbacks = {};
     callbacks.new_sample = onNewSample;
+    callbacks.eos = onEos;
     gst_app_sink_set_callbacks(GST_APP_SINK(m_appsink), &callbacks, this, nullptr);
 
     return true;
@@ -126,5 +128,20 @@ GstFlowReturn VideoPlayer::onNewSample(GstAppSink* sink, gpointer data) {
     }
 
     gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+GstFlowReturn VideoPlayer::onEos(GstAppSink* sink, gpointer data) {
+    auto* self = static_cast<VideoPlayer*>(data);
+    kLog.info("End of stream (EOS) callback triggered on appsink thread");
+
+    DeferredCall::callLater([self]() {
+        if (self->m_pipeline) {
+            kLog.info("Seeking back to start of video for loop playback");
+            gst_element_seek_simple(self->m_pipeline, GST_FORMAT_TIME,
+                (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 0);
+        }
+    });
+
     return GST_FLOW_OK;
 }
