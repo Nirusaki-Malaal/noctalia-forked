@@ -16,6 +16,7 @@ public:
   ~BalooProvider() override;
 
   [[nodiscard]] std::string_view prefix() const override { return "/find"; }
+  [[nodiscard]] std::string_view defaultPrefix() const override { return "/find"; }
   [[nodiscard]] std::string_view id() const override { return "Baloo"; }
   [[nodiscard]] std::string displayName() const override;
   [[nodiscard]] std::string_view defaultGlyphName() const override { return "file-search"; }
