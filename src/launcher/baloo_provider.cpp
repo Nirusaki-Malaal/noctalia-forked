@@ -1,7 +1,7 @@
 #include "launcher/baloo_provider.h"
 
 #include "core/deferred_call.h"
-#include "core/process.h"
+#include "core/process/process.h"
 #include "i18n/i18n.h"
 #include "util/string_utils.h"
 
