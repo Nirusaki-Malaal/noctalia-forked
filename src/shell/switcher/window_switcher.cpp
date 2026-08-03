@@ -5,10 +5,9 @@
 #include "compositors/hyprland/hyprland_window_id.h"
 #include "config/config_service.h"
 #include "core/deferred_call.h"
-#include "core/key_chord.h"
-#include "core/key_modifiers.h"
-#include "core/key_symbols.h"
-#include "core/keybind_matcher.h"
+#include "core/input/key_modifiers.h"
+#include "core/input/key_symbols.h"
+#include "core/input/keybind_matcher.h"
 #include "core/log.h"
 #include "core/ui_phase.h"
 #include "i18n/i18n.h"
@@ -142,7 +141,7 @@ namespace {
   }
 
   [[nodiscard]] float shellUiScale(const ConfigService* config) noexcept {
-    return config != nullptr ? config->config().shell.uiScale : 1.0f;
+    return config != nullptr ? config->config().accessibility.uiScale : 1.0f;
   }
 
   [[nodiscard]] bool isAltModifier(std::uint32_t sym) noexcept { return sym == XKB_KEY_Alt_L || sym == XKB_KEY_Alt_R; }
@@ -154,21 +153,6 @@ namespace {
       }
     }
     return nullptr;
-  }
-
-  [[nodiscard]] std::optional<std::string>
-  windowIdForToplevel(const CompositorPlatform& platform, const ToplevelInfo& info) {
-    if (info.handle != nullptr) {
-      if (const auto id = platform.compositorWindowIdForToplevel(info.handle); id.has_value() && !id->empty()) {
-        return id;
-      }
-    }
-    if (info.extHandle != nullptr) {
-      if (const auto id = platform.compositorWindowIdForExtToplevel(info.extHandle); id.has_value() && !id->empty()) {
-        return id;
-      }
-    }
-    return std::nullopt;
   }
 
   [[nodiscard]] std::uintptr_t wlrHandleForToplevel(const ToplevelInfo& info) noexcept {
@@ -198,12 +182,14 @@ namespace {
   }
 
   void activateWindowSwitcherEntry(CompositorPlatform& platform, const WindowSwitcherEntry& entry) {
-    if (compositors::isHyprland() && !entry.windowId.empty()) {
-      if (!compositors::hyprland::normalizeWindowId(entry.windowId).empty()) {
-        platform.focusCompositorWindow(entry.windowId);
-        return;
-      }
+    // Niri: foreign-toplevel activate does not reliably focus/scroll the column.
+    if (compositors::isNiri() && !entry.windowId.empty()) {
+      platform.focusCompositorWindow(entry.windowId);
+      return;
     }
+    // Prefer wlr-foreign-toplevel activate (same path as the taskbar). On Hyprland this
+    // raises floating windows and respects cursor:no_warps / scrolling follow_focus;
+    // dispatch focuswindow alone does not.
     if (entry.closeHandle != 0) {
       auto* handle = reinterpret_cast<zwlr_foreign_toplevel_handle_v1*>(entry.closeHandle);
       if (platform.containsWlrToplevelHandle(handle)) {
@@ -246,7 +232,7 @@ namespace {
     const std::string idLower = StringUtils::toLower(appId);
     for (const auto& info : platform.windowsForApp(idLower, idLower)) {
       if (!windowId.empty()) {
-        if (const auto mapped = windowIdForToplevel(platform, info); mapped.has_value()
+        if (const auto mapped = platform.compositorWindowIdForToplevelInfo(info); mapped.has_value()
             && (compositors::isHyprland() ? compositors::hyprland::windowIdsEqual(*mapped, windowId)
                                           : *mapped == windowId)) {
           return wlrHandleForToplevel(info);
@@ -264,7 +250,7 @@ namespace {
       const ToplevelInfo& info
   ) {
     WindowSwitcherEntry entry;
-    if (const auto windowId = windowIdForToplevel(platform, info); windowId.has_value()) {
+    if (const auto windowId = platform.compositorWindowIdForToplevelInfo(info); windowId.has_value()) {
       entry.windowId = *windowId;
     } else if (info.handle != nullptr) {
       entry.windowId = "toplevel:" + std::to_string(reinterpret_cast<std::uintptr_t>(info.handle));
@@ -316,7 +302,7 @@ namespace {
           continue;
         }
 
-        const auto mappedId = windowIdForToplevel(platform, info);
+        const auto mappedId = platform.compositorWindowIdForToplevelInfo(info);
         if (!mappedId.has_value() || mappedId->empty()) {
           continue;
         }
@@ -392,7 +378,8 @@ namespace {
       }
       WindowSwitcherCandidate candidate;
       candidate.entry = makeEntryFromToplevel(platform, iconResolver, iconSize, info.appId, info);
-      if (const auto mappedId = windowIdForToplevel(platform, info); mappedId.has_value() && !mappedId->empty()) {
+      if (const auto mappedId = platform.compositorWindowIdForToplevelInfo(info);
+          mappedId.has_value() && !mappedId->empty()) {
         candidate.entry.windowId = *mappedId;
       }
       candidate.toplevelOrder = info.order;
@@ -456,7 +443,7 @@ namespace {
     void setOnClose(std::function<void(std::size_t)> callback) { m_onClose = std::move(callback); }
     void setOnInvalidate(std::function<void()> callback) { m_onInvalidate = std::move(callback); }
 
-    [[nodiscard]] std::size_t itemCount() const override { return m_entries == nullptr ? 0u : m_entries->size(); }
+    [[nodiscard]] std::size_t itemCount() const override { return m_entries == nullptr ? 0U : m_entries->size(); }
 
     [[nodiscard]] std::unique_ptr<Node> createTile() override {
       std::unique_ptr<WindowSwitcherTile> tile = std::make_unique<WindowSwitcherTile>(m_scale, m_cache);
@@ -570,7 +557,7 @@ void WindowSwitcher::registerIpc(IpcService& ipc) {
         show(output);
         return "ok\n";
       },
-      "window-switcher [close]", "Open or close the window switcher overlay"
+      "[close]", "Open or close the window switcher overlay"
   );
 }
 
@@ -606,10 +593,15 @@ void WindowSwitcher::show(wl_output* output) {
     return;
   }
 
+  const bool wasActive = m_active;
   refreshWindows();
 
   m_output = output;
-  m_selectedIndex = m_windows.size() > 1 ? 1 : 0;
+  if (wasActive) {
+    cycleSelection(1);
+  } else {
+    m_selectedIndex = m_windows.size() > 1 ? 1 : 0;
+  }
   m_active = true;
 
   ensureSurface();
@@ -711,7 +703,13 @@ void WindowSwitcher::activateSelected() {
   if (m_platform == nullptr || m_windows.empty() || m_selectedIndex >= m_windows.size()) {
     return;
   }
-  activateWindowSwitcherEntry(*m_platform, m_windows[m_selectedIndex]);
+  // Hyprland ignores zwlr_foreign_toplevel_handle_v1.activate while an exclusive
+  // keyboard layer-shell surface is mapped (hyprwm/Hyprland#4829). Snapshot the
+  // selection, tear the overlay down, then activate on the next loop tick.
+  const WindowSwitcherEntry entry = m_windows[m_selectedIndex];
+  CompositorPlatform* platform = m_platform;
+  hide();
+  DeferredCall::callLater([platform, entry]() { activateWindowSwitcherEntry(*platform, entry); });
 }
 
 void WindowSwitcher::closeWindowAt(std::size_t index) {
@@ -778,14 +776,20 @@ bool WindowSwitcher::matchesTrigger(const KeyboardEvent& event) const noexcept {
   if (!event.pressed || event.preedit) {
     return false;
   }
-  if (!KeySymbol::isTab(event.sym)) {
+  if (m_config == nullptr) {
     return false;
   }
-  return (event.modifiers & KeyMod::Alt) != 0 && (event.modifiers & KeyMod::Super) == 0;
+  if ((event.modifiers & KeyMod::Alt) == 0 || (event.modifiers & KeyMod::Super) != 0) {
+    return false;
+  }
+
+  const std::uint32_t normalizedModifiers = event.modifiers & ~(KeyMod::Alt | KeyMod::Super);
+  return m_config->matchesKeybind(KeybindAction::TabNext, event.sym, normalizedModifiers)
+      || m_config->matchesKeybind(KeybindAction::TabPrevious, event.sym, normalizedModifiers);
 }
 
-bool WindowSwitcher::isAltRelease(const KeyboardEvent& event) const noexcept {
-  return !event.pressed && isAltModifier(event.sym);
+bool WindowSwitcher::isModifierRelease(const KeyboardEvent& event) const noexcept {
+  return !event.pressed && (isAltModifier(event.sym) || event.sym == XKB_KEY_Super_L || event.sym == XKB_KEY_Super_R);
 }
 
 bool WindowSwitcher::onKeyboardEvent(const KeyboardEvent& event) {
@@ -812,7 +816,7 @@ bool WindowSwitcher::onKeyboardEvent(const KeyboardEvent& event) {
     return false;
   }
 
-  if (isAltRelease(event)) {
+  if (isModifierRelease(event)) {
     activateSelected();
     hide();
     return true;
@@ -822,35 +826,48 @@ bool WindowSwitcher::onKeyboardEvent(const KeyboardEvent& event) {
     return true;
   }
 
-  if (KeybindMatcher::matches(KeybindAction::Cancel, event.sym, event.modifiers)) {
+  const std::uint32_t normalizedModifiers = event.modifiers & ~(KeyMod::Alt | KeyMod::Super);
+  auto matchesAction = [&](KeybindAction action) {
+    if (m_config != nullptr) {
+      return m_config->matchesKeybind(action, event.sym, normalizedModifiers);
+    }
+    return KeybindMatcher::matches(action, event.sym, normalizedModifiers);
+  };
+
+  if (matchesAction(KeybindAction::Cancel)) {
     hide();
     return true;
   }
 
-  if (KeySymbol::isTab(event.sym)) {
-    cycleSelection((event.modifiers & KeyMod::Shift) != 0 ? -1 : 1);
+  if (matchesAction(KeybindAction::TabPrevious)) {
+    cycleSelection(-1);
     return true;
   }
 
-  if (KeybindMatcher::matches(KeybindAction::Validate, event.sym, event.modifiers)) {
+  if (matchesAction(KeybindAction::TabNext)) {
+    cycleSelection(1);
+    return true;
+  }
+
+  if (matchesAction(KeybindAction::Validate)) {
     activateSelected();
     hide();
     return true;
   }
 
-  if (KeybindMatcher::matches(KeybindAction::Left, event.sym, event.modifiers)) {
+  if (matchesAction(KeybindAction::Left)) {
     navigateGrid(-1, 0);
     return true;
   }
-  if (KeybindMatcher::matches(KeybindAction::Right, event.sym, event.modifiers)) {
+  if (matchesAction(KeybindAction::Right)) {
     navigateGrid(1, 0);
     return true;
   }
-  if (KeybindMatcher::matches(KeybindAction::Up, event.sym, event.modifiers)) {
+  if (matchesAction(KeybindAction::Up)) {
     navigateGrid(0, -1);
     return true;
   }
-  if (KeybindMatcher::matches(KeybindAction::Down, event.sym, event.modifiers)) {
+  if (matchesAction(KeybindAction::Down)) {
     navigateGrid(0, 1);
     return true;
   }
@@ -890,13 +907,24 @@ bool WindowSwitcher::onPointerEvent(const PointerEvent& event) {
     }
     return false;
   case PointerEvent::Type::Button: {
+    const bool pressed = event.pressed;
     if (onTarget) {
       target->pointerInside = true;
     }
     if (!onTarget && !target->pointerInside) {
+      if (pressed) {
+        hide();
+        return true;
+      }
       return false;
     }
-    const bool pressed = (event.state == 1);
+    if (pressed
+        && onTarget
+        && (target->inputDispatcher.hoveredArea() == nullptr
+            || target->inputDispatcher.hoveredArea() == target->input)) {
+      hide();
+      return true;
+    }
     return target->inputDispatcher.pointerButton(
         static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, pressed
     );
@@ -919,7 +947,7 @@ void WindowSwitcher::ensureSurface() {
     return;
   }
   const auto* output = findOutput(*m_wayland, m_output);
-  if (output == nullptr || output->logicalWidth <= 0 || output->logicalHeight <= 0) {
+  if (output == nullptr || !output->hasUsableGeometry()) {
     return;
   }
 
@@ -941,8 +969,8 @@ void WindowSwitcher::ensureSurface() {
       .height = 0,
       .exclusiveZone = -1,
       .keyboard = LayerShellKeyboard::Exclusive,
-      .defaultWidth = static_cast<std::uint32_t>(output->logicalWidth),
-      .defaultHeight = static_cast<std::uint32_t>(output->logicalHeight),
+      .defaultWidth = static_cast<std::uint32_t>(output->effectiveLogicalWidth()),
+      .defaultHeight = static_cast<std::uint32_t>(output->effectiveLogicalHeight()),
   };
 
   inst->surface = std::make_unique<LayerSurface>(*m_wayland, std::move(config));
@@ -1033,14 +1061,14 @@ void WindowSwitcher::positionGrid(Instance& instance, float screenW, float scree
 void WindowSwitcher::buildScene(Instance& instance, std::uint32_t width, std::uint32_t height) {
   UiPhaseScope layoutPhase(UiPhase::Layout);
 
-  const float w = static_cast<float>(width);
-  const float h = static_cast<float>(height);
+  const auto w = static_cast<float>(width);
+  const auto h = static_cast<float>(height);
   const float scale = instance.uiLayoutScale;
 
-  instance.sceneRoot = std::make_unique<Node>();
+  instance.sceneRoot = ui::node({});
   instance.sceneRoot->setSize(w, h);
 
-  auto input = std::make_unique<InputArea>();
+  auto input = ui::inputArea({});
   input->setFrameSize(w, h);
   input->setFocusable(true);
   input->setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));

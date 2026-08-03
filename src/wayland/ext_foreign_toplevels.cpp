@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <wayland-client.h>
 
 namespace {
 
@@ -136,6 +135,7 @@ WaylandExtForeignToplevels::windowsForApp(const std::string& idLower, const std:
             .info = ToplevelInfo{
                 .title = state.title,
                 .appId = appId,
+                .identifier = state.identifier,
                 .order = state.order,
                 .handle = nullptr,
                 .extHandle = handle,
@@ -148,6 +148,42 @@ WaylandExtForeignToplevels::windowsForApp(const std::string& idLower, const std:
   std::vector<ToplevelInfo> out;
   out.reserve(matched.size());
   for (auto& window : matched) {
+    out.push_back(std::move(window.info));
+  }
+  return out;
+}
+
+std::vector<ToplevelInfo> WaylandExtForeignToplevels::windowsWithoutAppId() const {
+  struct OrphanWindow {
+    std::uint64_t order = 0;
+    ToplevelInfo info;
+  };
+
+  std::vector<OrphanWindow> orphans;
+  for (const auto& [handle, state] : m_handles) {
+    const auto appId = effectiveAppId(state.appId, state.title);
+    if (!appId.empty()) {
+      continue;
+    }
+    orphans.push_back(
+        OrphanWindow{
+            .order = state.order,
+            .info = ToplevelInfo{
+                .title = state.title,
+                .appId = {},
+                .identifier = state.identifier,
+                .order = state.order,
+                .handle = nullptr,
+                .extHandle = handle,
+            },
+        }
+    );
+  }
+  std::ranges::sort(orphans, {}, &OrphanWindow::order);
+
+  std::vector<ToplevelInfo> out;
+  out.reserve(orphans.size());
+  for (auto& window : orphans) {
     out.push_back(std::move(window.info));
   }
   return out;

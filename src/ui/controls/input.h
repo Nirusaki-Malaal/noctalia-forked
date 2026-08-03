@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,7 +21,6 @@ class GlyphNode;
 class InputArea;
 class Label;
 class RectNode;
-class Renderer;
 
 class Input : public Node, public TextInputClient {
 public:
@@ -39,6 +39,11 @@ public:
   void setHorizontalPadding(float padding);
   void setClearButtonEnabled(bool enabled);
   void setPasswordMode(bool enabled);
+  /// Multi-line editing: Enter inserts '\n' (Ctrl+Enter submits), the text wraps
+  /// at the viewport width and scrolls vertically. The control keeps whatever
+  /// height layout assigns (explicit height or flex-grown) instead of forcing
+  /// the single-line control height. Mutually exclusive with password mode.
+  void setMultiline(bool enabled);
   void setInvalid(bool invalid);
   void setFrameVisible(bool visible);
   /// When the frame is hidden, treat the field as sitting on a solid Primary fill (e.g. segmented control center).
@@ -111,6 +116,8 @@ private:
   void clampScrollOffset();
   void clampEditState();
   void selectWordAtByteOffset(std::size_t offset);
+  void selectLineAtByteOffset(std::size_t offset);
+  void extendPointerSelectionToByteOffset(std::size_t offset);
   [[nodiscard]] std::size_t wordStartForByteOffset(std::size_t offset) const;
   [[nodiscard]] std::size_t wordEndForByteOffset(std::size_t offset) const;
   [[nodiscard]] std::size_t previousWordStartForByteOffset(std::size_t offset) const;
@@ -137,6 +144,23 @@ private:
   [[nodiscard]] std::size_t xToByteOffset(float localX) const;
   [[nodiscard]] float stopXForByte(std::size_t bytePos) const;
   void syncPasswordGlyphNodes(std::size_t count);
+  void animatePasswordGlyphIn(GlyphNode& glyph);
+
+  // Multiline mode: geometry comes from the wrapped cursor-stop rects
+  // (m_stopRect, parallel to m_stopByte) instead of the 1-D x array.
+  [[nodiscard]] bool multilineStopsValid() const noexcept;
+  [[nodiscard]] std::size_t stopIndexForByte(std::size_t bytePos) const;
+  [[nodiscard]] std::size_t pointToByteOffset(float localX, float localY) const;
+  [[nodiscard]] std::size_t lineStartForByte(std::size_t bytePos) const;
+  [[nodiscard]] std::size_t lineEndForByte(std::size_t bytePos) const;
+  [[nodiscard]] std::size_t byteForVerticalMove(std::size_t from, int lineDelta);
+  [[nodiscard]] float contentTextHeight() const noexcept;
+  [[nodiscard]] float textViewportHeight() const noexcept;
+  [[nodiscard]] float currentLineHeight() const noexcept;
+  void ensureCursorVisibleY();
+  void clampScrollOffsetY();
+  void updateMultilineSelection();
+  void syncSelectionLineRects(std::size_t count);
 
   void markTextContentChanged();
   void rebuildCursorStops(Renderer& renderer);
@@ -169,18 +193,24 @@ private:
   std::vector<EditSnapshot> m_undoStack;
   std::vector<EditSnapshot> m_redoStack;
   EditCoalesceKind m_lastEditCoalesceKind = EditCoalesceKind::None;
-  std::chrono::steady_clock::time_point m_lastUndoRecordTime{};
+  std::chrono::steady_clock::time_point m_lastUndoRecordTime;
   std::size_t m_typingCoalesceCursorPos = 0;
 
   std::vector<float> m_stopX;
   std::vector<std::size_t> m_stopByte;
+  std::vector<TextCursorStop> m_stopRect;
+  float m_stopsBuiltForWidth = -1.0f;
   bool m_textMetricsDirty = true;
   float m_cachedLabelY = 0.0f;
   std::string m_labelVisibleSlice;
   std::size_t m_labelVisibleStartByte = 0;
   float m_labelSliceOriginX = 0.0f;
   std::vector<GlyphNode*> m_passwordGlyphs;
+  std::vector<RectNode*> m_selectionLineRects;
   float m_scrollOffset = 0.0f;
+  float m_scrollOffsetY = 0.0f;
+  // Sticky caret column for Up/Down runs; negative = unset.
+  float m_goalCaretX = -1.0f;
   bool m_cursorBlinkVisible = true;
   Timer m_cursorBlinkTimer;
 
@@ -195,6 +225,7 @@ private:
   float m_horizontalPadding = Style::spaceMd;
   bool m_clearButtonEnabled = false;
   bool m_passwordMode = false;
+  bool m_multiline = false;
   bool m_invalid = false;
   bool m_frameVisible = true;
   bool m_embeddedOnSolidPrimary = false;
@@ -205,9 +236,23 @@ private:
   float m_minLayoutWidth = 0.0f;
   float m_contentLeadSlack = 0.0f;
   TextAlign m_textAlign = TextAlign::Start;
-  std::chrono::steady_clock::time_point m_lastPrimaryPressTime{};
+  std::chrono::steady_clock::time_point m_lastPrimaryPressTime;
   float m_lastPrimaryPressX = 0.0f;
   float m_lastPrimaryPressY = 0.0f;
   bool m_hasLastPrimaryPress = false;
+  // 1 = caret/char drag, 2 = word, 3 = line (resets outside the multi-click window).
+  int m_primaryClickCount = 0;
+  enum class PointerSelectGranularity : std::uint8_t { Character, Word, Line };
+  PointerSelectGranularity m_pointerSelectGranularity = PointerSelectGranularity::Character;
+  // Bounds of the unit selected on the multi-click that started the drag; motion
+  // expands the selection to include the unit under the pointer.
+  std::size_t m_pointerSelectPivotStart = 0;
+  std::size_t m_pointerSelectPivotEnd = 0;
   Signal<>::ScopedConnection m_paletteConn;
+  Signal<>::ScopedConnection m_inputBordersConn;
+
+  // Detects synchronous self-destruction from user callbacks (onSubmit/onKeyEvent
+  // can close a dialog that owns this Input). handleKey takes a weak_ptr to it and
+  // bails before touching members if the callback tore us down.
+  std::shared_ptr<int> m_aliveToken = std::make_shared<int>(0);
 };

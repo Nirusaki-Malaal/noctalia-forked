@@ -3,23 +3,29 @@
 #include "core/frame_rate_limiter.h"
 #include "core/timer_manager.h"
 #include "shell/bar/widget.h"
+#include "shell/bar/widget_custom_image.h"
+#include "shell/tooltip/tooltip_content.h"
+#include "system/format_units.h"
+#include "ui/controls/flex.h"
 #include "ui/palette.h"
 #include "ui/signal.h"
 
 #include <chrono>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 class Box;
 class ConfigService;
 class Glyph;
 class Graph;
+class Image;
 class Label;
 class ProgressBar;
 class SystemMonitorService;
 struct SystemStats;
-struct wl_output;
 
 enum class SysmonStat {
   CpuUsage,
@@ -30,19 +36,36 @@ enum class SysmonStat {
   RamUsed,
   RamPct,
   SwapPct,
-  DiskPct,
+  DiskUsedPct,
+  DiskUsed,
+  DiskFreePct,
+  DiskFree,
   NetRx,
   NetTx
 };
-enum class SysmonDisplayMode { Text, Graph, Gauge };
+enum class SysmonDisplayMode { Text, Graph, Gauge, None };
+enum class SysmonGlyphPosition { Before, After };
 
 class SysmonWidget : public Widget {
 public:
-  SysmonWidget(
-      SystemMonitorService* monitor, wl_output* output, SysmonStat stat, std::string diskPath,
-      SysmonDisplayMode displayMode, ColorSpec highlightColor, ConfigService& configService,
-      std::string networkInterface = {}, bool showLabel = true, float labelMinWidth = 0.0f, std::string glyph = {}
-  );
+  struct Options {
+    SysmonStat stat = SysmonStat::CpuUsage;
+    std::string diskPath = "/";
+    std::string glyph;
+    std::string customImage;
+    bool customImageColorize = false;
+    std::string networkInterface;
+    FormatUnits::DecimalByteRateUnit networkSpeedUnit = FormatUnits::DecimalByteRateUnit::Auto;
+    bool networkSpeedCompact = false;
+    SysmonDisplayMode displayMode = SysmonDisplayMode::Gauge;
+    ColorSpec highlightColor = colorSpecFromRole(ColorRole::Error);
+    bool showLabel = true;
+    int labelMinWidth = 0;
+    bool showUnits = true;
+    SysmonGlyphPosition glyphPosition = SysmonGlyphPosition::Before;
+  };
+
+  SysmonWidget(SystemMonitorService* monitor, ConfigService& configService, Options options);
   ~SysmonWidget() override;
 
   void create() override;
@@ -61,11 +84,18 @@ private:
   void clearGraph();
   void syncVisualPalette();
   void syncValueColor();
+  void syncIcon(Renderer& renderer);
   void updateGraph(Renderer& renderer);
+  [[nodiscard]] float iconWidth() const;
+  [[nodiscard]] float iconHeight() const;
+  void setIconPosition(float x, float y);
   [[nodiscard]] float scrollProgressForSample(std::chrono::steady_clock::time_point sampledAt) const;
   [[nodiscard]] Color currentValueColor(ColorSpec baseColor);
   [[nodiscard]] double currentGradientValue();
   [[nodiscard]] std::pair<double, double> currentThresholds() const;
+  [[nodiscard]] std::optional<std::string> formatValueFor(SysmonStat stat, const SystemStats& stats) const;
+  [[nodiscard]] bool statAvailableForTooltip(SysmonStat stat, const SystemStats& stats) const;
+  [[nodiscard]] std::vector<TooltipRow> buildTooltipRows(const std::string& currentValue) const;
   [[nodiscard]] static double normalizedFromStats(
       SysmonStat stat, const SystemStats& stats, double& tempMin, double& tempMax, std::string_view networkInterface
   );
@@ -79,17 +109,24 @@ private:
   float m_labelMinWidth = 0.0f;
   std::string m_diskPath;
   std::string m_networkInterface;
+  FormatUnits::DecimalByteRateUnit m_networkSpeedUnit = FormatUnits::DecimalByteRateUnit::Auto;
+  FormatUnits::ByteRateLabelStyle m_networkSpeedLabelStyle = FormatUnits::ByteRateLabelStyle::Full;
   std::string m_glyphOverride;
+  WidgetCustomImage m_customImage;
+  bool m_showUnits;
+  SysmonGlyphPosition m_glyphPosition;
   std::string m_lastRawValue;
   bool m_isVerticalBar = false;
   bool m_lastLabelVertical = false;
 
   Glyph* m_glyph = nullptr;
+  Image* m_image = nullptr;
   Label* m_label = nullptr;
+  Flex* m_containerRow = nullptr;
 
   static constexpr int kHistorySamples = 30;
   bool m_graphInitialized = false;
-  std::chrono::steady_clock::time_point m_lastSampleAt{};
+  std::chrono::steady_clock::time_point m_lastSampleAt;
   double m_tempMin = 30.0;
   double m_tempMax = 80.0;
   Box* m_chartBg = nullptr;

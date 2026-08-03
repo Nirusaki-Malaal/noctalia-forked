@@ -1,8 +1,13 @@
 #include "shell/settings/settings_control_factory.h"
 
+#include "config/config_service.h"
 #include "config/config_types.h"
 #include "i18n/i18n.h"
+#include "render/scene/input_area.h"
+#include "shell/bar/widget_action.h"
+#include "shell/bar/widget_gesture.h"
 #include "shell/settings/color_spec_picker.h"
+#include "shell/settings/path_browse.h"
 #include "shell/settings/settings_content_common.h"
 #include "ui/builders.h"
 #include "ui/controls/button.h"
@@ -14,13 +19,18 @@
 #include "ui/controls/slider.h"
 #include "ui/controls/stepper.h"
 #include "ui/controls/toggle.h"
+#include "ui/dialogs/file_dialog.h"
 #include "ui/palette.h"
 #include "ui/style.h"
+#include "util/string_utils.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <format>
+#include <functional>
+#include <memory>
 #include <unordered_set>
 #include <utility>
 
@@ -44,6 +54,111 @@ namespace settings {
           })
       );
     }
+
+    // Horizontal space the leading invert slot occupies: corner glyph + gap + a Small toggle.
+    // Invertible sliders give this much (plus the row gap) back from their track so the toggle tucks
+    // in on the left without widening the control cluster.
+    constexpr float kInvertSlotContentWidth = Style::fontSizeBody
+        + Style::spaceXs
+        + Style::toggleThumbSizeSm
+        + (2.0f * Style::toggleInsetSm)
+        + Style::toggleTravelSm;
+
+    // Leading slot carrying the concave-corner invert toggle: a corner glyph (labelling the toggle
+    // in lieu of a text caption) plus a Small toggle. The slot sizes to its content. Reserve builds
+    // the same glyph+toggle but invisible, so a slider without a toggle keeps its slider and value
+    // box column-aligned with sibling sliders while showing no controls.
+    std::unique_ptr<Node> makeInvertSlot(
+        SliderSetting::InvertSlot slot, bool enabled, std::shared_ptr<bool> inverted,
+        std::function<void(double)> commitValue, Slider* sliderPtr, float scale
+    ) {
+      if (slot == SliderSetting::InvertSlot::None) {
+        return nullptr;
+      }
+      const bool placeholder = slot == SliderSetting::InvertSlot::Reserve;
+      const std::optional<bool> hidden = placeholder ? std::optional<bool>{false} : std::nullopt;
+      auto row = ui::row({.align = FlexAlign::Center, .gap = Style::spaceXs * scale});
+
+      row->addChild(
+          ui::glyph({
+              .glyph = "border-corner-pill",
+              .glyphSize = Style::fontSizeBody * scale,
+              .color = colorSpecFromRole(enabled ? ColorRole::OnSurfaceVariant : ColorRole::Outline),
+              .visible = hidden,
+          })
+      );
+      ui::ToggleProps toggleProps{
+          .checked = *inverted,
+          .enabled = enabled,
+          .toggleSize = ToggleSize::Small,
+          .scale = scale,
+          .visible = hidden,
+      };
+      if (!placeholder && enabled) {
+        toggleProps.onChange = [inverted, commitValue = std::move(commitValue), sliderPtr](bool on) {
+          *inverted = on;
+          commitValue(sliderPtr->value());
+        };
+      }
+      row->addChild(ui::toggle(std::move(toggleProps)));
+      return row;
+    }
+
+    std::string joinSettingPath(const std::vector<std::string>& path) {
+      std::string joined;
+      joined.reserve(64);
+      for (std::size_t i = 0; i < path.size(); ++i) {
+        if (i > 0) {
+          joined += '.';
+        }
+        joined += path[i];
+      }
+      return joined;
+    }
+
+    bool tagTabFocusKey(Node& root, const std::string& key) {
+      if (auto* segmented = dynamic_cast<Segmented*>(&root)) {
+        if (InputArea* area = segmented->focusArea(); area != nullptr) {
+          area->setTabFocusKey(key);
+          return true;
+        }
+      }
+      if (auto* area = dynamic_cast<InputArea*>(&root)) {
+        if (area->focusable() && area->tabStop()) {
+          area->setTabFocusKey(key);
+          return true;
+        }
+      }
+      for (const auto& child : root.children()) {
+        if (tagTabFocusKey(*child, key)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // Synthetic picker entry: a grammar keyword rather than an IPC command, so it cannot collide
+    // with a real command name.
+    constexpr std::string_view kActionExecOption = "\x01exec";
+
+    // Argument specs spell required arguments as <id> and optional ones as [context]. A <> nested
+    // inside brackets is still optional, so only a top-level one makes the argument mandatory.
+    [[nodiscard]] bool specTakesArguments(std::string_view spec) { return !spec.empty(); }
+
+    [[nodiscard]] bool specRequiresArgument(std::string_view spec) {
+      int optionalDepth = 0;
+      for (const char c : spec) {
+        if (c == '[') {
+          ++optionalDepth;
+        } else if (c == ']') {
+          optionalDepth = std::max(0, optionalDepth - 1);
+        } else if (c == '<' && optionalDepth == 0) {
+          return true;
+        }
+      }
+      return false;
+    }
+
   } // namespace
 
   SettingsControlFactory::SettingsControlFactory(SettingsContentContext ctx)
@@ -55,35 +170,29 @@ namespace settings {
   }
 
   std::unique_ptr<Button> SettingsControlFactory::makeResetButton(const std::vector<std::string>& path) {
-    auto& ctx = m_ctx;
-    const float scale = m_scale;
-    return ui::button({
-        .text = i18n::tr("settings.actions.reset"),
-        .fontSize = Style::fontSizeCaption * scale,
-        .variant = ButtonVariant::Ghost,
-        .minHeight = Style::controlHeightSm * scale,
-        .paddingV = Style::spaceXs * scale,
-        .paddingH = Style::spaceSm * scale,
-        .radius = Style::scaledRadiusMd(scale),
-        .onClick = [clearOverride = ctx.clearOverride, path]() { clearOverride(path); },
-    });
+    return makeGroupedResetButton(std::vector<std::vector<std::string>>{path});
   }
 
-  std::unique_ptr<Button> SettingsControlFactory::makeResetButton(std::vector<std::vector<std::string>> paths) {
+  std::unique_ptr<Button> SettingsControlFactory::makeGroupedResetButton(std::vector<std::vector<std::string>> paths) {
     auto& ctx = m_ctx;
     const float scale = m_scale;
+    const bool pendingConfirmation = ctx.isResetConfirmationPending && ctx.isResetConfirmationPending(paths);
     return ui::button({
-        .text = i18n::tr("settings.actions.reset"),
+        .text = i18n::tr(pendingConfirmation ? "settings.actions.confirm-reset" : "settings.actions.reset"),
         .fontSize = Style::fontSizeCaption * scale,
-        .variant = ButtonVariant::Ghost,
+        .variant = pendingConfirmation ? ButtonVariant::Destructive : ButtonVariant::Ghost,
         .minHeight = Style::controlHeightSm * scale,
         .paddingV = Style::spaceXs * scale,
         .paddingH = Style::spaceSm * scale,
         .radius = Style::scaledRadiusMd(scale),
-        .onClick = [clearOverride = ctx.clearOverride, paths = std::move(paths)]() {
-          for (const auto& path : paths) {
-            clearOverride(path);
+        .onClick = [clearOverrides = ctx.clearOverrides, requestConfirmation = ctx.requestResetConfirmation,
+                    requestRebuild = ctx.requestRebuild, paths = std::move(paths), pendingConfirmation]() mutable {
+          if (!pendingConfirmation) {
+            requestConfirmation(paths);
+            requestRebuild();
+            return;
           }
+          clearOverrides(std::move(paths));
         },
     });
   }
@@ -130,10 +239,8 @@ namespace settings {
     const Config& cfg = m_ctx.config;
     // Range sliders own a second config path (high/critical); both reset and report "override" together.
     const auto* rangeSlider = std::get_if<RangeSliderSetting>(&entry.control);
-    const auto isOverridden = [&](const std::vector<std::string>& p) {
-      return ctx.configService != nullptr && ctx.configService->hasEffectiveOverride(p);
-    };
-    const bool overridden = isOverridden(entry.path) || (rangeSlider != nullptr && isOverridden(rangeSlider->highPath));
+    const auto* selectSetting = std::get_if<SelectSetting>(&entry.control);
+    const bool overridden = ctx.configService != nullptr && settingEntryHasEffectiveOverride(entry, *ctx.configService);
     const bool redundantGuiOverride =
         ctx.configService != nullptr && ctx.configService->hasOverride(entry.path) && !overridden;
     const bool monitorSetting = isMonitorOverrideSettingPath(entry.path);
@@ -179,11 +286,18 @@ namespace settings {
     if (overridden) {
       actions->addChild(makeOverrideBadge());
       if (rangeSlider != nullptr) {
-        actions->addChild(makeResetButton(std::vector<std::vector<std::string>>{entry.path, rangeSlider->highPath}));
+        actions->addChild(
+            makeGroupedResetButton(std::vector<std::vector<std::string>>{entry.path, rangeSlider->highPath})
+        );
+      } else if (selectSetting != nullptr && !selectSetting->linkedPath.empty()) {
+        actions->addChild(
+            makeGroupedResetButton(std::vector<std::vector<std::string>>{entry.path, selectSetting->linkedPath})
+        );
       } else {
         actions->addChild(makeResetButton(entry.path));
       }
     }
+    tagTabFocusKey(*control, joinSettingPath(entry.path));
     actions->addChild(std::move(control));
 
     auto row = ui::row(
@@ -210,15 +324,19 @@ namespace settings {
           .enabled = enabled,
           .scale = scale,
           .onChange = [configService = ctx.configService, setOverride = ctx.setOverride,
-                       clearOverride = ctx.clearOverride, path, clearWhenValue](bool value) {
+                       clearOverride = ctx.clearOverride, requestRebuild = ctx.requestRebuild, path,
+                       clearWhenValue](bool value) {
             if (clearWhenValue.has_value()
                 && value == *clearWhenValue
                 && configService != nullptr
                 && configService->hasOverride(path)) {
               clearOverride(path);
-              return;
+            } else {
+              setOverride(path, value);
             }
-            setOverride(path, value);
+            if (requestRebuild) {
+              requestRebuild();
+            }
           },
       });
     }
@@ -240,22 +358,29 @@ namespace settings {
         segmentedOptions.push_back(ui::SegmentedOption{.label = opt.label});
       }
       auto options = setting.options;
-      const bool integerValue = setting.integerValue;
+      const SelectValueType valueType = setting.valueType;
+      const auto groupedCommit = setting.groupedCommit;
       return ui::segmented({
           .options = std::move(segmentedOptions),
           .selectedIndex = optionIndex(setting.options, setting.selectedValue),
           .scale = scale,
-          .onChange = [setOverride = ctx.setOverride, clearOverride = ctx.clearOverride, path, options,
-                       integerValue](std::size_t index) {
+          .onChange = [setOverride = ctx.setOverride, setOverrides = ctx.setOverrides,
+                       clearOverride = ctx.clearOverride, requestRebuild = ctx.requestRebuild, path, options, valueType,
+                       groupedCommit](std::size_t index) {
             if (index < options.size()) {
-              if (options[index].value.empty() && integerValue) {
+              if (groupedCommit) {
+                setOverrides(groupedCommit(options[index].value, path));
+              } else if (options[index].value.empty() && valueType == SelectValueType::Integer) {
                 clearOverride(path);
-                return;
-              }
-              if (integerValue) {
+              } else if (valueType == SelectValueType::Integer) {
                 setOverride(path, static_cast<std::int64_t>(std::stoll(options[index].value)));
+              } else if (valueType == SelectValueType::Boolean) {
+                setOverride(path, options[index].value == "true");
               } else {
                 setOverride(path, options[index].value);
+              }
+              if (requestRebuild) {
+                requestRebuild();
               }
             }
           },
@@ -263,34 +388,44 @@ namespace settings {
     }
 
     const auto selectedIndex = optionIndex(setting.options, setting.selectedValue);
-    const bool clearSelection = !selectedIndex.has_value() && !setting.selectedValue.empty();
+    const bool missingSelection = !selectedIndex.has_value();
+    const bool unknownValue = missingSelection && !setting.selectedValue.empty();
+    const bool clearSelection = unknownValue || (missingSelection && setting.allowEmptySelection);
     const float selectWidth = setting.preferredWidth > 0.0f ? setting.preferredWidth : 190.0f;
     auto options = setting.options;
     const bool clearOnEmpty = setting.clearOnEmpty;
-    const bool integerValue = setting.integerValue;
+    const SelectValueType valueType = setting.valueType;
+    const auto groupedCommit = setting.groupedCommit;
     return ui::select({
         .options = optionLabels(setting.options),
         .selectedIndex = selectedIndex,
         .clearSelection = clearSelection,
-        .placeholder = clearSelection ? std::optional<std::string>{i18n::tr(
-                                            "settings.controls.select.unknown-value", "value", setting.selectedValue
-                                        )}
-                                      : std::nullopt,
+        .placeholder = unknownValue ? std::optional<std::string>{i18n::tr(
+                                          "settings.controls.select.unknown-value", "value", setting.selectedValue
+                                      )}
+                                    : std::nullopt,
         .fontSize = Style::fontSizeBody * scale,
         .controlHeight = Style::controlHeight * scale,
         .glyphSize = Style::fontSizeBody * scale,
         .colorSwatchPreviews = optionSwatchPreviews(setting.options),
         .width = selectWidth * scale,
         .height = Style::controlHeight * scale,
-        .onSelectionChanged = [clearOverride = ctx.clearOverride, setOverride = ctx.setOverride, path, options,
-                               clearOnEmpty, integerValue](std::size_t index, std::string_view /*label*/) {
+        .onSelectionChanged = [clearOverride = ctx.clearOverride, setOverride = ctx.setOverride,
+                               setOverrides = ctx.setOverrides, path, options, clearOnEmpty, valueType,
+                               groupedCommit](std::size_t index, std::string_view /*label*/) {
           if (index < options.size()) {
-            if (options[index].value.empty() && (clearOnEmpty || integerValue)) {
+            if (groupedCommit) {
+              setOverrides(groupedCommit(options[index].value, path));
+              return;
+            }
+            if (options[index].value.empty() && (clearOnEmpty || valueType == SelectValueType::Integer)) {
               clearOverride(path);
               return;
             }
-            if (integerValue) {
+            if (valueType == SelectValueType::Integer) {
               setOverride(path, static_cast<std::int64_t>(std::stoll(options[index].value)));
+            } else if (valueType == SelectValueType::Boolean) {
+              setOverride(path, options[index].value == "true");
             } else {
               setOverride(path, options[index].value);
             }
@@ -306,11 +441,9 @@ namespace settings {
     const float scale = m_scale;
     return ui::button({
         .text = optionLabel(setting.options, setting.selectedValue),
-        .glyph = "search",
         .fontSize = Style::fontSizeBody * scale,
-        .glyphSize = Style::fontSizeBody * scale,
         .contentAlign = ButtonContentAlign::Start,
-        .variant = ButtonVariant::Outline,
+        .variant = ButtonVariant::Default,
         .minWidth = 190.0f * scale,
         .minHeight = Style::controlHeight * scale,
         .paddingV = Style::spaceSm * scale,
@@ -318,9 +451,19 @@ namespace settings {
         .radius = Style::scaledRadiusMd(scale),
         .onClick = [openPopup = ctx.openSearchPickerPopup, title = std::move(title), options = setting.options,
                     selectedValue = setting.selectedValue, placeholder = setting.placeholder,
-                    emptyText = setting.emptyText, path = std::move(path)]() {
+                    emptyText = setting.emptyText, path = std::move(path), onSelect = setting.onSelect]() {
           if (openPopup) {
-            openPopup(title, options, selectedValue, placeholder, emptyText, path);
+            openPopup(
+                SearchPickerOpenRequest{
+                    .title = title,
+                    .options = options,
+                    .selectedValue = selectedValue,
+                    .placeholder = placeholder,
+                    .emptyText = emptyText,
+                    .settingPath = path,
+                    .onSelect = onSelect,
+                }
+            );
           }
         },
     });
@@ -329,16 +472,28 @@ namespace settings {
   std::unique_ptr<Flex> SettingsControlFactory::makeSlider(
       double value, double minValue, double maxValue, double step, std::vector<std::string> path, bool integerValue,
       std::function<std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>(double)> linkedCommit,
-      std::string valueSuffix
+      std::string valueSuffix, SliderSetting::InvertSlot invertSlot, bool invertEnabled
   ) {
     auto& ctx = m_ctx;
     const float scale = m_scale;
     auto wrap = ui::row({.align = FlexAlign::Center, .gap = Style::spaceSm * scale});
 
+    // Signed radius sliders show the magnitude; a leading toggle carries the sign.
+    const bool invertible = invertSlot == SliderSetting::InvertSlot::Toggle;
+    auto inverted = std::make_shared<bool>(value < 0.0);
+    const double magnitude = std::abs(value);
+    const double sliderValue = invertible ? magnitude : value;
+
+    // Narrow the track by the leading slot so the cluster keeps its normal total width.
+    const float sliderWidth = (invertSlot == SliderSetting::InvertSlot::None
+                                   ? Style::sliderDefaultWidth
+                                   : Style::sliderDefaultWidth - kInvertSlotContentWidth - Style::spaceSm)
+        * scale;
+
     Input* valueInputPtr = nullptr;
     auto valueInput = ui::input({
         .out = &valueInputPtr,
-        .value = formatSliderValue(value, integerValue),
+        .value = formatSliderValue(sliderValue, integerValue),
         .fontSize = Style::fontSizeCaption * scale,
         .controlHeight = Style::controlHeightSm * scale,
         .horizontalPadding = Style::spaceXs * scale,
@@ -352,17 +507,18 @@ namespace settings {
         .minValue = minValue,
         .maxValue = maxValue,
         .step = step,
-        .value = value,
+        .value = sliderValue,
         .trackHeight = Style::sliderTrackHeight * scale,
         .thumbSize = Style::sliderThumbSize * scale,
         .controlHeight = Style::controlHeight * scale,
-        .width = Style::sliderDefaultWidth * scale,
+        .width = sliderWidth,
         .height = Style::controlHeight * scale,
         .onValueChanged = [valueInputPtr, integerValue](double next) {
           valueInputPtr->setInvalid(false);
           valueInputPtr->setValue(formatSliderValue(next, integerValue));
         },
     });
+    valueInputPtr->setValue(formatSliderValue(sliderPtr->value(), integerValue));
 
     // Helper: commit either via single setOverride or as an atomic batch when linkedCommit
     // returns extra overrides (cross-field constraints).
@@ -386,29 +542,39 @@ namespace settings {
       setOverride(path, std::move(primary));
     };
 
-    slider->setOnDragEnd([commit, sliderPtr]() { commit(sliderPtr->value()); });
+    // For invertible sliders the slider value is the magnitude; fold in the sign the toggle holds.
+    std::function<void(double)> commitValue = commit;
+    if (invertible) {
+      commitValue = [commit, inverted](double magValue) { commit(*inverted ? -magValue : magValue); };
+    }
 
-    const auto commitInputText = [commit, sliderPtr, valueInputPtr, minValue, maxValue,
+    slider->setOnDragEnd([commitValue, sliderPtr]() { commitValue(sliderPtr->value()); });
+
+    const auto commitInputText = [commitValue, sliderPtr, valueInputPtr, minValue, maxValue,
                                   integerValue](const std::string& text) {
       const auto parsed = parseDoubleInput(text);
       if (!parsed.has_value() || *parsed < minValue || *parsed > maxValue) {
         valueInputPtr->setInvalid(true);
-        return;
+        return false;
       }
       const double v = *parsed;
       valueInputPtr->setInvalid(false);
       sliderPtr->setValue(v);
-      if (!integerValue) {
-        valueInputPtr->setValue(formatSliderValue(sliderPtr->value(), false));
-      }
-      commit(v);
+      const double snapped = sliderPtr->value();
+      valueInputPtr->setValue(formatSliderValue(snapped, integerValue));
+      commitValue(snapped);
+      return true;
     };
 
     valueInput->setOnChange([valueInputPtr](const std::string& /*text*/) { valueInputPtr->setInvalid(false); });
-    valueInput->setOnSubmit([commitInputText](const std::string& text) { commitInputText(text); });
-    valueInput->setOnFocusLoss([commitInputText, valueInputPtr]() { commitInputText(valueInputPtr->value()); });
+    valueInput->setOnSubmit([commitInputText](const std::string& text) { (void)commitInputText(text); });
+    valueInput->setOnFocusLoss([commitInputText, valueInputPtr]() { (void)commitInputText(valueInputPtr->value()); });
 
-    // Slider first, numeric value field on the right (reset from makeRow stays left of this cluster).
+    // Invert toggle leads, then slider, then the numeric value field on the right (reset from makeRow
+    // stays left of this cluster).
+    if (auto invert = makeInvertSlot(invertSlot, invertEnabled, inverted, commitValue, sliderPtr, scale)) {
+      wrap->addChild(std::move(invert));
+    }
     wrap->addChild(std::move(slider));
     wrap->addChild(std::move(valueInput));
     if (auto suffix = makeSuffixSlot(std::move(valueSuffix), scale)) {
@@ -466,6 +632,8 @@ namespace settings {
               highInputPtr->setValue(formatSliderValue(next, integerValue));
             },
     });
+    lowInputPtr->setValue(formatSliderValue(sliderPtr->lowValue(), integerValue));
+    highInputPtr->setValue(formatSliderValue(sliderPtr->highValue(), integerValue));
 
     const auto commitTo = [setOverride = ctx.setOverride,
                            integerValue](const std::vector<std::string>& path, double v) {
@@ -487,7 +655,7 @@ namespace settings {
       const auto parsed = parseDoubleInput(input->value());
       if (!parsed.has_value() || *parsed < minValue || *parsed > maxValue) {
         input->setInvalid(true);
-        return;
+        return false;
       }
       input->setInvalid(false);
       if (isLow) {
@@ -499,23 +667,24 @@ namespace settings {
         input->setValue(formatSliderValue(sliderPtr->highValue(), integerValue));
         commitTo(path, sliderPtr->highValue());
       }
+      return true;
     };
 
     const double minValue = setting.minValue;
     const double maxValue = setting.maxValue;
     lowInput->setOnChange([lowInputPtr](const std::string& /*text*/) { lowInputPtr->setInvalid(false); });
     lowInput->setOnSubmit([commitInput, lowInputPtr, lowPath, minValue, maxValue](const std::string& /*text*/) {
-      commitInput(lowInputPtr, lowPath, minValue, maxValue, true);
+      (void)commitInput(lowInputPtr, lowPath, minValue, maxValue, true);
     });
     lowInput->setOnFocusLoss([commitInput, lowInputPtr, lowPath, minValue, maxValue]() {
-      commitInput(lowInputPtr, lowPath, minValue, maxValue, true);
+      (void)commitInput(lowInputPtr, lowPath, minValue, maxValue, true);
     });
     highInput->setOnChange([highInputPtr](const std::string& /*text*/) { highInputPtr->setInvalid(false); });
     highInput->setOnSubmit([commitInput, highInputPtr, highPath, minValue, maxValue](const std::string& /*text*/) {
-      commitInput(highInputPtr, highPath, minValue, maxValue, false);
+      (void)commitInput(highInputPtr, highPath, minValue, maxValue, false);
     });
     highInput->setOnFocusLoss([commitInput, highInputPtr, highPath, minValue, maxValue]() {
-      commitInput(highInputPtr, highPath, minValue, maxValue, false);
+      (void)commitInput(highInputPtr, highPath, minValue, maxValue, false);
     });
 
     wrap->addChild(std::move(slider));
@@ -528,13 +697,169 @@ namespace settings {
     return wrap;
   }
 
+  std::unique_ptr<Node> SettingsControlFactory::makeGestureActionRow(
+      const GestureActionSetting& setting, const std::string& title, std::vector<std::string> path
+  ) {
+    auto& ctx = m_ctx;
+    const float scale = m_scale;
+
+    // Shared by value: the context is a build-pass local, but these callbacks are stored in the
+    // scene and fire long after it is gone.
+    const auto catalog = std::make_shared<const std::vector<GestureActionOption>>(ctx.actionCatalog);
+    const auto specFor = [catalog](std::string_view verb) -> std::string {
+      const auto it = std::ranges::find_if(*catalog, [verb](const GestureActionOption& action) {
+        return action.option.value == verb;
+      });
+      return it != catalog->end() ? it->argsSpec : std::string{};
+    };
+
+    const bool isOverridden = !setting.configured.empty();
+    const std::string effective = isOverridden ? setting.configured : setting.defaultAction;
+    const auto parsed = noctalia::bar::parseWidgetAction(effective);
+
+    // A row holds its chosen command until the argument is typed, because committing a bare verb
+    // that needs one would store a binding that silently does nothing.
+    const bool pending = ctx.pendingGestureKey == setting.gestureKey;
+    std::string selected;
+    std::string argument = !pending && parsed.has_value() ? parsed->args : std::string{};
+    if (pending) {
+      selected = ctx.pendingGestureVerb;
+    } else if (!isOverridden) {
+      selected.clear();
+    } else if (!parsed.has_value() || parsed->kind == noctalia::bar::WidgetAction::Kind::None) {
+      selected = std::string(noctalia::bar::kNoneVerb);
+    } else if (parsed->kind == noctalia::bar::WidgetAction::Kind::Exec) {
+      selected = std::string(kActionExecOption);
+    } else {
+      selected = parsed->verb;
+    }
+
+    // Keep the picker on "Default" for an inherited binding, but derive the argument editor from
+    // the effective action so optional arguments such as volume/brightness step remain editable.
+    std::string actionVerb = selected;
+    if (!pending && parsed.has_value()) {
+      if (parsed->kind == noctalia::bar::WidgetAction::Kind::Exec) {
+        actionVerb = std::string(kActionExecOption);
+      } else if (parsed->kind == noctalia::bar::WidgetAction::Kind::Ipc) {
+        actionVerb = parsed->verb;
+      }
+    }
+    const bool execMode = actionVerb == kActionExecOption;
+
+    std::vector<SelectOption> options;
+    options.reserve(ctx.actionCatalog.size() + 3);
+    options.push_back(
+        SelectOption{
+            .value = {},
+            .label = setting.defaultAction.empty()
+                ? i18n::tr("settings.widgets.actions.unset")
+                : std::format("{} ({})", i18n::tr("settings.widgets.actions.default"), setting.defaultAction),
+        }
+    );
+    options.push_back(
+        SelectOption{
+            .value = std::string(noctalia::bar::kNoneVerb),
+            .label = i18n::tr("settings.widgets.actions.disabled"),
+        }
+    );
+    options.push_back(
+        SelectOption{
+            .value = std::string(kActionExecOption),
+            .label = i18n::tr("settings.widgets.actions.run-command"),
+        }
+    );
+    for (const auto& action : ctx.actionCatalog) {
+      options.push_back(action.option);
+    }
+
+    SearchPickerSetting picker;
+    picker.options = std::move(options);
+    picker.selectedValue = selected;
+    picker.emptyText = i18n::tr("ui.controls.search-picker.empty");
+    picker.onSelect = [setOverride = ctx.setOverride, clearOverride = ctx.clearOverride,
+                       requestRebuild = ctx.requestRebuild, pendingKey = &ctx.pendingGestureKey,
+                       pendingVerb = &ctx.pendingGestureVerb, specFor, path,
+                       key = setting.gestureKey](const std::string& value) {
+      pendingKey->clear();
+      pendingVerb->clear();
+      const bool needsArgument = value == kActionExecOption || (!value.empty() && specRequiresArgument(specFor(value)));
+      if (needsArgument) {
+        // Nothing to store yet: the value is completed by the argument field.
+        *pendingKey = key;
+        *pendingVerb = value;
+        clearOverride(path);
+      } else if (value.empty()) {
+        clearOverride(path);
+      } else {
+        setOverride(path, value);
+      }
+      if (requestRebuild) {
+        requestRebuild();
+      }
+    };
+
+    const std::string argsSpec = execMode ? std::string{} : specFor(actionVerb);
+    const bool wantsArgument = execMode || (!actionVerb.empty() && specTakesArguments(argsSpec));
+
+    auto control = ui::row({.align = FlexAlign::Center, .gap = Style::spaceSm * scale});
+    control->addChild(makeSearchPicker(picker, title, path));
+    if (wantsArgument) {
+      control->addChild(
+          ui::input({
+              .value = argument,
+              .placeholder = execMode ? i18n::tr("settings.widgets.actions.command-placeholder") : argsSpec,
+              .fontSize = Style::fontSizeBody * scale,
+              .controlHeight = Style::controlHeight * scale,
+              .horizontalPadding = Style::spaceSm * scale,
+              .width = 220.0f * scale,
+              .height = Style::controlHeight * scale,
+              .onSubmit =
+                  [setOverride = ctx.setOverride, clearOverride = ctx.clearOverride,
+                   requestRebuild = ctx.requestRebuild, pendingKey = &ctx.pendingGestureKey,
+                   pendingVerb = &ctx.pendingGestureVerb, specFor, path, verb = actionVerb,
+                   defaultAction = setting.defaultAction, execMode](const std::string& text) {
+                    const std::string trimmed = StringUtils::trim(text);
+                    if (trimmed.empty() && (execMode || specRequiresArgument(specFor(verb)))) {
+                      // A required argument cannot produce a valid binding.
+                      clearOverride(path);
+                    } else {
+                      std::string commandLine;
+                      if (execMode) {
+                        commandLine = std::string(noctalia::bar::kExecVerb) + " " + trimmed;
+                      } else {
+                        commandLine = verb;
+                        if (!trimmed.empty()) {
+                          commandLine += " " + trimmed;
+                        }
+                      }
+                      if (commandLine == defaultAction) {
+                        clearOverride(path);
+                      } else {
+                        setOverride(path, commandLine);
+                      }
+                    }
+                    pendingKey->clear();
+                    pendingVerb->clear();
+                    if (requestRebuild) {
+                      requestRebuild();
+                    }
+                  },
+              .submitOnFocusLoss = true,
+          })
+      );
+    }
+    return control;
+  }
+
   std::unique_ptr<Input> SettingsControlFactory::makeText(
       const std::string& value, const std::string& placeholder, std::vector<std::string> path, float width
   ) {
     auto& ctx = m_ctx;
     const float scale = m_scale;
     const float inputWidth = (width > 0.0f ? width : 190.0f) * scale;
+    Input* inputPtr = nullptr;
     auto input = ui::input({
+        .out = &inputPtr,
         .value = value,
         .placeholder = placeholder,
         .fontSize = Style::fontSizeBody * scale,
@@ -542,10 +867,78 @@ namespace settings {
         .horizontalPadding = Style::spaceSm * scale,
         .width = inputWidth,
         .height = Style::controlHeight * scale,
-        .onSubmit = [setOverride = ctx.setOverride, path](const std::string& v) { setOverride(path, v); },
         .submitOnFocusLoss = true,
     });
+    input->setOnChange([inputPtr](const std::string& /*text*/) { inputPtr->setInvalid(false); });
+    input->setOnSubmit([configService = ctx.configService, setOverride = ctx.setOverride, path,
+                        inputPtr](const std::string& text) {
+      if (configService != nullptr && !configService->validateOverride(path, ConfigOverrideValue{text})) {
+        inputPtr->setInvalid(true);
+        // Send the rejected mutation through the normal error-reporting path so the
+        // editor sheet shows the shared schema diagnostic beside this control.
+        setOverride(path, text);
+        return;
+      }
+      inputPtr->setInvalid(false);
+      setOverride(path, text);
+    });
     return input;
+  }
+
+  std::unique_ptr<Node>
+  SettingsControlFactory::makePathBrowse(const TextSetting& setting, std::vector<std::string> path) {
+    auto input = makeText(setting.value, setting.placeholder, path, setting.width > 0.0f ? setting.width : 280.0f);
+    Input* inputPtr = input.get();
+    const bool selectFolder = setting.browseMode == TextSettingBrowseMode::SelectFolder;
+    const float scale = m_scale;
+    auto& ctx = m_ctx;
+
+    return ui::row(
+        {.align = FlexAlign::Center, .gap = Style::spaceSm * scale}, std::move(input),
+        ui::button({
+            .glyph = selectFolder ? "folder" : "file-text",
+            .glyphSize = Style::fontSizeBody * scale,
+            .variant = ButtonVariant::Default,
+            .minWidth = Style::controlHeight * scale,
+            .minHeight = Style::controlHeight * scale,
+            .paddingV = Style::spaceXs * scale,
+            .paddingH = Style::spaceSm * scale,
+            .radius = Style::scaledRadiusMd(scale),
+            .onClick = [setOverride = ctx.setOverride, requestRebuild = ctx.requestRebuild, path = std::move(path),
+                        inputPtr, selectFolder, extensions = setting.browseFileExtensions,
+                        fallbackDirectory = setting.browseFallbackDirectory]() {
+              FileDialogOptions options;
+              options.mode = selectFolder ? FileDialogMode::SelectFolder : FileDialogMode::Open;
+              options.defaultViewMode = FileDialogViewMode::List;
+              options.title = selectFolder ? i18n::tr("settings.controls.path-browse.folder-title")
+                                           : i18n::tr("settings.controls.path-browse.file-title");
+              if (!selectFolder) {
+                options.extensions = extensions;
+              }
+
+              const std::string currentValue = inputPtr->value();
+              if (!currentValue.empty()) {
+                applyPathDialogStartValue(
+                    options, currentValue, selectFolder ? PathBrowseKind::Folder : PathBrowseKind::File
+                );
+              } else {
+                applyPathDialogStartValue(options, fallbackDirectory, PathBrowseKind::Folder);
+              }
+
+              (void)FileDialog::open(
+                  std::move(options), [setOverride, requestRebuild, path](std::optional<std::filesystem::path> picked) {
+                    if (!picked.has_value()) {
+                      return;
+                    }
+                    setOverride(path, picked->string());
+                    if (requestRebuild) {
+                      requestRebuild();
+                    }
+                  }
+              );
+            },
+        })
+    );
   }
 
   std::unique_ptr<Input>
@@ -697,34 +1090,50 @@ namespace settings {
     }
     auto block = ui::column(std::move(blockProps));
 
-    auto titleRow = ui::row(
-        {.align = FlexAlign::Center,
-         .gap = Style::spaceSm * scale,
-         .minHeight = reserveTitleHeight ? std::optional<float>{Style::controlHeightSm * scale} : std::nullopt},
+    auto titleRow = ui::row({
+        .align = FlexAlign::Center,
+        .gap = Style::spaceSm * scale,
+        .minHeight = reserveTitleHeight ? std::optional<float>{Style::controlHeightSm * scale} : std::nullopt,
+        .fillWidth = compactTitleDescription ? std::optional<bool>{true} : std::nullopt,
+    });
+    titleRow->addChild(
         ui::label({
             .text = entry.title,
             .fontSize = Style::fontSizeBody * scale,
+            .fontWeight = FontWeight::Bold,
             .color = colorSpecFromRole(ColorRole::OnSurface),
             .maxLines = titleMaxTwoLines ? std::optional<int>{2} : std::nullopt,
-            .fontWeight = FontWeight::Bold,
         })
     );
-    ui::FlexProps copyProps{.align = FlexAlign::Start, .flexGrow = 1.0f};
+
+    std::unique_ptr<Flex> overrideActions;
+    if (overridden && !compactTitleDescription) {
+      overrideActions = makeOverrideResetActions(entry.path);
+    }
+
+    ui::FlexProps copyProps{.align = FlexAlign::Start, .fillWidth = true};
     if (!compactTitleDescription) {
       copyProps.gap = Style::spaceXs * scale;
+      copyProps.flexGrow = 1.0f;
     }
     auto copy = ui::column(std::move(copyProps));
     copy->addChild(std::move(titleRow));
     if (!entry.subtitle.empty()) {
-      copy->addChild(makeSettingSubtitleLabel(entry.subtitle, scale));
+      auto subtitle = makeSettingSubtitleLabel(entry.subtitle, scale);
+      if (compactTitleDescription) {
+        subtitle->setFlexGrow(1.0f);
+      }
+      copy->addChild(std::move(subtitle));
     }
 
-    auto header = ui::row({.align = FlexAlign::Start, .gap = Style::spaceSm * scale, .fillWidth = true});
-    header->addChild(std::move(copy));
-    if (overridden) {
-      header->addChild(makeOverrideResetActions(entry.path));
+    if (!compactTitleDescription && overrideActions != nullptr) {
+      auto header = ui::row({.align = FlexAlign::Start, .gap = Style::spaceSm * scale, .fillWidth = true});
+      header->addChild(std::move(copy));
+      header->addChild(std::move(overrideActions));
+      block->addChild(std::move(header));
+    } else {
+      block->addChild(std::move(copy));
     }
-    block->addChild(std::move(header));
     return block;
   }
 
@@ -854,7 +1263,8 @@ namespace settings {
       );
       row->addChild(
           ui::button({
-              .glyph = value.empty() ? std::string{} : std::string{"close"},
+              // nullopt, not "": an empty glyph name resolves to the missing-glyph skull.
+              .glyph = value.empty() ? std::nullopt : std::optional<std::string>{"close"},
               .fontSize = Style::fontSizeCaption * scale,
               .glyphSize = Style::fontSizeCaption * scale,
               .variant = ButtonVariant::Ghost,

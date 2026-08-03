@@ -2,18 +2,19 @@
 
 #include "config/config_service.h"
 #include "core/log.h"
-#include "pipewire/pipewire_spectrum.h"
 #include "render/render_context.h"
 #include "render/scene/node.h"
 #include "shell/desktop/desktop_widget_layout.h"
 #include "shell/desktop/widget_transform.h"
 #include "time/time_format.h"
+#include "ui/builders.h"
 #include "wayland/layer_surface.h"
 #include "wayland/wayland_connection.h"
 #include "wayland/wayland_seat.h"
 
 #include <algorithm>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -28,17 +29,24 @@ namespace {
     return nullptr;
   }
 
+  // Per-widget layer-shell namespace so compositor rules can target individual widgets.
+  // The id already carries the "desktop-widget-" prefix; strip it to avoid doubling.
+  std::string desktopWidgetNamespace(const DesktopWidgetState& state) {
+    constexpr std::string_view kIdPrefix = "desktop-widget-";
+    std::string_view uid = state.id;
+    if (uid.starts_with(kIdPrefix)) {
+      uid.remove_prefix(kIdPrefix.size());
+    }
+    return "noctalia-desktop-widget-" + state.type + "-" + std::string(uid);
+  }
+
 } // namespace
 
-void DesktopWidgetsHost::initialize(
-    WaylandConnection& wayland, ConfigService* config, PipeWireSpectrum* pipewireSpectrum,
-    const WeatherService* weather, RenderContext* renderContext, MprisService* mpris, HttpClient* httpClient,
-    SystemMonitorService* sysmon, DesktopWidgetScriptDeps scriptDeps
-) {
-  m_wayland = &wayland;
-  m_config = config;
-  m_renderContext = renderContext;
-  m_factory = std::make_unique<DesktopWidgetFactory>(pipewireSpectrum, weather, mpris, httpClient, sysmon, scriptDeps);
+void DesktopWidgetsHost::initialize(const DesktopWidgetServices& services) {
+  m_wayland = &services.wayland;
+  m_config = services.config;
+  m_renderContext = services.renderContext;
+  m_factory = std::make_unique<DesktopWidgetFactory>(services.runtime);
 }
 
 void DesktopWidgetsHost::show(const DesktopWidgetsSnapshot& snapshot) {
@@ -77,8 +85,18 @@ void DesktopWidgetsHost::onSecondTick() {
     if (instance->surface == nullptr || instance->widget == nullptr) {
       continue;
     }
-    if (instance->widget->wantsSecondTicks() || minuteBoundary) {
+    if (instance->widget->wantsSecondTicks()) {
+      instance->surface->requestUpdateOnly();
+    } else if (minuteBoundary) {
       instance->surface->requestUpdate();
+    }
+  }
+}
+
+void DesktopWidgetsHost::requestUpdate() {
+  for (auto& instance : m_instances) {
+    if (instance->surface != nullptr) {
+      instance->surface->requestUpdateOnly();
     }
   }
 }
@@ -161,7 +179,7 @@ void DesktopWidgetsHost::createInstance(const DesktopWidgetState& state, const W
     return;
   }
 
-  const float baseUiScale = m_config != nullptr ? m_config->config().shell.uiScale : 1.0f;
+  const float baseUiScale = m_config != nullptr ? m_config->config().accessibility.uiScale : 1.0f;
   auto widget = m_factory->create(state.type, state.settings, desktop_widgets::widgetContentScale(baseUiScale));
   if (widget == nullptr) {
     return;
@@ -187,7 +205,7 @@ void DesktopWidgetsHost::createInstance(const DesktopWidgetState& state, const W
   );
 
   auto surfaceConfig = LayerSurfaceConfig{
-      .nameSpace = "noctalia-desktop-widget",
+      .nameSpace = desktopWidgetNamespace(clampedState),
       .layer = LayerShellLayer::Bottom,
       .anchor = LayerShellAnchor::Top | LayerShellAnchor::Left,
       .width = geometry.surfaceWidth,
@@ -262,10 +280,10 @@ void DesktopWidgetsHost::createInstance(const DesktopWidgetState& state, const W
 
 void DesktopWidgetsHost::buildScene(DesktopWidgetInstance& instance) {
   if (instance.sceneRoot == nullptr) {
-    instance.sceneRoot = std::make_unique<Node>();
+    instance.sceneRoot = ui::node({});
     instance.sceneRoot->setAnimationManager(&instance.animations);
 
-    auto transformNode = std::make_unique<Node>();
+    auto transformNode = ui::node({});
     instance.transformNode = instance.sceneRoot->addChild(std::move(transformNode));
     if (instance.widget != nullptr) {
       instance.transformNode->addChild(instance.widget->releaseRoot());
@@ -293,7 +311,7 @@ void DesktopWidgetsHost::prepareFrame(DesktopWidgetInstance& instance, bool need
 
   buildScene(instance);
 
-  const float baseUiScale = m_config != nullptr ? m_config->config().shell.uiScale : 1.0f;
+  const float baseUiScale = m_config != nullptr ? m_config->config().accessibility.uiScale : 1.0f;
   instance.widget->setContentScale(desktop_widgets::widgetContentScale(baseUiScale));
   instance.widget->setBox(instance.state.boxWidth, instance.state.boxHeight);
 
@@ -347,6 +365,21 @@ void DesktopWidgetsHost::prepareFrame(DesktopWidgetInstance& instance, bool need
     desktop_widgets::widgetNodeScale(instance.state, flipScaleX, flipScaleY);
     instance.transformNode->setScale(flipScaleX, flipScaleY);
   }
+
+  if (instance.widget->needsFrameTick()) {
+    instance.surface->requestFrameTick();
+  }
+
+  if (instance.widget->hasVisibleBackground()) {
+    const float radius = instance.widget->backgroundRadius();
+    auto blurStrips = Surface::tessellateRotatedRoundedRect(
+        geometry.contentOffsetX, geometry.contentOffsetY, instance.intrinsicWidth, instance.intrinsicHeight, radius,
+        instance.state.rotationRad
+    );
+    instance.surface->setBlurRegion(blurStrips);
+  } else {
+    instance.surface->clearBlurRegion();
+  }
 }
 
 bool DesktopWidgetsHost::onPointerEvent(const PointerEvent& event) {
@@ -379,7 +412,7 @@ bool DesktopWidgetsHost::onPointerEvent(const PointerEvent& event) {
     break;
   case PointerEvent::Type::Button:
     target->inputDispatcher.pointerButton(
-        static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, event.state == 1
+        static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, event.pressed
     );
     break;
   case PointerEvent::Type::Axis:

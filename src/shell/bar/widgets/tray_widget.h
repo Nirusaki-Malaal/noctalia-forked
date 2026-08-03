@@ -1,9 +1,7 @@
 #pragma once
 
-#include "config/config_types.h"
 #include "dbus/tray/tray_service.h"
 #include "shell/bar/widget.h"
-#include "system/desktop_entry.h"
 #include "system/icon_resolver.h"
 #include "ui/palette.h"
 #include "ui/signal.h"
@@ -11,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,18 +19,29 @@ class Flex;
 class Image;
 class InputArea;
 class Glyph;
-class TrayService;
 
 class TrayWidget : public Widget {
 public:
-  TrayWidget(
-      ConfigService& config, TrayService* tray, std::vector<std::string> hiddenItems = {},
-      std::vector<std::string> pinnedItems = {}, bool drawerMode = false, std::function<void()> itemActivated = {},
-      std::string barPosition = "top", bool panelGridMode = false, std::size_t panelGridColumns = 3,
-      float inlineEntryGap = Style::spaceXs, bool matchAdjacentSpacing = false
-  );
+  struct Options {
+    std::vector<std::string> hiddenItems;
+    std::vector<std::string> pinnedItems;
+    bool drawerMode = false;
+    std::function<void()> itemActivated;
+    std::string barPosition = "top";
+    bool panelGridMode = false;
+    std::size_t panelGridColumns = 3;
+    float inlineEntryGap = Style::spaceXs;
+    bool matchAdjacentSpacing = false;
+    std::optional<float> customItemSize;
+    // Read by TrayDrawerPanel, not by TrayWidget: they live here so the tray widget definition owns their defaults.
+    double drawerItemSize = Style::baseGlyphSize;
+    bool detachedPanel = false;
+  };
+
+  TrayWidget(ConfigService& config, TrayService* tray, Options options);
 
   void create() override;
+  [[nodiscard]] bool wantsBarHoverHighlight() const noexcept override { return false; }
 
 private:
   void doLayout(Renderer& renderer, float containerWidth, float containerHeight) override;
@@ -76,7 +86,9 @@ private:
   std::size_t m_panelGridColumns = 3;
   float m_inlineEntryGap = Style::spaceXs;
   bool m_matchAdjacentSpacing = false;
+  std::optional<float> m_customItemSize;
   bool m_appIconColorizeDirty = false;
+
   InputArea* m_drawerTrigger = nullptr;
   Glyph* m_drawerChevron = nullptr;
   std::string m_drawerChevronGlyph;

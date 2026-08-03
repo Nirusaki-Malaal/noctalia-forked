@@ -1,5 +1,8 @@
 #include "render/programs/fancy_audio_visualizer_program.h"
 
+#include "render/core/render_styles.h"
+#include "render/core/texture_handle.h"
+
 #include <array>
 #include <stdexcept>
 
@@ -442,6 +445,8 @@ void FancyAudioVisualizerProgram::destroy() {
   m_waveThicknessLoc = -1;
   m_innerDiameterLoc = -1;
 }
+
+void FancyAudioVisualizerProgram::abandon() noexcept { m_program.abandon(); }
 
 void FancyAudioVisualizerProgram::draw(
     TextureId audioTexture, float surfaceWidth, float surfaceHeight, float width, float height,

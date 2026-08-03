@@ -1,47 +1,35 @@
 #include "shell/settings/settings_content.h"
 
+#include "config/config_service.h"
 #include "config/config_types.h"
 #include "i18n/i18n.h"
 #include "notification/notification_filter.h"
-#include "render/core/color.h"
 #include "shell/settings/bar_widget_editor.h"
-#include "shell/settings/color_spec_picker.h"
 #include "shell/settings/settings_content_common.h"
 #include "shell/settings/settings_control_factory.h"
 #include "ui/builders.h"
-#include "ui/controls/box.h"
 #include "ui/controls/button.h"
 #include "ui/controls/flex.h"
-#include "ui/controls/glyph.h"
 #include "ui/controls/input.h"
 #include "ui/controls/keybind_recorder.h"
 #include "ui/controls/label.h"
 #include "ui/controls/list_editor.h"
 #include "ui/controls/segmented.h"
 #include "ui/controls/select.h"
-#include "ui/controls/separator.h"
-#include "ui/controls/slider.h"
 #include "ui/controls/toggle.h"
-#include "ui/dialogs/file_dialog.h"
 #include "ui/dialogs/glyph_picker_dialog.h"
 #include "ui/palette.h"
 #include "ui/style.h"
-#include "util/string_utils.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
-#include <cstdint>
-#include <filesystem>
-#include <format>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -85,6 +73,14 @@ namespace settings {
         .pendingDeleteWidgetName = ctx.pendingDeleteWidgetName,
         .pendingDeleteWidgetSettingPath = ctx.pendingDeleteWidgetSettingPath,
         .renamingWidgetName = ctx.renamingWidgetName,
+        .makeGestureActionRow =
+            [&factory](const GestureActionSetting& setting, const std::string& title, std::vector<std::string> path) {
+              return factory.makeGestureActionRow(setting, title, std::move(path));
+            },
+        .pendingGestureKey = ctx.pendingGestureKey,
+        .pendingGestureVerb = ctx.pendingGestureVerb,
+        .actionsExpandedFor = ctx.actionsExpandedFor,
+        .actionCatalog = ctx.actionCatalog,
         .requestRebuild = ctx.requestRebuild,
         .resetContentScroll = ctx.resetContentScroll,
         .setScrollTarget = ctx.setScrollTarget,
@@ -133,6 +129,7 @@ namespace settings {
         .makeStringMapBlock = [&factory](
                                   Flex& section, const SettingEntry& entry, const StringMapSetting& map
                               ) { factory.makeStringMapBlock(section, entry, map); },
+        .supportsTaskbarWorkspaceGrouping = ctx.supportsTaskbarWorkspaceGrouping,
     };
   }
 
@@ -209,10 +206,12 @@ namespace settings {
         [&](double value, double minValue, double maxValue, double step, std::vector<std::string> path,
             bool integerValue = false, std::string valueSuffix = {},
             std::function<std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>(double)> linkedCommit =
-                {}) -> std::unique_ptr<Node> {
+                {},
+            SliderSetting::InvertSlot invertSlot = SliderSetting::InvertSlot::None,
+            bool invertEnabled = true) -> std::unique_ptr<Node> {
       return factory.makeSlider(
           value, minValue, maxValue, step, std::move(path), integerValue, std::move(linkedCommit),
-          std::move(valueSuffix)
+          std::move(valueSuffix), invertSlot, invertEnabled
       );
     };
 
@@ -227,84 +226,7 @@ namespace settings {
     };
 
     const auto makeTextWithPathBrowse = [&](const TextSetting& setting, const std::vector<std::string>& path) {
-      auto wrap = ui::row({.align = FlexAlign::Center, .gap = Style::spaceSm * scale});
-
-      const float inputWidth = (setting.width > 0.0f ? setting.width : 280.0f) * scale;
-      Input* inputPtr = nullptr;
-      auto input = ui::input({
-          .out = &inputPtr,
-          .value = setting.value,
-          .placeholder = setting.placeholder,
-          .fontSize = Style::fontSizeBody * scale,
-          .controlHeight = Style::controlHeight * scale,
-          .horizontalPadding = Style::spaceSm * scale,
-          .width = inputWidth,
-          .height = Style::controlHeight * scale,
-          .onSubmit = [setOverride = ctx.setOverride, path](const std::string& v) { setOverride(path, v); },
-          .submitOnFocusLoss = true,
-      });
-      wrap->addChild(std::move(input));
-
-      const bool selectFolder = setting.browseMode == TextSettingBrowseMode::SelectFolder;
-      auto browse = ui::button({
-          .glyph = selectFolder ? "folder" : "file-text",
-          .glyphSize = Style::fontSizeBody * scale,
-          .variant = ButtonVariant::Outline,
-          .minWidth = Style::controlHeight * scale,
-          .minHeight = Style::controlHeight * scale,
-          .paddingV = Style::spaceXs * scale,
-          .paddingH = Style::spaceSm * scale,
-          .radius = Style::scaledRadiusMd(scale),
-          .onClick = [setOverride = ctx.setOverride, path, inputPtr, selectFolder, exts = setting.browseFileExtensions,
-                      fallbackDir = setting.browseFallbackDirectory]() {
-            FileDialogOptions options;
-            options.mode = selectFolder ? FileDialogMode::SelectFolder : FileDialogMode::Open;
-            options.defaultViewMode = FileDialogViewMode::List;
-            options.title = selectFolder ? i18n::tr("settings.controls.path-browse.folder-title")
-                                         : i18n::tr("settings.controls.path-browse.file-title");
-            if (!selectFolder) {
-              options.extensions = exts;
-            }
-            const std::string cur = inputPtr->value();
-            if (!cur.empty()) {
-              std::filesystem::path p(cur);
-              std::error_code ec;
-              if (selectFolder) {
-                if (std::filesystem::exists(p, ec) && std::filesystem::is_directory(p, ec)) {
-                  options.startDirectory = p;
-                } else if (p.has_parent_path()) {
-                  const auto parent = p.parent_path();
-                  if (std::filesystem::exists(parent, ec)) {
-                    options.startDirectory = parent;
-                  }
-                }
-              } else {
-                if (std::filesystem::exists(p, ec) && std::filesystem::is_regular_file(p, ec)) {
-                  options.startDirectory = p.parent_path();
-                  options.defaultFilename = p.filename().string();
-                } else if (p.has_parent_path() && std::filesystem::exists(p.parent_path(), ec)) {
-                  options.startDirectory = p.parent_path();
-                }
-              }
-            } else if (!fallbackDir.empty()) {
-              std::error_code ec;
-              const std::filesystem::path fallback(fallbackDir);
-              if (std::filesystem::exists(fallback, ec) && std::filesystem::is_directory(fallback, ec)) {
-                options.startDirectory = fallback;
-              }
-            }
-            (void)FileDialog::open(
-                std::move(options), [setOverride, path](std::optional<std::filesystem::path> picked) {
-                  if (!picked.has_value()) {
-                    return;
-                  }
-                  setOverride(path, picked->string());
-                }
-            );
-          },
-      });
-      wrap->addChild(std::move(browse));
-      return wrap;
+      return factory.makePathBrowse(setting, path);
     };
 
     const auto makeGlyphText = [&](const TextSetting& setting, std::vector<std::string> path) -> std::unique_ptr<Node> {
@@ -314,7 +236,7 @@ namespace settings {
       auto pickerButton = ui::button({
           .glyph = "apps",
           .glyphSize = Style::fontSizeBody * scale,
-          .variant = ButtonVariant::Outline,
+          .variant = ButtonVariant::Default,
           .minWidth = Style::controlHeight * scale,
           .minHeight = Style::controlHeight * scale,
           .paddingV = Style::spaceXs * scale,
@@ -376,14 +298,17 @@ namespace settings {
 
       auto checkRow = ui::row(
           {.align = FlexAlign::Center,
+           .wrap = true,
            .gap = Style::spaceMd * scale,
            .paddingV = Style::spaceXs * scale,
-           .paddingH = 0.0f}
+           .paddingH = 0.0f,
+           .fillWidth = true}
       );
 
       auto options = setting.options;
       auto selected = setting.selectedValues;
       const bool requireAtLeastOne = setting.requireAtLeastOne;
+      const bool persistUnselected = setting.persistUnselected;
       auto path = entry.path;
 
       for (const auto& option : options) {
@@ -395,7 +320,7 @@ namespace settings {
             .checked = isSelected,
             .scale = scale,
             .onChange = [setOverride = ctx.setOverride, requestRebuild = ctx.requestRebuild, path, options, selected,
-                         optionValue, requireAtLeastOne](bool checked) mutable {
+                         optionValue, requireAtLeastOne, persistUnselected](bool checked) mutable {
               auto it = std::ranges::find(selected, optionValue);
               if (checked) {
                 if (it == selected.end()) {
@@ -410,11 +335,12 @@ namespace settings {
                   selected.erase(it);
                 }
               }
-              // Preserve the option order so the override file is stable.
+              // Preserve the option order so the override file is stable. When
+              // persistUnselected is set, store the unchecked complement (denylist).
               std::vector<std::string> ordered;
-              ordered.reserve(selected.size());
+              ordered.reserve(options.size());
               for (const auto& opt : options) {
-                if (std::ranges::contains(selected, opt.value)) {
+                if (std::ranges::contains(selected, opt.value) != persistUnselected) {
                   ordered.push_back(opt.value);
                 }
               }
@@ -501,8 +427,8 @@ namespace settings {
                       .bg = colorSpecFromRole(
                           active ? ColorRole::Primary : ColorRole::SurfaceVariant, active ? 1.0f : 0.45f
                       ),
-                      .border =
-                          colorSpecFromRole(active ? ColorRole::Primary : ColorRole::Outline, active ? 0.9f : 0.45f),
+                      .border = active ? colorSpecFromRole(ColorRole::Primary, 0.9f)
+                                       : colorSpecFromRole(ColorRole::Outline, Style::disabledOutlineAlpha),
                       .label = colorSpecFromRole(active ? ColorRole::OnPrimary : ColorRole::OnSurface),
                   },
               .hover =
@@ -520,7 +446,7 @@ namespace settings {
               .disabled =
                   Button::ButtonStateColors{
                       .bg = colorSpecFromRole(ColorRole::SurfaceVariant, 0.35f),
-                      .border = colorSpecFromRole(ColorRole::Outline, 0.35f),
+                      .border = colorSpecFromRole(ColorRole::Outline, Style::disabledOutlineAlpha),
                       .label = colorSpecFromRole(ColorRole::OnSurfaceVariant),
                   },
               .selected = std::nullopt,
@@ -569,9 +495,9 @@ namespace settings {
                 .out = &titleLabel,
                 .text = option.label,
                 .fontSize = Style::fontSizeBody * scale,
+                .fontWeight = FontWeight::Medium,
                 .color = colorSpecFromRole(checked ? ColorRole::OnPrimary : ColorRole::OnSurface),
                 .maxLines = 1,
-                .fontWeight = FontWeight::Medium,
             })
         );
         if (!option.description.empty()) {
@@ -644,6 +570,9 @@ namespace settings {
           syncPressedText();
         });
         card->setOnClick([checkedState, setTileActive]() mutable { setTileActive(!*checkedState); });
+        if (!option.tooltip.empty()) {
+          card->setTooltip(option.tooltip);
+        }
 
         row->addChild(std::move(cardNode));
         ++countInRow;
@@ -662,9 +591,35 @@ namespace settings {
                                           const KeybindListSetting& keybinds) {
       const bool overridden = (ctx.configService != nullptr && ctx.configService->hasEffectiveOverride(entry.path));
 
-      auto block = makeCollectionBlock(entry, overridden, true, true, true, true);
+      auto block = makeCollectionBlock(entry, false, true, true, true, true, true);
+      block->setClipChildren(true);
+      block->setMinWidth(0.0f);
+      block->setGap(Style::spaceXs * scale);
 
-      auto list = ui::column({.align = FlexAlign::Stretch, .gap = Style::spaceXs * scale});
+      auto list = ui::column({
+          .align = FlexAlign::Stretch,
+          .gap = Style::spaceXs * scale,
+          .fillWidth = true,
+          .clipChildren = true,
+      });
+
+      const auto configureGridRecorder = [](KeybindRecorder& recorder) {
+        recorder.setMinWidth(0.0f);
+        recorder.setFillWidth(true);
+        recorder.setClipChildren(true);
+      };
+
+      const auto keybindTabFocusKey = [&entry](std::string_view suffix) {
+        std::string key;
+        for (std::size_t i = 0; i < entry.path.size(); ++i) {
+          if (i > 0) {
+            key += '.';
+          }
+          key += entry.path[i];
+        }
+        key += suffix;
+        return key;
+      };
 
       // An empty list clears the override so defaults take effect again; never persist as "disabled".
       // If no GUI override exists, request a rebuild so the UI snaps back to the underlying default.
@@ -685,19 +640,26 @@ namespace settings {
       };
 
       for (std::size_t i = 0; i < keybinds.items.size(); ++i) {
-        auto row = ui::row({.align = FlexAlign::Center, .gap = Style::spaceXs * scale});
+        auto row = ui::row({
+            .align = FlexAlign::Center,
+            .gap = Style::spaceXs * scale,
+            .fillWidth = true,
+        });
 
         auto recorder = ui::keybindRecorder({
             .chord = keybinds.items[i],
             .scale = scale,
             .unsetPlaceholder = i18n::tr("settings.controls.keybind.unset-placeholder"),
             .recordingPlaceholder = i18n::tr("settings.controls.keybind.recording-placeholder"),
-            .onCommit = [commitItems, items = keybinds.items, i](KeyChord chord) mutable {
-              if (i < items.size()) {
-                items[i] = chord;
-                commitItems(std::move(items));
-              }
-            },
+            .flexGrow = 1.0f,
+            .onCommit =
+                [commitItems, items = keybinds.items, i](KeyChord chord) mutable {
+                  if (i < items.size()) {
+                    items[i] = chord;
+                    commitItems(std::move(items));
+                  }
+                },
+            .configure = configureGridRecorder,
         });
         row->addChild(std::move(recorder));
 
@@ -707,6 +669,8 @@ namespace settings {
             .variant = ButtonVariant::Ghost,
             .minWidth = Style::controlHeightSm * scale,
             .minHeight = Style::controlHeightSm * scale,
+            .maxWidth = Style::controlHeightSm * scale,
+            .maxHeight = Style::controlHeightSm * scale,
             .padding = Style::spaceXs * scale,
             .radius = Style::scaledRadiusSm(scale),
             .onClick = [commitItems, items = keybinds.items, i]() mutable {
@@ -725,25 +689,40 @@ namespace settings {
       const bool canAdd = (keybinds.maxItems == 0 || keybinds.items.size() < keybinds.maxItems);
       if (canAdd) {
         // Trailing recorder is UI-only; it only joins the persisted list once a chord is recorded.
-        auto addRow = ui::row({.align = FlexAlign::Center, .gap = Style::spaceXs * scale});
+        auto addRow = ui::row({
+            .align = FlexAlign::Center,
+            .gap = Style::spaceXs * scale,
+            .fillWidth = true,
+        });
 
         auto addRecorder = ui::keybindRecorder({
             .scale = scale,
             .unsetPlaceholder = i18n::tr("settings.controls.keybind.add"),
             .recordingPlaceholder = i18n::tr("settings.controls.keybind.recording-placeholder"),
-            .onCommit = [commitItems, items = keybinds.items](KeyChord chord) mutable {
-              items.push_back(chord);
-              commitItems(std::move(items));
-            },
+            .flexGrow = 1.0f,
+            .onCommit =
+                [commitItems, items = keybinds.items](KeyChord chord) mutable {
+                  items.push_back(chord);
+                  commitItems(std::move(items));
+                },
+            .configure =
+                [configureGridRecorder, focusKey = keybindTabFocusKey(".add")](KeybindRecorder& recorder) {
+                  configureGridRecorder(recorder);
+                  recorder.setTabFocusKey(focusKey);
+                },
         });
         addRow->addChild(std::move(addRecorder));
+        // Reserve the remove-button column so the add recorder lines up with the recorded ones.
+        addRow->addChild(ui::row({.width = Style::controlHeightSm * scale}));
 
         list->addChild(std::move(addRow));
       }
 
-      // Push the recorder to the bottom of the block so inputs line up across the stretched row.
-      block->addChild(ui::spacer());
       block->addChild(std::move(list));
+
+      if (overridden) {
+        block->addChild(factory.makeOverrideResetActions(entry.path));
+      }
 
       section.addChild(std::move(block));
     };
@@ -901,10 +880,14 @@ namespace settings {
         auto enabledToggle = ui::toggle({
             .checked = (*state)[idx].enabled,
             .scale = scale,
-            .onChange = [state, rowIndex = idx, commit](bool v) {
-              (*state)[rowIndex].enabled = v;
-              commit();
-            },
+            .onChange =
+                [state, rowIndex = idx, commit](bool v) {
+                  (*state)[rowIndex].enabled = v;
+                  commit();
+                },
+            .configure = [idx](
+                             Toggle& toggle
+                         ) { toggle.setTabFocusKey("settings.session-actions." + std::to_string(idx) + ".enabled"); },
         });
         row->addChild(std::move(enabledToggle));
 
@@ -924,8 +907,8 @@ namespace settings {
           .onClick = [state, commit]() {
             state->push_back(
                 SessionPanelActionConfig{
-                    "command", true, "notify-send 'Noctalia' 'Custom session entry'", std::nullopt, std::nullopt,
-                    SessionActionButtonVariant::Default, std::nullopt
+                    .action = "command",
+                    .command = "notify-send 'Noctalia' 'Custom session entry'",
                 }
             );
             commit();
@@ -1027,10 +1010,14 @@ namespace settings {
         auto enabledToggle = ui::toggle({
             .checked = (*state)[idx].enabled,
             .scale = scale,
-            .onChange = [state, rowIndex = idx, commit](bool v) {
-              (*state)[rowIndex].enabled = v;
-              commit();
-            },
+            .onChange =
+                [state, rowIndex = idx, commit](bool v) {
+                  (*state)[rowIndex].enabled = v;
+                  commit();
+                },
+            .configure = [idx](
+                             Toggle& toggle
+                         ) { toggle.setTabFocusKey("settings.idle.behavior." + std::to_string(idx) + ".enabled"); },
         });
         row->addChild(std::move(enabledToggle));
 
@@ -1107,10 +1094,15 @@ namespace settings {
         auto enabledToggle = ui::toggle({
             .checked = (*state)[idx].enabled,
             .scale = scale,
-            .onChange = [state, rowIndex = idx, commit](bool v) {
-              (*state)[rowIndex].enabled = v;
-              commit();
-            },
+            .onChange =
+                [state, rowIndex = idx, commit](bool v) {
+                  (*state)[rowIndex].enabled = v;
+                  commit();
+                },
+            .configure =
+                [idx](Toggle& toggle) {
+                  toggle.setTabFocusKey("settings.notifications.filter." + std::to_string(idx) + ".enabled");
+                },
         });
         row->addChild(std::move(enabledToggle));
 
@@ -1149,7 +1141,7 @@ namespace settings {
             } else if constexpr (std::is_same_v<T, SliderSetting>) {
               return makeSlider(
                   control.value, control.minValue, control.maxValue, control.step, entry.path, control.integerValue,
-                  control.valueSuffix, control.linkedCommit
+                  control.valueSuffix, control.linkedCommit, control.invertSlot, control.invertEnabled
               );
             } else if constexpr (std::is_same_v<T, RangeSliderSetting>) {
               return makeRangeSlider(control, entry.path);
@@ -1190,7 +1182,7 @@ namespace settings {
                 return ui::button({
                     .text = control.label,
                     .fontSize = Style::fontSizeBody * scale,
-                    .variant = ButtonVariant::Outline,
+                    .variant = control.destructive ? ButtonVariant::Destructive : ButtonVariant::Default,
                     .minHeight = Style::controlHeight * scale,
                     .paddingV = Style::spaceSm * scale,
                     .paddingH = Style::spaceMd * scale,
@@ -1203,7 +1195,7 @@ namespace settings {
                   .glyph = control.glyph,
                   .fontSize = Style::fontSizeBody * scale,
                   .glyphSize = Style::fontSizeBody * scale,
-                  .variant = ButtonVariant::Outline,
+                  .variant = control.destructive ? ButtonVariant::Destructive : ButtonVariant::Default,
                   .minHeight = Style::controlHeight * scale,
                   .paddingV = Style::spaceSm * scale,
                   .paddingH = Style::spaceMd * scale,
@@ -1212,6 +1204,8 @@ namespace settings {
               });
             } else if constexpr (std::is_same_v<T, ColorSpecPickerSetting>) {
               return makeColorSpecPicker(control, entry.path);
+            } else if constexpr (std::is_same_v<T, GestureActionSetting>) {
+              return factory.makeGestureActionRow(control, entry.title, entry.path);
             }
           },
           entry.control
@@ -1221,46 +1215,19 @@ namespace settings {
     std::string activeSectionKey;
     std::string activeGroupKey;
     Flex* activeSection = nullptr;
-    // Row-major grid state for keybind entries (see KeybindListSetting dispatch below).
-    constexpr std::size_t kKeybindsPerRow = 3;
+    constexpr std::size_t kKeybindsPerRow = 2;
     Flex* activeKeybindRow = nullptr;
     std::size_t activeKeybindRowCount = 0;
     std::size_t visibleEntries = 0;
+    // Very short queries (one or two letters) match hundreds of entries and building the subtree for every match is
+    // costly. Cap how many results we render and hint that the list was truncated.
+    constexpr std::size_t kMaxSearchResults = 50;
+    bool truncated = false;
     const std::string normalizedSearchQuery = normalizedSettingQuery(ctx.searchQuery);
 
     BarWidgetEditorContext barWidgetEditorCtx = makeBarWidgetEditorContext(factory);
 
-    auto visibilityConditionMatches = [&](const SettingVisibilityCondition& cond) -> bool {
-      for (const auto& other : registry) {
-        if (other.path == cond.path) {
-          std::string currentValue;
-          if (const auto* toggle = std::get_if<ToggleSetting>(&other.control)) {
-            currentValue = toggle->checked ? "true" : "false";
-          } else if (const auto* select = std::get_if<SelectSetting>(&other.control)) {
-            currentValue = select->selectedValue;
-          }
-          for (const auto& v : cond.values) {
-            if (v == currentValue) {
-              return true;
-            }
-          }
-          return false;
-        }
-      }
-      return true;
-    };
-
-    auto isEntryVisible = [&](const SettingEntry& e) -> bool {
-      if (!e.visibleWhen.has_value()) {
-        return true;
-      }
-      for (const auto& cond : e.visibleWhen->all) {
-        if (!visibilityConditionMatches(cond)) {
-          return false;
-        }
-      }
-      return true;
-    };
+    auto isEntryVisible = [&](const SettingEntry& e) -> bool { return !e.visibleWhen || e.visibleWhen(ctx.config); };
 
     const std::string_view selectedBarName =
         ctx.selectedBar != nullptr ? std::string_view{ctx.selectedBar->name} : std::string_view{};
@@ -1297,11 +1264,17 @@ namespace settings {
       }
       if (ctx.showOverriddenOnly
           && ctx.configService != nullptr
-          && !ctx.configService->hasEffectiveOverride(entry.path)) {
+          && !settingEntryHasEffectiveOverride(entry, *ctx.configService)) {
         continue;
       }
       if (!matchesNormalizedSettingQuery(entry, normalizedSearchQuery)) {
         continue;
+      }
+      // Cap only once a genuinely-matching entry is about to be rendered, so the truncation hint never
+      // shows when exactly kMaxSearchResults entries matched and the remainder were filtered out anyway.
+      if (!ctx.searchQuery.empty() && visibleEntries >= kMaxSearchResults) {
+        truncated = true;
+        break;
       }
 
       const std::string contentSectionKey = barSettingContentSectionKey(entry);
@@ -1320,6 +1293,12 @@ namespace settings {
           displayTitle = sectionLabel(entry.section);
         }
         activeSection = makeSection(displayTitle, entry.section);
+        if (ctx.config.shell.offlineMode && settingsSectionNeedsOfflineModeNotice(entry.section)) {
+          const bool showDisableHint = entry.section != SettingsSection::Security;
+          activeSection->addChild(
+              makeOfflineModeNotice(scale, offlineModeNoticeMessage(entry.section), showDisableHint)
+          );
+        }
       }
       if (activeSection != nullptr) {
         if (entry.group != activeGroupKey) {
@@ -1332,8 +1311,7 @@ namespace settings {
             addIdleLiveStatusPanel(*activeSection, ctx, scale);
           }
         }
-        const bool isKeybindEntry = std::holds_alternative<KeybindListSetting>(entry.control);
-        if (!isKeybindEntry) {
+        if (!std::holds_alternative<KeybindListSetting>(entry.control)) {
           activeKeybindRow = nullptr;
           activeKeybindRowCount = 0;
         }
@@ -1347,10 +1325,8 @@ namespace settings {
           makeShortcutListBlock(*activeSection, entry, *shortcuts);
         } else if (const auto* keybindList = std::get_if<KeybindListSetting>(&entry.control)) {
           if (activeKeybindRow == nullptr || activeKeybindRowCount >= kKeybindsPerRow) {
-            // Stretch so every block in the row shares the tallest block's height; each block then
-            // bottom-anchors its recorder, keeping inputs aligned regardless of description length.
             auto row = ui::row({
-                .align = FlexAlign::Stretch,
+                .align = FlexAlign::Start,
                 .gap = Style::spaceMd * scale,
                 .fillWidth = true,
             });
@@ -1378,6 +1354,13 @@ namespace settings {
       }
     }
 
+    if (activeKeybindRow != nullptr && activeKeybindRowCount > 0 && activeKeybindRowCount < kKeybindsPerRow) {
+      while (activeKeybindRowCount < kKeybindsPerRow) {
+        activeKeybindRow->addChild(ui::row({.fillWidth = true, .flexGrow = 1.0f}));
+        ++activeKeybindRowCount;
+      }
+    }
+
     // The Plugins section has no registry entries — it renders fully custom
     // content (addSettingsPlugins), so suppress the "no settings found" state.
     if (visibleEntries == 0 && ctx.selectedSection != "plugins") {
@@ -1388,7 +1371,7 @@ namespace settings {
            .padding = (Style::spaceLg * 2.0f) * scale,
            .fill = colorSpecFromRole(ColorRole::SurfaceVariant, 0.24f),
            .radius = Style::scaledRadiusMd(scale),
-           .border = colorSpecFromRole(ColorRole::Outline, 0.28f),
+           .border = colorSpecFromRole(ColorRole::Outline),
            .minWidth = 360.0f * scale,
            .minHeight = 160.0f * scale,
            .fillWidth = true,
@@ -1407,6 +1390,18 @@ namespace settings {
           ui::row(
               {.align = FlexAlign::Center, .fillWidth = true}, ui::box({.flexGrow = 0.5f}), std::move(emptyState),
               ui::box({.flexGrow = 0.5f})
+          )
+      );
+    }
+
+    if (truncated) {
+      content.addChild(
+          ui::row(
+              {.align = FlexAlign::Center, .justify = FlexJustify::Center, .fillWidth = true},
+              makeLabel(
+                  i18n::tr("settings.window.search-truncated", "count", std::to_string(kMaxSearchResults)),
+                  Style::fontSizeBody * scale, colorSpecFromRole(ColorRole::OnSurfaceVariant), FontWeight::Normal
+              )
           )
       );
     }

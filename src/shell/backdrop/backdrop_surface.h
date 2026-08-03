@@ -1,7 +1,6 @@
 #pragma once
 
 #include "render/core/cached_layer.h"
-#include "render/core/texture_handle.h"
 #include "render/wallpaper_renderer.h"
 #include "wayland/layer_surface.h"
 #include "shell/backdrop/video_player.h"
@@ -26,6 +25,9 @@ public:
   void playVideo(const std::string& path);
   void stopVideo();
   void onGpuResourcesInvalidated();
+  void prepareForGraphicsReset() noexcept;
+  void restoreAfterGraphicsReset();
+  void finishGraphicsResetRecovery() noexcept;
 
   [[nodiscard]] WallpaperRenderer* wallpaperRenderer() noexcept { return &m_wallpaperRenderer; }
 

@@ -22,6 +22,7 @@ public:
 
   void initialize(wl_display* display, bool createSharedContext = true);
   void cleanup();
+  void recreateRootContext();
 
   [[nodiscard]] EGLDisplay display() const noexcept { return m_display; }
   [[nodiscard]] EGLConfig config() const noexcept { return m_config; }
@@ -34,8 +35,9 @@ public:
 
   [[nodiscard]] EGLContext createContext(EGLContext shareContext, std::string_view label);
 
-  // Bind the root context surfacelessly. No-op when shared context is disabled.
-  void makeCurrentSurfaceless() const;
+  // Bind the root context surfacelessly. No-op (returns true) when shared context is disabled.
+  // Returns false if eglMakeCurrent failed (e.g. context lost on resume); callers skip GPU work.
+  bool makeCurrentSurfaceless() const;
 
 private:
   void buildContextAttributes();
@@ -49,4 +51,5 @@ private:
   bool m_contextAttributesRobust = false;
   bool m_resetNotificationEnabled = false;
   bool m_videoMemoryPurgeNotificationEnabled = false;
+  bool m_sharedContextEnabled = false;
 };

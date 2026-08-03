@@ -1,15 +1,17 @@
 #pragma once
 
 #include "render/core/shader_program.h"
-#include "render/core/texture_handle.h"
 
 #include <GLES2/gl2.h>
 #include <cstdint>
+
+class TextureId;
 
 class BlurProgram {
 public:
   void ensureInitialized();
   void destroy();
+  void abandon() noexcept;
 
   // Draw srcTex to the currently-bound framebuffer using a separable Gaussian blur.
   // dirX/dirY: blur direction (1,0 = horizontal, 0,1 = vertical).

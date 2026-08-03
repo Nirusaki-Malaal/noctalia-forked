@@ -1,6 +1,5 @@
 #pragma once
 
-#include "config/config_service.h"
 #include "shell/settings/settings_registry.h"
 
 #include <cstddef>
@@ -13,9 +12,9 @@
 
 class Flex;
 class InputArea;
-class Button;
 class Label;
 class Node;
+class ConfigService;
 
 namespace settings {
 
@@ -23,6 +22,18 @@ namespace settings {
   inline constexpr int kSettingDescriptionMaxLines = 5;
 
   [[nodiscard]] std::unique_ptr<Label> makeSettingSubtitleLabel(std::string_view text, float scale);
+
+  struct SearchPickerOpenRequest {
+    std::string title;
+    std::vector<SelectOption> options;
+    std::string selectedValue;
+    std::string placeholder;
+    std::string emptyText;
+    std::vector<std::string> settingPath;
+    // When set, replaces the default "empty clears, otherwise set" commit for settingPath.
+    // Needed where the chosen option is not itself the stored value.
+    std::function<void(const std::string&)> onSelect;
+  };
 
   struct SettingsContentContext {
     const Config& config;
@@ -43,6 +54,12 @@ namespace settings {
     std::string& pendingDeleteWidgetName;
     std::string& pendingDeleteWidgetSettingPath;
     std::string& renamingWidgetName;
+    std::string& pendingGestureKey;
+    std::string& pendingGestureVerb;
+    std::string& actionsExpandedFor;
+    // Bindable IPC commands for the gesture action picker: value = command, label = usage,
+    // description = the command's --help text.
+    std::vector<GestureActionOption> actionCatalog;
 
     std::function<void()> requestRebuild;
     std::function<void()> requestContentRebuild;
@@ -50,14 +67,13 @@ namespace settings {
     std::function<void(Node*)> setScrollTarget;
     std::function<void(InputArea*)> focusArea;
     std::function<void(const std::vector<std::string>&)> openBarWidgetAddPopup;
-    std::function<void(
-        const std::string& title, const std::vector<SelectOption>& options, const std::string& selectedValue,
-        const std::string& placeholder, const std::string& emptyText, const std::vector<std::string>& settingPath
-    )>
-        openSearchPickerPopup;
+    std::function<void(SearchPickerOpenRequest request)> openSearchPickerPopup;
     std::function<void(std::vector<std::string>, ConfigOverrideValue)> setOverride;
     std::function<void(std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>)> setOverrides;
     std::function<void(std::vector<std::string>)> clearOverride;
+    std::function<void(std::vector<std::vector<std::string>>)> clearOverrides;
+    std::function<bool(const std::vector<std::vector<std::string>>&)> isResetConfirmationPending;
+    std::function<void(std::vector<std::vector<std::string>>)> requestResetConfirmation;
     std::function<void(std::string, std::string, std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>)>
         renameWidgetInstance;
 
@@ -78,6 +94,7 @@ namespace settings {
     std::function<void()> afterIdleBehaviorApply;
     std::function<void()> afterNotificationFilterApply;
     std::function<void()> closeHostedEditor;
+    bool supportsTaskbarWorkspaceGrouping = true;
   };
 
   std::size_t

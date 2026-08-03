@@ -1,6 +1,7 @@
 #pragma once
 
-#include "notification/notification_manager.h"
+#include "core/timer_manager.h"
+#include "notification/notification.h"
 #include "render/animation/animation_manager.h"
 #include "render/scene/input_dispatcher.h"
 #include "system/icon_resolver.h"
@@ -11,15 +12,16 @@
 #include <vector>
 
 class ConfigService;
-class Glyph;
 class HttpClient;
 class Input;
 class InputArea;
 class LayerSurface;
+class NotificationManager;
 class Node;
 class ProgressBar;
 class RenderContext;
 class WaylandConnection;
+enum class NotificationEvent;
 struct KeyboardEvent;
 struct PointerEvent;
 struct WaylandOutput;
@@ -73,6 +75,7 @@ private:
     std::uint64_t hoverResetToken = 0;
     bool hoverResetPending = false;
     bool replyInputFocused = false;
+    Timer exitFallbackTimer;
   };
 
   // Per-output instance (each has its own surface, scene, animations)

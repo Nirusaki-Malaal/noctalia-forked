@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config/config_types.h"
+#include "render/core/render_styles.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,12 +30,23 @@ namespace shell::dock {
     std::int32_t exclusiveZone = 0;
   };
 
+  struct DockConcaveShape {
+    CornerShapes corners{};
+    Radii radii;
+    RectInsets logicalInset{};
+  };
+
+  [[nodiscard]] DockConcaveShape dockConcaveShape(const DockConfig& cfg);
+
   [[nodiscard]] std::uint32_t positionToAnchor(DockEdge edge);
   [[nodiscard]] bool isVerticalEdge(DockEdge edge);
   void shiftAlongEdge(DockEdge edge, float& x, float& y, float amount);
   [[nodiscard]] std::int32_t dockContentSize(const DockConfig& cfg, std::size_t itemCount);
   [[nodiscard]] std::int32_t dockThickness(const DockConfig& cfg);
+  // Extra cross-axis surface padding so magnified icons (and badges) are not clipped.
   [[nodiscard]] std::int32_t dockHoverZoomCrossPad(const DockConfig& cfg);
+  // Extra main-axis end padding for magnified icon/badge overhang past the pill ends.
+  [[nodiscard]] std::int32_t dockHoverZoomMainPad(const DockConfig& cfg);
   [[nodiscard]] std::size_t dockLauncherButtonCount(DockLauncherPosition position);
   [[nodiscard]] std::size_t dockLauncherButtonCount(const DockConfig& cfg);
   [[nodiscard]] DockSurfaceGeometry

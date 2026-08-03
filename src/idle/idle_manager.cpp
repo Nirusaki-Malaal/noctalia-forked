@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace {
@@ -16,6 +17,7 @@ namespace {
   constexpr Logger kLog("idle");
 
   constexpr std::uint32_t kHeartbeatTimeoutMs = 1000;
+  constexpr double kMaxIdleTimeoutMs = static_cast<double>(std::numeric_limits<std::uint32_t>::max());
 
   const ext_idle_notification_v1_listener kIdleNotificationListener = {
       .idled = &IdleManager::handleIdled,
@@ -26,6 +28,11 @@ namespace {
       .idled = &IdleManager::handleHeartbeatIdled,
       .resumed = &IdleManager::handleHeartbeatResumed,
   };
+
+  std::uint32_t timeoutSecondsToMilliseconds(double timeoutSeconds) {
+    const double timeoutMs = std::clamp(std::ceil(timeoutSeconds * 1000.0), 1.0, kMaxIdleTimeoutMs);
+    return static_cast<std::uint32_t>(timeoutMs);
+  }
 
 } // namespace
 
@@ -156,11 +163,13 @@ void IdleManager::recreateBehaviorNotification(BehaviorState& behavior) {
   }
   behavior.phase = BehaviorPhase::Waiting;
 
-  if (!behavior.config.enabled || behavior.config.timeoutSeconds <= 0) {
+  if (!behavior.config.enabled
+      || !std::isfinite(behavior.config.timeoutSeconds)
+      || behavior.config.timeoutSeconds <= 0.0) {
     return;
   }
 
-  const auto timeoutMs = static_cast<std::uint32_t>(behavior.config.timeoutSeconds) * 1000u;
+  const auto timeoutMs = timeoutSecondsToMilliseconds(behavior.config.timeoutSeconds);
   behavior.notification = m_wayland->createIdleNotification(timeoutMs);
   if (behavior.notification == nullptr) {
     kLog.warn("failed to re-register idle behavior '{}'", behavior.config.name);
@@ -185,11 +194,11 @@ void IdleManager::createBehavior(const IdleBehaviorConfig& config) {
   if (!config.enabled) {
     return;
   }
-  if (config.timeoutSeconds < 0) {
+  if (!std::isfinite(config.timeoutSeconds) || config.timeoutSeconds < 0.0) {
     kLog.warn("idle behavior '{}' ignored: timeout must be >= 0 seconds", config.name);
     return;
   }
-  if (config.timeoutSeconds == 0) {
+  if (config.timeoutSeconds == 0.0) {
     kLog.debug("idle behavior '{}' disabled by zero timeout", config.name);
     return;
   }
@@ -202,7 +211,7 @@ void IdleManager::createBehavior(const IdleBehaviorConfig& config) {
   auto behavior = std::make_unique<BehaviorState>();
   behavior->owner = this;
   behavior->config = config;
-  const auto timeoutMs = static_cast<std::uint32_t>(config.timeoutSeconds) * 1000u;
+  const auto timeoutMs = timeoutSecondsToMilliseconds(config.timeoutSeconds);
   behavior->notification = m_wayland->createIdleNotification(timeoutMs);
   if (behavior->notification == nullptr) {
     kLog.warn("failed to register idle behavior '{}'", config.name);
@@ -214,20 +223,25 @@ void IdleManager::createBehavior(const IdleBehaviorConfig& config) {
   m_behaviors.push_back(std::move(behavior));
 }
 
-void IdleManager::runBehavior(BehaviorState& behavior) {
+bool IdleManager::runBehavior(BehaviorState& behavior) {
   const ResolvedIdleBehavior resolved = resolveIdleBehaviorActions(behavior.config);
-  if (!runAction(behavior.config, resolved.idleAction)) {
+  const bool ok = runAction(behavior.config, resolved.idleAction);
+  if (!ok) {
     kLog.warn("idle behavior '{}' action failed", behavior.config.name);
   }
+  return ok;
 }
 
 void IdleManager::runResumeBehavior(BehaviorState& behavior) {
   const ResolvedIdleBehavior resolved = resolveIdleBehaviorActions(behavior.config);
-  if (resolved.resumeAction.kind == IdleActionKind::None) {
-    return;
+  if (resolved.resumeAction.kind != IdleActionKind::None && !runAction(behavior.config, resolved.resumeAction)) {
+    kLog.warn("idle behavior '{}' native resume action failed", behavior.config.name);
   }
-  if (!runAction(behavior.config, resolved.resumeAction)) {
-    kLog.warn("idle behavior '{}' resume action failed", behavior.config.name);
+  if (!resolved.resumeCommand.empty()
+      && !runAction(
+          behavior.config, IdleActionRequest{.kind = IdleActionKind::Command, .command = resolved.resumeCommand}
+      )) {
+    kLog.warn("idle behavior '{}' resume command failed", behavior.config.name);
   }
 }
 
@@ -245,16 +259,18 @@ void IdleManager::cancelActiveGrace(bool userCancelled) {
   if (!hasActiveGrace()) {
     return;
   }
+  const bool willLockSession = m_activeGraceWillLock;
   for (auto* behavior : m_graceBehaviors) {
     if (behavior != nullptr) {
       behavior->phase = BehaviorPhase::Waiting;
     }
   }
   m_graceBehaviors.clear();
+  m_activeGraceWillLock = false;
   m_graceFallbackTimer.stop();
   ++m_graceGeneration;
   if (m_onGraceEnd) {
-    m_onGraceEnd(userCancelled);
+    m_onGraceEnd(userCancelled, willLockSession);
   }
 }
 
@@ -265,23 +281,41 @@ void IdleManager::graceFadeComplete() {
   auto behaviors = std::move(m_graceBehaviors);
   m_graceBehaviors.clear();
   m_graceFallbackTimer.stop();
-  m_graceFallbackTimer.stop();
-  if (m_onGraceEnd) {
-    m_onGraceEnd(false);
+
+  // End grace (and tear down the overlay) before idle actions. Suspend can freeze the process
+  // before a deferred hide runs, leaving the opaque layer surface stuck after resume.
+  bool willDispatchLockAction = false;
+  for (auto* behavior : behaviors) {
+    if (behavior == nullptr || behavior->phase != BehaviorPhase::Fading) {
+      continue;
+    }
+    const IdleActionKind idleKind = resolveIdleBehaviorActions(behavior->config).idleAction.kind;
+    if (idleKind == IdleActionKind::Lock || idleKind == IdleActionKind::LockAndSuspend) {
+      willDispatchLockAction = true;
+    }
   }
+  m_activeGraceWillLock = false;
+  if (m_onGraceEnd) {
+    m_onGraceEnd(false, willDispatchLockAction);
+  }
+
   for (auto* behavior : behaviors) {
     if (behavior == nullptr || behavior->phase != BehaviorPhase::Fading) {
       continue;
     }
     behavior->phase = BehaviorPhase::Idled;
     kLog.info("idle behavior '{}' triggered after pre-action fade", behavior->config.name);
-    runBehavior(*behavior);
+    (void)runBehavior(*behavior);
   }
 }
 
 void IdleManager::joinActiveGrace(BehaviorState& behavior) {
   if (std::ranges::contains(m_graceBehaviors, &behavior)) {
     return;
+  }
+  const IdleActionKind idleKind = resolveIdleBehaviorActions(behavior.config).idleAction.kind;
+  if (idleKind == IdleActionKind::Lock || idleKind == IdleActionKind::LockAndSuspend) {
+    m_activeGraceWillLock = true;
   }
   behavior.phase = BehaviorPhase::Fading;
   m_graceBehaviors.push_back(&behavior);

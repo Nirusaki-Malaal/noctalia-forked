@@ -1,5 +1,7 @@
 #include "render/backend/gles_framebuffer.h"
 
+#include "render/core/texture_manager.h"
+
 #include <utility>
 
 GlesFramebuffer::~GlesFramebuffer() { destroy(); }
@@ -70,6 +72,14 @@ void GlesFramebuffer::destroy() {
     m_textures->unload(m_color);
   }
   m_textures = nullptr;
+  m_width = 0;
+  m_height = 0;
+}
+
+void GlesFramebuffer::abandon() noexcept {
+  m_textures = nullptr;
+  m_id = 0;
+  m_color = {};
   m_width = 0;
   m_height = 0;
 }

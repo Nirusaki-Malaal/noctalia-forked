@@ -1,8 +1,8 @@
 #include "system/location_service.h"
 
+#include "config/config_service.h"
 #include "core/log.h"
 #include "i18n/i18n.h"
-#include "json.hpp"
 #include "net/http_client.h"
 #include "util/string_utils.h"
 
@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <format>
 #include <fstream>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <system_error>
 

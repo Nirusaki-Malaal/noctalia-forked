@@ -1,11 +1,12 @@
 #pragma once
 
 #include "config/config_types.h"
-#include "shell/backdrop/backdrop_instance.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
+struct BackdropInstance;
 class ConfigService;
 class GlSharedContext;
 class SharedTextureCache;
@@ -25,6 +26,9 @@ public:
   void onStateChange();
   void onThemeChanged();
   void onGpuResourcesInvalidated();
+  void prepareForGraphicsReset() noexcept;
+  void restoreAfterGraphicsReset();
+  void finishGraphicsResetRecovery() noexcept;
   void requestLayout();
 
 private:

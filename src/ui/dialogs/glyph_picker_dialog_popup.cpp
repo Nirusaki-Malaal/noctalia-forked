@@ -1,5 +1,6 @@
 #include "ui/dialogs/glyph_picker_dialog_popup.h"
 
+#include "config/config_service.h"
 #include "core/deferred_call.h"
 #include "render/render_context.h"
 #include "render/scene/node.h"
@@ -31,7 +32,7 @@ bool GlyphPickerDialogPopup::onPointerEvent(const PointerEvent& event) {
     if (m_selectPopup->onPointerEvent(event)) {
       return true;
     }
-    if (event.type == PointerEvent::Type::Button && event.state == 1) {
+    if (event.type == PointerEvent::Type::Button && event.pressed) {
       m_selectPopup->closeSelectDropdown();
       return true;
     }

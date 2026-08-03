@@ -1,5 +1,5 @@
 {
-  description = "Noctalia - A lightweight Wayland shell and bar";
+  description = "A sleek, customizable desktop shell crafted for Wayland.";
 
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
@@ -8,7 +8,7 @@
   outputs =
     { self, nixpkgs }:
     let
-      inherit (nixpkgs.lib) genAttrs getExe;
+      inherit (nixpkgs.lib) genAttrs getExe warn;
 
       systems = [
         "x86_64-linux"
@@ -32,8 +32,12 @@
 
       packages = forEachSystem (
         { pkgs, ... }:
-        {
+        rec {
           default = pkgs.callPackage ./nix/package.nix { };
+          # DEPRECATED: identical to `default`; kept for compat, warns on use.
+          cuda = warn
+            "noctalia: the `.#cuda` package output is deprecated and now identical to `.#default` (autoAddDriverRunpath is always applied); switch to `.#default`. This alias will be removed in the future."
+            default;
         }
       );
 
@@ -67,6 +71,13 @@
         { pkgs, lib, ... }:
         {
           imports = [ ./nix/hjem-module.nix ];
+          programs.noctalia.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+
+      nixosModules.default =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./nix/nixos-module.nix ];
           programs.noctalia.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
     };

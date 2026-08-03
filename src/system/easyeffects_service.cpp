@@ -1,9 +1,6 @@
 #include "system/easyeffects_service.h"
 
-#include "config/config_service.h"
 #include "core/log.h"
-#include "core/process.h"
-#include "ipc/ipc_arg_parse.h"
 #include "ipc/ipc_service.h"
 #include "util/string_utils.h"
 
@@ -538,6 +535,6 @@ void EasyEffectsService::registerIpc(
         }
         return "ok\n";
       },
-      "effects-profile-set <output|input> <profile>", "Set the EasyEffects output or input profile"
+      "<output|input> <profile>", "Set the EasyEffects output or input profile"
   );
 }

@@ -1,5 +1,6 @@
 #include "config/config_types.h"
 
+#include "core/input/key_modifiers.h"
 #include "render/core/color.h"
 #include "util/string_utils.h"
 #include "wayland/wayland_connection.h"
@@ -59,12 +60,10 @@ std::vector<PluginSourceConfig> defaultPluginSources() {
   return {
       {.kind = PluginSourceKind::Git,
        .name = "official",
-       .location = "https://github.com/noctalia-dev/official-plugins",
-       .autoUpdate = false},
+       .location = "https://github.com/noctalia-dev/official-plugins"},
       {.kind = PluginSourceKind::Git,
        .name = "community",
-       .location = "https://github.com/noctalia-dev/community-plugins",
-       .autoUpdate = false},
+       .location = "https://github.com/noctalia-dev/community-plugins"},
   };
 }
 
@@ -94,28 +93,30 @@ bool isValidPluginSourceName(std::string_view name) {
 std::vector<SessionPanelActionConfig> defaultSessionPanelActions() {
   return {
       SessionPanelActionConfig{
-          "lock", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Default,
-          KeyChord{XKB_KEY_1, 0}
+          .action = "lock",
+          .shortcut = KeyChord{.sym = XKB_KEY_1},
       },
       SessionPanelActionConfig{
-          "logout", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Default,
-          KeyChord{XKB_KEY_2, 0}
+          .action = "logout",
+          .shortcut = KeyChord{.sym = XKB_KEY_2},
       },
       SessionPanelActionConfig{
-          "lock_and_suspend", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Default,
-          KeyChord{XKB_KEY_3, 0}
+          .action = "lock_and_suspend",
+          .shortcut = KeyChord{.sym = XKB_KEY_3},
       },
       SessionPanelActionConfig{
-          "lock_and_hibernate", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Default,
-          KeyChord{XKB_KEY_4, 0}
+      SessionPanelActionConfig{
+          .action = "lock_and_hibernate",
+          .shortcut = KeyChord{.sym = XKB_KEY_4},
       },
       SessionPanelActionConfig{
-          "reboot", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Default,
-          KeyChord{XKB_KEY_5, 0}
+          .action = "reboot",
+          .shortcut = KeyChord{.sym = XKB_KEY_5},
       },
       SessionPanelActionConfig{
-          "shutdown", true, std::nullopt, std::nullopt, std::nullopt, SessionActionButtonVariant::Destructive,
-          KeyChord{XKB_KEY_6, 0}
+          .action = "shutdown",
+          .variant = SessionActionButtonVariant::Destructive,
+          .shortcut = KeyChord{.sym = XKB_KEY_6},
       },
   };
 }
@@ -152,7 +153,11 @@ std::vector<IdleBehaviorConfig> defaultIdleBehaviors() {
 std::vector<KeyChord> defaultKeybindSet(KeybindAction action) {
   switch (action) {
   case KeybindAction::Validate:
-    return {{.sym = XKB_KEY_Return, .modifiers = 0}, {.sym = XKB_KEY_KP_Enter, .modifiers = 0}};
+    return {
+        {.sym = XKB_KEY_Return, .modifiers = 0},
+        {.sym = XKB_KEY_KP_Enter, .modifiers = 0},
+        {.sym = XKB_KEY_space, .modifiers = 0},
+    };
   case KeybindAction::Cancel:
     return {{.sym = XKB_KEY_Escape, .modifiers = 0}};
   case KeybindAction::Left:
@@ -163,6 +168,16 @@ std::vector<KeyChord> defaultKeybindSet(KeybindAction action) {
     return {{.sym = XKB_KEY_Up, .modifiers = 0}};
   case KeybindAction::Down:
     return {{.sym = XKB_KEY_Down, .modifiers = 0}};
+  case KeybindAction::TabNext:
+    return {{.sym = XKB_KEY_Tab, .modifiers = 0}};
+  case KeybindAction::TabPrevious:
+    return {{.sym = XKB_KEY_ISO_Left_Tab, .modifiers = KeyMod::Shift}};
+  case KeybindAction::Delete:
+    return {{.sym = XKB_KEY_Delete, .modifiers = 0}};
+  case KeybindAction::Copy:
+    return {{.sym = XKB_KEY_c, .modifiers = KeyMod::Ctrl}};
+  case KeybindAction::Save:
+    return {{.sym = XKB_KEY_s, .modifiers = KeyMod::Ctrl}};
   }
   return {};
 }
@@ -192,31 +207,7 @@ float detachedPanelBackgroundOpacityForTransparencyMode(PanelTransparencyMode mo
   return 1.0f;
 }
 
-void inferIdleBehaviorActionFromLegacyFields(IdleBehaviorConfig& behavior) {
-  if (!behavior.action.empty()) {
-    return;
-  }
-  if (behavior.command == "noctalia:session lock") {
-    behavior.action = "lock";
-    return;
-  }
-  if (behavior.command == "noctalia:dpms-off") {
-    behavior.action = "screen_off";
-    return;
-  }
-  if (behavior.command == "noctalia:session suspend") {
-    behavior.action = "suspend";
-    return;
-  }
-  if (behavior.command == "noctalia:session lock-and-suspend") {
-    behavior.action = "lock_and_suspend";
-    return;
-  }
-  behavior.action = "command";
-}
-
 void normalizeIdleBehaviorAction(IdleBehaviorConfig& behavior) {
-  inferIdleBehaviorActionFromLegacyFields(behavior);
   if (behavior.action == "suspend" && behavior.lockBeforeSuspend) {
     behavior.action = "lock_and_suspend";
   }
@@ -226,130 +217,99 @@ ResolvedIdleBehavior resolveIdleBehaviorActions(const IdleBehaviorConfig& behavi
   IdleBehaviorConfig tmp = behavior;
   normalizeIdleBehaviorAction(tmp);
   const std::string& act = tmp.action;
-  const auto resume = [&tmp](IdleActionRequest fallback) {
-    return tmp.resumeCommand.empty() ? std::move(fallback) : commandIdleAction(tmp.resumeCommand);
-  };
 
   if (act == "lock") {
     return {
         .idleAction = idleAction(IdleActionKind::Lock),
-        .resumeAction = resume({}),
+        .resumeAction = {},
+        .resumeCommand = tmp.resumeCommand,
     };
   }
   if (act == "screen_off") {
     return {
         .idleAction = idleAction(IdleActionKind::ScreenOff),
-        .resumeAction = resume(idleAction(IdleActionKind::ScreenOn)),
+        .resumeAction = idleAction(IdleActionKind::ScreenOn),
+        .resumeCommand = tmp.resumeCommand,
     };
   }
   if (act == "suspend") {
     return {
         .idleAction = idleAction(IdleActionKind::Suspend),
-        .resumeAction = resume({}),
+        .resumeAction = {},
+        .resumeCommand = tmp.resumeCommand,
     };
   }
   if (act == "lock_and_suspend") {
     return {
         .idleAction = idleAction(IdleActionKind::LockAndSuspend),
-        .resumeAction = resume({}),
+        .resumeAction = {},
+        .resumeCommand = tmp.resumeCommand,
     };
   }
   return {
       .idleAction = commandIdleAction(behavior.command),
-      .resumeAction = commandIdleAction(behavior.resumeCommand),
+      .resumeAction = {},
+      .resumeCommand = behavior.resumeCommand,
   };
 }
 
+const WidgetSettingValue* WidgetConfig::findSetting(const std::string& key) const {
+  const auto it = settings.find(key);
+  return it != settings.end() ? &it->second : nullptr;
+}
+
 std::string WidgetConfig::getString(const std::string& key, const std::string& fallback) const {
-  auto it = settings.find(key);
-  if (it == settings.end()) {
-    return fallback;
-  }
-  if (const auto* v = std::get_if<std::string>(&it->second)) {
-    return *v;
-  }
-  return fallback;
+  const auto* value = findSetting(key);
+  const auto decoded = value != nullptr ? noctalia::config::widgetSettingValueAs<std::string>(*value) : std::nullopt;
+  return decoded.value_or(fallback);
 }
 
 std::vector<std::string>
 WidgetConfig::getStringList(const std::string& key, const std::vector<std::string>& fallback) const {
-  auto it = settings.find(key);
-  if (it == settings.end()) {
-    return fallback;
-  }
-  if (const auto* v = std::get_if<std::vector<std::string>>(&it->second)) {
-    return *v;
-  }
-  if (const auto* v = std::get_if<std::string>(&it->second)) {
-    return {*v};
-  }
-  return fallback;
+  const auto* value = findSetting(key);
+  const auto decoded =
+      value != nullptr ? noctalia::config::widgetSettingValueAs<std::vector<std::string>>(*value) : std::nullopt;
+  return decoded.value_or(fallback);
 }
 
 std::int64_t WidgetConfig::getInt(const std::string& key, std::int64_t fallback) const {
-  auto it = settings.find(key);
-  if (it == settings.end()) {
-    return fallback;
-  }
-  if (const auto* v = std::get_if<std::int64_t>(&it->second)) {
-    return *v;
-  }
-  if (const auto* v = std::get_if<double>(&it->second)) {
-    return static_cast<std::int64_t>(std::llround(*v));
-  }
-  return fallback;
+  const auto* value = findSetting(key);
+  const auto decoded = value != nullptr ? noctalia::config::widgetSettingValueAs<std::int64_t>(*value) : std::nullopt;
+  return decoded.value_or(fallback);
 }
 
 double WidgetConfig::getDouble(const std::string& key, double fallback) const {
-  auto it = settings.find(key);
-  if (it == settings.end()) {
-    return fallback;
-  }
-  if (const auto* v = std::get_if<double>(&it->second)) {
-    return *v;
-  }
-  // Allow int -> double promotion.
-  if (const auto* v = std::get_if<std::int64_t>(&it->second)) {
-    return static_cast<double>(*v);
-  }
-  return fallback;
+  const auto* value = findSetting(key);
+  const auto decoded = value != nullptr ? noctalia::config::widgetSettingValueAs<double>(*value) : std::nullopt;
+  return decoded.value_or(fallback);
 }
 
 bool WidgetConfig::getBool(const std::string& key, bool fallback) const {
-  auto it = settings.find(key);
-  if (it == settings.end()) {
-    return fallback;
-  }
-  if (const auto* v = std::get_if<bool>(&it->second)) {
-    return *v;
-  }
-  return fallback;
+  const auto* value = findSetting(key);
+  const auto decoded = value != nullptr ? noctalia::config::widgetSettingValueAs<bool>(*value) : std::nullopt;
+  return decoded.value_or(fallback);
 }
 
 ColorSpec
 WidgetConfig::getColorSpec(const std::string& key, const ColorSpec& fallback, std::string_view context) const {
-  auto it = settings.find(key);
-  if (it == settings.end()) {
-    return fallback;
-  }
-  if (const auto* v = std::get_if<std::string>(&it->second)) {
-    return colorSpecFromConfigString(*v, context.empty() ? std::string_view(key) : context);
-  }
-  return fallback;
+  const auto* value = findSetting(key);
+  const auto decoded = value != nullptr
+      ? noctalia::config::widgetSettingValueAs<ColorSpec>(*value, context.empty() ? std::string_view(key) : context)
+      : std::nullopt;
+  return decoded.value_or(fallback);
 }
 
 std::optional<ColorSpec> WidgetConfig::getOptionalColorSpec(const std::string& key, std::string_view context) const {
-  auto it = settings.find(key);
-  if (it == settings.end()) {
+  const auto* value = findSetting(key);
+  if (value == nullptr) {
     return std::nullopt;
   }
-  if (const auto* v = std::get_if<std::string>(&it->second)) {
+  if (const auto* v = std::get_if<std::string>(value)) {
     if (StringUtils::trim(*v).empty()) {
       return std::nullopt;
     }
-    return colorSpecFromConfigString(*v, context.empty() ? std::string_view(key) : context);
   }
-  return std::nullopt;
+  return noctalia::config::widgetSettingValueAs<ColorSpec>(*value, context.empty() ? std::string_view(key) : context);
 }
 
 std::unordered_map<std::string, std::string>
@@ -361,7 +321,7 @@ WidgetConfig::getStringMap(const std::string& key, const std::unordered_map<std:
   return it->second;
 }
 
-bool WidgetConfig::hasSetting(const std::string& key) const { return settings.contains(key); }
+bool WidgetConfig::hasSetting(const std::string& key) const { return findSetting(key) != nullptr; }
 
 WidgetBarCapsuleSpec resolveWidgetBarCapsuleSpec(const BarConfig& bar, const WidgetConfig* widget) {
   WidgetBarCapsuleSpec spec{};
@@ -384,11 +344,15 @@ WidgetBarCapsuleSpec resolveWidgetBarCapsuleSpec(const BarConfig& bar, const Wid
   if (bar.widgetCapsuleRadius.has_value()) {
     spec.radius = std::clamp(static_cast<float>(*bar.widgetCapsuleRadius), 0.0f, 80.0f);
   }
-  if (widget != nullptr && widget->hasSetting("capsule_radius")) {
-    spec.radius = std::clamp(
-        static_cast<float>(widget->getDouble("capsule_radius", static_cast<double>(spec.radius.value_or(0.0f)))), 0.0f,
-        80.0f
-    );
+  if (widget != nullptr) {
+    const auto radius = widget->settings.find("capsule_radius");
+    if (radius != widget->settings.end()
+        && (std::holds_alternative<double>(radius->second) || std::holds_alternative<std::int64_t>(radius->second))) {
+      spec.radius = std::clamp(
+          static_cast<float>(widget->getDouble("capsule_radius", static_cast<double>(spec.radius.value_or(0.0f)))),
+          0.0f, 80.0f
+      );
+    }
   }
   spec.opacity = bar.widgetCapsuleOpacity;
   if (widget != nullptr && widget->hasSetting("capsule_opacity")) {
@@ -396,6 +360,7 @@ WidgetBarCapsuleSpec resolveWidgetBarCapsuleSpec(const BarConfig& bar, const Wid
         static_cast<float>(widget->getDouble("capsule_opacity", static_cast<double>(spec.opacity))), 0.0f, 1.0f
     );
   }
+  spec.hoverHighlight = bar.hoverHighlight;
 
   if (!spec.enabled) {
     return spec;
@@ -437,6 +402,74 @@ const BarCapsuleGroupStyle* findBarCapsuleGroupStyle(const BarConfig& bar, const
   return nullptr;
 }
 
+namespace {
+  void collectCapsuleGroupRefs(const std::vector<std::string>& lane, std::set<std::string>& out) {
+    for (const auto& entry : lane) {
+      if (isCapsuleGroupToken(entry)) {
+        out.insert(capsuleGroupTokenId(entry));
+      }
+    }
+  }
+
+  const std::vector<std::string>&
+  effectiveLane(const std::optional<std::vector<std::string>>& monitorLane, const std::vector<std::string>& barLane) {
+    return monitorLane.has_value() ? *monitorLane : barLane;
+  }
+} // namespace
+
+std::set<std::string> capsuleGroupRefsForBarScope(const BarConfig& bar) {
+  std::set<std::string> refs;
+  collectCapsuleGroupRefs(bar.startWidgets, refs);
+  collectCapsuleGroupRefs(bar.centerWidgets, refs);
+  collectCapsuleGroupRefs(bar.endWidgets, refs);
+  for (const auto& ovr : bar.monitorOverrides) {
+    if (ovr.widgetCapsuleGroups.has_value()) {
+      continue;
+    }
+    collectCapsuleGroupRefs(effectiveLane(ovr.startWidgets, bar.startWidgets), refs);
+    collectCapsuleGroupRefs(effectiveLane(ovr.centerWidgets, bar.centerWidgets), refs);
+    collectCapsuleGroupRefs(effectiveLane(ovr.endWidgets, bar.endWidgets), refs);
+  }
+  return refs;
+}
+
+std::set<std::string> capsuleGroupRefsForMonitorScope(const BarConfig& bar, const BarMonitorOverride& monitorOverride) {
+  std::set<std::string> refs;
+  collectCapsuleGroupRefs(effectiveLane(monitorOverride.startWidgets, bar.startWidgets), refs);
+  collectCapsuleGroupRefs(effectiveLane(monitorOverride.centerWidgets, bar.centerWidgets), refs);
+  collectCapsuleGroupRefs(effectiveLane(monitorOverride.endWidgets, bar.endWidgets), refs);
+  return refs;
+}
+
+std::vector<BarCapsuleGroupStyle> reconcileCapsuleGroups(
+    const std::vector<BarCapsuleGroupStyle>& current, const std::vector<BarCapsuleGroupStyle>& base,
+    const std::set<std::string>& referenced
+) {
+  std::vector<BarCapsuleGroupStyle> out;
+  out.reserve(current.size() + base.size());
+  std::vector<bool> consumed(current.size(), false);
+  for (const auto& baseGroup : base) {
+    bool matched = false;
+    for (std::size_t i = 0; i < current.size(); ++i) {
+      if (!consumed[i] && current[i].id == baseGroup.id) {
+        out.push_back(current[i]);
+        consumed[i] = true;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched && referenced.contains(baseGroup.id)) {
+      out.push_back(baseGroup);
+    }
+  }
+  for (std::size_t i = 0; i < current.size(); ++i) {
+    if (!consumed[i] && referenced.contains(current[i].id)) {
+      out.push_back(current[i]);
+    }
+  }
+  return out;
+}
+
 WidgetBarCapsuleSpec capsuleSpecFromGroup(const BarConfig& bar, const BarCapsuleGroupStyle& group) {
   WidgetBarCapsuleSpec spec;
   spec.enabled = true;
@@ -454,6 +487,7 @@ WidgetBarCapsuleSpec capsuleSpecFromGroup(const BarConfig& bar, const BarCapsule
     spec.radius = std::nullopt;
   }
   spec.opacity = group.opacity;
+  spec.hoverHighlight = bar.hoverHighlight;
   return spec;
 }
 

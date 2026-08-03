@@ -1,7 +1,7 @@
 #pragma once
 
 #include <chrono>
-#include <json.hpp>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <poll.h>
 #include <string>
@@ -61,7 +61,7 @@ namespace compositors::niri {
     std::vector<NiriEventHandler*> m_eventHandlers;
     int m_eventSocketFd = -1;
     std::vector<char> m_readBuffer;
-    std::chrono::steady_clock::time_point m_nextReconnectAt{};
+    std::chrono::steady_clock::time_point m_nextReconnectAt;
     std::chrono::seconds m_reconnectBackoff{2};
   };
 

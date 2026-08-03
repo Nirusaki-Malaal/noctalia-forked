@@ -2,6 +2,7 @@
 
 #include "config/config_service.h"
 #include "render/animation/animation_manager.h"
+#include "render/scene/input_area.h"
 #include "render/scene/input_dispatcher.h"
 #include "render/scene/node.h"
 #include "shell/bar/widget.h"
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 class Box;
@@ -26,6 +28,8 @@ struct BarCapsuleRun {
   WidgetBarCapsuleSpec spec{};
   float contentScale = 1.0f;
   std::vector<Widget*> widgets;
+  // Hover highlight overlays, parallel to `widgets` for group runs; one shared box for single runs.
+  std::vector<Box*> hoverBoxes;
 };
 
 struct BarInstance {
@@ -42,11 +46,17 @@ struct BarInstance {
   float slideHiddenDx = 0.0f;
   float slideHiddenDy = 0.0f;
   InputDispatcher inputDispatcher;
+  // Gestures for the parts of the bar no widget covers. The sink is never mounted in the scene; it
+  // is used only for its scroll-detent accumulator, so dead-zone scrolling quantizes like a widget.
+  noctalia::bar::WidgetActionBindings deadZoneBindings;
+  InputArea deadZoneAxisSink;
   float hideOpacity = 1.0f;
   // bar-hide/toggle IPC on non-autohide bars: release compositor exclusive zone until bar-show (v4 isVisible=false).
   bool ipcLayoutReleased = false;
   // bar-auto-hide-set off keeps autoHide true until the reveal completes; block hover helpers from replacing it.
   bool autoHideDisablePending = false;
+  // smart_auto_hide: active workspace empty (or overview open) — keep the bar visible.
+  bool smartAutoHidePinnedVisible = false;
   bool pointerInside = false;
   float lastPointerSx = 0.0f;
   float lastPointerSy = 0.0f;
@@ -59,8 +69,10 @@ struct BarInstance {
   Node* shadowRightClip = nullptr;
   Box* shadowLeft = nullptr;
   Box* shadowRight = nullptr;
-  Box* attachedPanelResizeTestRect = nullptr;
   Node* contentClip = nullptr;
+  // Unclipped layer between the bar background and contentClip; hosts the hover pills of
+  // capsule-less widgets so they neither affect layout nor get clipped at section boundaries.
+  Node* hoverUnderlay = nullptr;
   Node* startSlot = nullptr;
   Node* centerSlot = nullptr;
   Node* endSlot = nullptr;
@@ -75,8 +87,10 @@ struct BarInstance {
   std::vector<BarCapsuleRun> centerCapsuleRuns;
   std::vector<BarCapsuleRun> endCapsuleRuns;
 
+  // Maps each widget's root node to its Widget so hover-change events resolve to the owning widget.
+  std::unordered_map<const Node*, Widget*> widgetByRoot;
+  Widget* hoverHighlightWidget = nullptr;
+
   Signal<>::ScopedConnection paletteConn;
   std::optional<AttachedPanelGeometry> attachedPanelGeometry;
-  bool attachedPanelResizeTestOpen = false;
-  std::uint32_t attachedPanelResizeTestExtent = 0;
 };

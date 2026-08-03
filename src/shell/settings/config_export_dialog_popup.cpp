@@ -9,7 +9,6 @@
 #include "ui/popup_chrome.h"
 #include "ui/style.h"
 #include "wayland/popup_surface.h"
-#include "wayland/wayland_connection.h"
 #include "xdg-shell-client-protocol.h"
 
 #include <algorithm>
@@ -42,7 +41,8 @@ namespace settings {
           .offsetX = 0,
           .offsetY = 0,
           .serial = serial,
-          .grab = true,
+          // Dialogs stay open on outside click / focus loss; Escape and close dismiss.
+          .grab = false,
       };
     }
 
@@ -55,11 +55,8 @@ namespace settings {
     initializeBase(wayland, config, renderContext);
   }
 
-  void ConfigExportDialogPopup::open(
-      xdg_surface* parentXdgSurface, wl_output* output, std::uint32_t serial, wl_surface* parentWlSurface,
-      std::uint32_t parentWidth, std::uint32_t parentHeight, float scale, ExportCallback callback
-  ) {
-    if (parentXdgSurface == nullptr || parentWlSurface == nullptr) {
+  void ConfigExportDialogPopup::open(ConfigExportDialogPopupRequest request) {
+    if (request.parent.xdgSurface == nullptr || request.parent.wlSurface == nullptr) {
       return;
     }
 
@@ -67,22 +64,22 @@ namespace settings {
       close();
     }
 
-    m_scale = std::max(0.1f, scale);
+    m_scale = std::max(0.1f, request.scale);
     m_mode = ConfigExportMode::MergedUser;
-    m_callback = std::move(callback);
+    m_callback = std::move(request.callback);
     m_root = nullptr;
     m_mergedRadio = nullptr;
     m_fullRadio = nullptr;
-    m_parentHeight = parentHeight;
+    m_parentHeight = request.parent.height;
 
     const float popupWidth = kPopupWidth * m_scale;
     const float popupHeight = kInitialPopupHeight * m_scale;
     const auto cfg = centeredPopupConfig(
-        parentWidth, parentHeight, static_cast<std::uint32_t>(std::max(1.0f, popupWidth)),
-        static_cast<std::uint32_t>(std::max(1.0f, popupHeight)), serial
+        request.parent.width, request.parent.height, static_cast<std::uint32_t>(std::max(1.0f, popupWidth)),
+        static_cast<std::uint32_t>(std::max(1.0f, popupHeight)), request.parent.serial
     );
 
-    if (!openPopupAsChild(cfg, parentXdgSurface, parentWlSurface, output)) {
+    if (!openPopupAsChild(cfg, request.parent)) {
       close();
     }
   }
@@ -126,7 +123,7 @@ namespace settings {
                 [this](Flex& row) {
                   row.setRadius(Style::scaledRadiusMd(m_scale));
                   row.setFill(colorSpecFromRole(ColorRole::SurfaceVariant, 0.45f));
-                  row.setBorder(colorSpecFromRole(ColorRole::Outline, 0.55f), Style::borderWidth);
+                  row.setBorder(colorSpecFromRole(ColorRole::Outline), Style::borderWidth);
                 },
         },
         ui::radioButton({
@@ -149,9 +146,9 @@ namespace settings {
             ui::label({
                 .text = title,
                 .fontSize = Style::fontSizeBody * m_scale,
+                .fontWeight = FontWeight::Bold,
                 .color = colorSpecFromRole(ColorRole::OnSurface),
                 .maxLines = 1,
-                .fontWeight = FontWeight::Bold,
             }),
             ui::label({
                 .text = description,
@@ -191,8 +188,8 @@ namespace settings {
             ui::label({
                 .text = i18n::tr("settings.export-config.title"),
                 .fontSize = Style::fontSizeTitle * m_scale,
-                .color = colorSpecFromRole(ColorRole::OnSurface),
                 .fontWeight = FontWeight::Bold,
+                .color = colorSpecFromRole(ColorRole::OnSurface),
                 .flexGrow = 1.0f,
             }),
             ui::button({
@@ -204,7 +201,15 @@ namespace settings {
                 .minHeight = Style::controlHeightSm * m_scale,
                 .padding = Style::spaceXs * m_scale,
                 .radius = Style::scaledRadiusMd(m_scale),
-                .onClick = [this]() { DeferredCall::callLater([this]() { close(); }); },
+                .onClick = [this]() {
+                  const std::weak_ptr<void> aliveGuard = m_aliveGuard;
+                  DeferredCall::callLater([this, aliveGuard]() {
+                    if (aliveGuard.expired()) {
+                      return;
+                    }
+                    close();
+                  });
+                },
             })
         )
     );
@@ -242,7 +247,16 @@ namespace settings {
                 .paddingV = Style::spaceXs * m_scale,
                 .paddingH = Style::spaceMd * m_scale,
                 .radius = Style::scaledRadiusMd(m_scale),
-                .onClick = [this]() { DeferredCall::callLater([this]() { close(); }); },
+                .onClick =
+                    [this]() {
+                      const std::weak_ptr<void> aliveGuard = m_aliveGuard;
+                      DeferredCall::callLater([this, aliveGuard]() {
+                        if (aliveGuard.expired()) {
+                          return;
+                        }
+                        close();
+                      });
+                    },
             }),
             ui::button({
                 .text = i18n::tr("settings.export-config.export"),
@@ -253,7 +267,15 @@ namespace settings {
                 .paddingV = Style::spaceXs * m_scale,
                 .paddingH = Style::spaceMd * m_scale,
                 .radius = Style::scaledRadiusMd(m_scale),
-                .onClick = [this]() { DeferredCall::callLater([this]() { accept(); }); },
+                .onClick = [this]() {
+                  const std::weak_ptr<void> aliveGuard = m_aliveGuard;
+                  DeferredCall::callLater([this, aliveGuard]() {
+                    if (aliveGuard.expired()) {
+                      return;
+                    }
+                    accept();
+                  });
+                },
             })
         )
     );
@@ -277,7 +299,7 @@ namespace settings {
     const float panelH = std::ceil(pref.height + pad * 2.0f);
     const ShellConfig::ShadowConfig shadow =
         config() != nullptr ? config()->config().shell.shadow : ShellConfig::ShadowConfig{};
-    const auto geo = popup_chrome::computeGeometry(panelW, panelH, shadow);
+    const auto geo = popup_chrome::computeGeometry(panelW, panelH, shadow, Style::popupShadowsEnabled());
     const float maxOuterHeight =
         m_parentHeight > 0 ? std::max(1.0f, static_cast<float>(m_parentHeight) - (kParentMargin * m_scale)) : 1.0e6f;
     const std::uint32_t nextHeight =

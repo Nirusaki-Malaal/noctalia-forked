@@ -1,5 +1,7 @@
 #include "render/programs/rect_program.h"
 
+#include "render/core/render_styles.h"
+
 #include <array>
 #include <stdexcept>
 
@@ -505,6 +507,8 @@ void RectProgram::destroy() {
   m_shadowExclusionRadiiLocation = -1;
   m_transformLocation = -1;
 }
+
+void RectProgram::abandon() noexcept { m_program.abandon(); }
 
 void RectProgram::draw(
     float surfaceWidth, float surfaceHeight, float width, float height, const RoundedRectStyle& style,

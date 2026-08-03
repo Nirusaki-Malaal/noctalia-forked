@@ -1,11 +1,14 @@
 #include "ui/controls/slider.h"
 
+#include "core/input/key_symbols.h"
+#include "core/input/keybind_matcher.h"
 #include "cursor-shape-v1-client-protocol.h"
 #include "render/core/render_styles.h"
 #include "render/scene/input_area.h"
 #include "render/scene/rect_node.h"
 #include "ui/palette.h"
 #include "ui/style.h"
+#include "util/clamp.h"
 
 #include <algorithm>
 #include <cmath>
@@ -76,7 +79,7 @@ Slider::Slider() {
     if (!m_enabled || !m_wheelAdjustEnabled || data.axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
       return false;
     }
-    const double lines = static_cast<double>(data.scrollDelta(1.0f));
+    const auto lines = static_cast<double>(data.scrollSteps());
     if (lines == 0.0) {
       return false;
     }
@@ -91,6 +94,55 @@ Slider::Slider() {
       m_onDragEnd();
     }
     return true;
+  });
+  area->setFocusable(true);
+  area->setOnFocusGain([this]() {
+    applyVisualState();
+    markPaintDirty();
+  });
+  area->setOnFocusLoss([this]() {
+    applyVisualState();
+    markPaintDirty();
+  });
+  area->setOnKeyDown([this](const InputArea::KeyData& key) {
+    if (!key.pressed || !m_enabled) {
+      return;
+    }
+    const double step = m_step > 0.0 ? m_step : (m_max - m_min) * 0.05;
+    if (step <= 0.0) {
+      return;
+    }
+    if (KeybindMatcher::matches(KeybindAction::Left, key.sym, key.modifiers)) {
+      setValue(m_value - step);
+      if (m_onDragEnd) {
+        m_onDragEnd();
+      }
+    } else if (KeybindMatcher::matches(KeybindAction::Right, key.sym, key.modifiers)) {
+      setValue(m_value + step);
+      if (m_onDragEnd) {
+        m_onDragEnd();
+      }
+    } else if (KeySymbol::isPageDown(key.sym)) {
+      setValue(m_value - step * 10.0);
+      if (m_onDragEnd) {
+        m_onDragEnd();
+      }
+    } else if (KeySymbol::isPageUp(key.sym)) {
+      setValue(m_value + step * 10.0);
+      if (m_onDragEnd) {
+        m_onDragEnd();
+      }
+    } else if (KeySymbol::isHome(key.sym)) {
+      setValue(m_min);
+      if (m_onDragEnd) {
+        m_onDragEnd();
+      }
+    } else if (KeySymbol::isEnd(key.sym)) {
+      setValue(m_max);
+      if (m_onDragEnd) {
+        m_onDragEnd();
+      }
+    }
   });
   m_inputArea = static_cast<InputArea*>(addChild(std::move(area)));
   m_inputArea->setCursorShape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER);
@@ -206,7 +258,9 @@ void Slider::updateGeometry() {
   m_fill->setPosition(trackX, trackY);
   m_fill->setFrameSize(std::max(0.0f, thumbX - trackX), m_trackHeight);
 
-  m_thumb->setPosition(std::clamp(thumbX - m_thumbSizePx * 0.5f, trackX, trackX + trackW - m_thumbSizePx), thumbY);
+  m_thumb->setPosition(
+      util::clampOrdered(thumbX - m_thumbSizePx * 0.5f, trackX, trackX + trackW - m_thumbSizePx), thumbY
+  );
   m_thumb->setFrameSize(m_thumbSizePx, m_thumbSizePx);
 
   m_inputArea->setPosition(0.0f, 0.0f);
@@ -227,6 +281,7 @@ void Slider::updateFromLocalX(float x) {
 void Slider::applyVisualState() {
   const bool hovering = m_inputArea != nullptr && m_inputArea->hovered();
   const bool pressing = m_inputArea != nullptr && m_inputArea->pressed();
+  const bool focused = m_inputArea != nullptr && m_inputArea->focused();
 
   Color trackColor = resolved(ColorRole::Outline);
   Color fillColor = resolved(ColorRole::Primary);
@@ -236,10 +291,12 @@ void Slider::applyVisualState() {
   m_thumb->setVisible(m_enabled);
 
   if (!m_enabled) {
-    trackColor = resolved(ColorRole::Outline, 0.5f);
+    trackColor = resolved(ColorRole::Outline, Style::disabledOutlineAlpha);
     fillColor = resolved(ColorRole::Primary, 0.5f);
   } else if (pressing) {
     fillColor = resolved(ColorRole::Primary);
+  } else if (focused) {
+    thumbBorder = resolveColorSpec(focusRingColorSpec());
   } else if (hovering) {
     thumbBorder = resolved(ColorRole::Hover);
   }
@@ -252,7 +309,7 @@ void Slider::applyVisualState() {
 
   auto thumbStyle = solidStyle(thumbColor, m_thumbSizePx * 0.5f);
   thumbStyle.border = thumbBorder;
-  thumbStyle.borderWidth = Style::borderWidth;
+  thumbStyle.borderWidth = focused ? Style::focusRingWidth : Style::borderWidth;
   m_thumb->setStyle(thumbStyle);
 }
 

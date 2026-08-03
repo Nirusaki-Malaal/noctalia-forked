@@ -1,12 +1,13 @@
 #pragma once
 
-#include "render/core/texture_manager.h"
+#include "render/core/texture_handle.h"
 
 #include <memory>
 #include <string>
 #include <unordered_map>
 
 class GlSharedContext;
+class TextureManager;
 
 // Path-keyed, refcounted texture cache backed by a TextureManager living in
 // the shared EGL context. Any subsystem in the shared context's share group
@@ -27,10 +28,13 @@ public:
   [[nodiscard]] TextureHandle acquire(const std::string& path);
   [[nodiscard]] TextureHandle peek(const std::string& path) const;
   void release(TextureHandle& handle, const std::string& path);
+  void abandonGpuResources() noexcept;
   void reloadResidentTextures();
 
 private:
-  void makeCurrent();
+  // Returns false if no usable GL context could be bound (e.g. context lost on resume);
+  // callers skip the upload/unload and retry on the next graphics-reset rebuild.
+  [[nodiscard]] bool makeCurrent();
 
   struct Entry {
     TextureHandle handle;

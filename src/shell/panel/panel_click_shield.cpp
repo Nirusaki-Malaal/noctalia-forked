@@ -3,15 +3,14 @@
 #include "compositors/compositor_detect.h"
 #include "core/log.h"
 #include "viewporter-client-protocol.h"
+#include "wayland/layer_surface.h"
 #include "wayland/wayland_connection.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 #include <cerrno>
 #include <cstring>
-#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <wayland-client.h>
 
 namespace {
 
@@ -70,7 +69,7 @@ bool PanelClickShield::ensureSharedBuffer() {
   constexpr std::int32_t kWidth = 1;
   constexpr std::int32_t kHeight = 1;
   constexpr std::int32_t kStride = kWidth * 4;
-  constexpr std::size_t kSize = static_cast<std::size_t>(kStride * kHeight);
+  constexpr auto kSize = static_cast<std::size_t>(kStride * kHeight);
 
   int fd = createAnonFd(kSize);
   if (fd < 0) {
@@ -182,6 +181,16 @@ PanelClickShield::createShield(wl_output* output, LayerShellLayer layer, std::ve
   wl_surface_commit(shield->surface);
 
   return shield;
+}
+
+void PanelClickShield::setLayer(LayerShellLayer layer) {
+  for (auto& [output, shield] : m_shields) {
+    if (shield == nullptr || shield->layerSurface == nullptr || shield->surface == nullptr) {
+      continue;
+    }
+    zwlr_layer_surface_v1_set_layer(shield->layerSurface, static_cast<std::uint32_t>(layer));
+    wl_surface_commit(shield->surface);
+  }
 }
 
 void PanelClickShield::deactivate() {

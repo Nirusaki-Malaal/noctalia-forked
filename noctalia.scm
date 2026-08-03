@@ -6,8 +6,8 @@
 ;;; --8<---------------cut here---------------start------------->8---
 ;;; (channel
 ;;;   (name 'noctalia)
-;;;   (url "https://github.com/noctalia-dev/noctalia-shell")
-;;;   (branch "v5"))
+;;;   (url "https://github.com/noctalia-dev/noctalia")
+;;;   (branch "main"))
 ;;; --8<---------------cut here---------------end--------------->8---
 ;;;
 ;;; It provides this (noctalia) module with the noctalia-git package.
@@ -23,6 +23,8 @@
   ;; Guix build systems
   #:use-module (guix build-system meson)
   ;; Guix packages
+  #:use-module (gnu packages calendar)
+  #:use-module (gnu packages cpp)
   #:use-module (gnu packages curl)
   #:use-module (gnu packages fontutils)
   #:use-module (gnu packages freedesktop)
@@ -33,10 +35,13 @@
   #:use-module (gnu packages image)
   #:use-module (gnu packages jemalloc)
   #:use-module (gnu packages linux)
+  #:use-module (gnu packages markup)
   #:use-module (gnu packages maths)
   #:use-module (gnu packages multiprecision)
   #:use-module (gnu packages pkg-config)
   #:use-module (gnu packages polkit)
+  #:use-module (gnu packages pulseaudio)
+  #:use-module (gnu packages stb)
   #:use-module (gnu packages xdisorg)
   #:use-module (gnu packages xml))
 
@@ -70,13 +75,6 @@
     (build-system meson-build-system)
     (arguments
      (list #:build-type "release"
-           ;; FIXME: process_test fails with:
-           ;; --8<---------------cut here---------------start------------->8---
-           ;; stderr:
-           ;; process_test: completion-only async command exit code was wrong
-           ;; process_test: completion-only async command stdout was wrong
-           ;; --8<---------------cut here---------------end--------------->8---
-           #:tests? #f
            #:phases
            #~(modify-phases %standard-phases
                (add-after 'unpack 'prepare-for-build
@@ -87,7 +85,10 @@
                    ;; /bin/sh doesn't exist in the build environment.
                    (substitute* "tests/process_test.cpp"
                      (("/bin/(sh)" _ cmd)
-                      (which cmd))))))))
+                      (which cmd)))
+                   ;; Adjust import paths for STB headers packaged in Guix.
+                   (substitute* (find-files "." "\\.cpp$|^meson\\.build$")
+                     (("\\bstb/stb_") "stb_")))))))
     (native-inputs
      (list pkg-config))
     (inputs
@@ -97,22 +98,31 @@
            freetype
            glib
            gmp
-           mpfr
            harfbuzz
            jemalloc
+           mpfr
            (librsvg-for-system)
+           libjxl
+           libical
            libqalculate
+           libsndfile
            libwebp
            libxkbcommon
            libxml2
            linux-pam
+           md4c
            mesa
+           nlohmann-json
            pango
            pipewire
            polkit
            sdbus-c++
+           stb-image-resize2
+           stb-image-write
+           tomlplusplus
            wayland
-           wayland-protocols-1.48))
+           wayland-protocols-1.48
+           wireplumber))
     (home-page "https://noctalia.dev/")
     (synopsis "Wayland shell and bar")
     (description

@@ -22,7 +22,7 @@ struct FileEntry {
   std::filesystem::path absPath;
   bool isDir = false;
   std::uintmax_t size = 0;
-  std::filesystem::file_time_type mtime{};
+  std::filesystem::file_time_type mtime;
 };
 
 class DirectoryScanner {
@@ -33,6 +33,11 @@ public:
   ) const;
 
   [[nodiscard]] static bool isImagePath(const std::filesystem::path& path);
+
+  // Extension filter for FileDialogOptions::extensions and
+  // TextSetting::browseFileExtensions. `includeSvg` adds ".svg" for pickers
+  // that also accept vector art.
+  [[nodiscard]] static std::vector<std::string> imageExtensionFilter(bool includeSvg);
 
 private:
   [[nodiscard]] static bool

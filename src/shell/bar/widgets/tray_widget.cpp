@@ -6,12 +6,13 @@
 #include "dbus/tray/tray_service.h"
 #include "render/core/image_file_loader.h"
 #include "render/core/image_source_log.h"
-#include "render/core/renderer.h"
+#include "render/core/texture_manager.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
 #include "render/text/glyph_registry.h"
 #include "shell/panel/panel_manager.h"
 #include "shell/tray/tray_identifier.h"
+#include "system/desktop_entry.h"
 #include "ui/app_icon_colorization.h"
 #include "ui/builders.h"
 #include "ui/palette.h"
@@ -84,12 +85,23 @@ namespace {
 
   bool isSvgPath(std::string_view path) { return path.ends_with(".svg") || path.ends_with(".SVG"); }
 
+  std::pair<std::int32_t, std::int32_t> trayPointerCoords(const InputArea& area, const InputArea::PointerData& data) {
+    float absX = 0.0f;
+    float absY = 0.0f;
+    Node::absolutePosition(&area, absX, absY);
+    return {
+        static_cast<std::int32_t>(std::lround(absX + data.localX)),
+        static_cast<std::int32_t>(std::lround(absY + data.localY)),
+    };
+  }
+
   std::optional<LoadedImageFile>
   loadSymbolicTrayIcon(const std::string& path, int targetSize, const Color& symbolicColor) {
-    std::string loadError;
-    auto loaded = loadImageFile(path, targetSize, &loadError);
+    auto loaded = loadImageFile(path, targetSize);
     if (!loaded) {
-      kLog.debug("tray widget symbolic icon decode failed path={} error={}", ImageSourceLog::describe(path), loadError);
+      kLog.debug(
+          "tray widget symbolic icon decode failed path={} error={}", ImageSourceLog::describe(path), loaded.error()
+      );
       return std::nullopt;
     }
 
@@ -145,22 +157,21 @@ namespace {
       loaded->rgba[i + 3] = static_cast<std::uint8_t>(std::lround(a * std::clamp(mask, 0.0f, 1.0f)));
     }
 
-    return loaded;
+    return std::move(*loaded);
   }
 
   bool isUniqueBusName(std::string_view value) { return !value.empty() && value.front() == ':'; }
 
 } // namespace
 
-TrayWidget::TrayWidget(
-    ConfigService& config, TrayService* tray, std::vector<std::string> hiddenItems,
-    std::vector<std::string> pinnedItems, bool drawerMode, std::function<void()> itemActivated, std::string barPosition,
-    bool panelGridMode, std::size_t panelGridColumns, float inlineEntryGap, bool matchAdjacentSpacing
-)
-    : m_config(config), m_tray(tray), m_hiddenItems(std::move(hiddenItems)), m_pinnedItems(std::move(pinnedItems)),
-      m_drawerMode(drawerMode), m_itemActivated(std::move(itemActivated)), m_barPosition(std::move(barPosition)),
-      m_panelGridMode(panelGridMode), m_panelGridColumns(std::clamp<std::size_t>(panelGridColumns, 1U, 5U)),
-      m_inlineEntryGap(std::max(0.0f, inlineEntryGap)), m_matchAdjacentSpacing(matchAdjacentSpacing) {
+TrayWidget::TrayWidget(ConfigService& config, TrayService* tray, Options options)
+    : m_config(config), m_tray(tray), m_hiddenItems(std::move(options.hiddenItems)),
+      m_pinnedItems(std::move(options.pinnedItems)), m_drawerMode(options.drawerMode),
+      m_itemActivated(std::move(options.itemActivated)), m_barPosition(std::move(options.barPosition)),
+      m_panelGridMode(options.panelGridMode),
+      m_panelGridColumns(std::clamp<std::size_t>(options.panelGridColumns, 1U, 5U)),
+      m_inlineEntryGap(std::max(0.0f, options.inlineEntryGap)), m_matchAdjacentSpacing(options.matchAdjacentSpacing),
+      m_customItemSize(options.customItemSize) {
   auto normalizeTokens = [](std::vector<std::string>& tokens) {
     std::vector<std::string> normalized;
     normalized.reserve(tokens.size());
@@ -445,6 +456,71 @@ void TrayWidget::rebuild(Renderer& renderer) {
     m_container->removeChild(m_container->children().back().get());
   }
 
+  auto attachHover = [this](InputArea& area, float size) {
+    if (!barCapsuleSpec().hoverHighlight) {
+      return;
+    }
+    Box* hoverBoxPtr = nullptr;
+    ColorSpec hoverFill = widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface));
+    hoverFill.alpha = 0.0f;
+    const float padding = Style::spaceXs * m_contentScale;
+    area.addChild(
+        ui::box({
+            .out = &hoverBoxPtr,
+            .fill = hoverFill,
+            .radius = resolvedBarCapsuleRadius(size + padding * 2.0f, size + padding * 2.0f),
+            .width = size + padding * 2.0f,
+            .height = size + padding * 2.0f,
+            .configure = [padding](Box& box) {
+              box.setZIndex(-1);
+              box.setHitTestVisible(false);
+              box.setPosition(-padding, -padding);
+            },
+        })
+    );
+
+    auto progress = std::make_shared<float>(0.0f);
+    area.setOnEnter([this, hoverBoxPtr, progress](const InputArea::PointerData&) {
+      if (m_animations == nullptr)
+        return;
+      m_animations->cancelForOwner(hoverBoxPtr);
+      const ColorSpec fill = widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface));
+      m_animations->animate(
+          *progress, 1.0f, Style::animFast, Easing::EaseOutCubic,
+          [this, hoverBoxPtr, fill, progress](float p) {
+            *progress = p;
+            hoverBoxPtr->setVisible(p > 0.001f);
+            ColorSpec c = fill;
+            c.alpha = 0.1f * p;
+            hoverBoxPtr->setFill(c);
+            requestRedraw();
+          },
+          {}, hoverBoxPtr
+      );
+      requestFrameTick();
+    });
+
+    area.setOnLeave([this, hoverBoxPtr, progress]() {
+      if (m_animations == nullptr)
+        return;
+      m_animations->cancelForOwner(hoverBoxPtr);
+      const ColorSpec fill = widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface));
+      m_animations->animate(
+          *progress, 0.0f, Style::animFast, Easing::EaseOutCubic,
+          [this, hoverBoxPtr, fill, progress](float p) {
+            *progress = p;
+            hoverBoxPtr->setVisible(p > 0.001f);
+            ColorSpec c = fill;
+            c.alpha = 0.1f * p;
+            hoverBoxPtr->setFill(c);
+            requestRedraw();
+          },
+          {}, hoverBoxPtr
+      );
+      requestFrameTick();
+    });
+  };
+
   if (m_drawerMode) {
     m_drawerTrigger = nullptr;
     m_drawerChevron = nullptr;
@@ -458,8 +534,8 @@ void TrayWidget::rebuild(Renderer& renderer) {
       break;
     }
     if (hasDrawerItems) {
-      const float itemSize = Style::baseGlyphSize * m_contentScale;
-      auto triggerArea = std::make_unique<InputArea>();
+      const float itemSize = m_customItemSize.value_or(Style::baseGlyphSize) * m_contentScale;
+      auto triggerArea = ui::inputArea({});
       auto* triggerPtr = triggerArea.get();
       m_drawerTrigger = triggerPtr;
       triggerArea->setSize(itemSize, itemSize);
@@ -498,6 +574,7 @@ void TrayWidget::rebuild(Renderer& renderer) {
       );
       m_drawerChevron = glyph.get();
       triggerArea->addChild(std::move(glyph));
+      attachHover(*triggerArea, itemSize);
       m_container->addChild(std::move(triggerArea));
     }
   }
@@ -515,7 +592,7 @@ void TrayWidget::rebuild(Renderer& renderer) {
       continue;
     }
     const std::string iconPath = resolveIconPath(item);
-    const float itemSize = Style::baseGlyphSize * m_contentScale;
+    const float itemSize = m_customItemSize.value_or(Style::baseGlyphSize) * m_contentScale;
     const float iconSize = itemSize;
     const int iconRequestSize = std::max(32, static_cast<int>(std::round(iconSize * 2.0f)));
 
@@ -670,7 +747,7 @@ void TrayWidget::rebuild(Renderer& renderer) {
     }
 
     if (overlayNode != nullptr && iconNode != nullptr) {
-      auto stack = std::make_unique<Node>();
+      auto stack = ui::node({});
       stack->setSize(itemSize, itemSize);
       iconNode->setPosition(std::round((itemSize - iconW) * 0.5f), std::round((itemSize - iconH) * 0.5f));
       overlayNode->setPosition(std::round((itemSize - overlayW) * 0.5f), std::round((itemSize - overlayH) * 0.5f));
@@ -682,22 +759,28 @@ void TrayWidget::rebuild(Renderer& renderer) {
     }
 
     // Wrap icon in InputArea for click handling
-    auto area = std::make_unique<InputArea>();
+    auto area = ui::inputArea({});
     area->setSize(itemSize, itemSize);
     iconNode->setPosition(std::round((itemSize - iconW) * 0.5f), std::round((itemSize - iconH) * 0.5f));
     auto itemId = item.id;
     area->setAcceptedButtons(InputArea::buttonMask({BTN_LEFT, BTN_RIGHT}));
-    area->setOnClick([this, itemId](const InputArea::PointerData& data) {
+    InputArea* areaPtr = area.get();
+    area->setOnClick([this, itemId, areaPtr](const InputArea::PointerData& data) {
       if (m_tray == nullptr) {
         return;
       }
+      const auto [x, y] = trayPointerCoords(*areaPtr, data);
       if (data.button == BTN_LEFT) {
-        (void)m_tray->activateItem(itemId);
+        (void)m_tray->activateItem(itemId, x, y);
         if (m_itemActivated) {
           m_itemActivated();
         }
       } else if (data.button == BTN_RIGHT) {
-        m_tray->requestMenuToggle(itemId, m_contentScale);
+        if (m_tray->itemUsesDBusMenu(itemId)) {
+          m_tray->requestMenuToggle(itemId, m_contentScale);
+        } else {
+          (void)m_tray->openContextMenu(itemId, x, y);
+        }
       }
     });
     area->addChild(std::move(iconNode));
@@ -705,6 +788,8 @@ void TrayWidget::rebuild(Renderer& renderer) {
     if (const std::string tooltipText = tray::formatTrayItemTooltip(item); !tooltipText.empty()) {
       area->setTooltip(tooltipText);
     }
+
+    attachHover(*area, itemSize);
 
     if (m_panelGridMode) {
       if (gridRow == nullptr || gridCol >= m_panelGridColumns) {
@@ -837,7 +922,9 @@ std::string TrayWidget::resolveIconPath(const TrayItemInfo& item) {
   }
 
   // Match the on-screen request size used when the icon is loaded (see rebuild).
-  const int iconTargetSize = std::max(32, static_cast<int>(std::round(Style::baseGlyphSize * m_contentScale * 2.0f)));
+  const int iconTargetSize = std::max(
+      32, static_cast<int>(std::round(m_customItemSize.value_or(Style::baseGlyphSize) * m_contentScale * 2.0f))
+  );
 
   auto resolveMapped = [this, iconTargetSize](const std::string& name) -> std::string {
     if (name.empty()) {

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "config/config_service.h"
 #include "shell/settings/settings_registry.h"
 
 #include <functional>
@@ -10,6 +9,7 @@
 #include <vector>
 
 class Button;
+class ConfigService;
 class Flex;
 class InputArea;
 class Node;
@@ -32,6 +32,12 @@ namespace settings {
     std::string& pendingDeleteWidgetName;
     std::string& pendingDeleteWidgetSettingPath;
     std::string& renamingWidgetName;
+    std::function<std::unique_ptr<Node>(const GestureActionSetting&, const std::string&, std::vector<std::string>)>
+        makeGestureActionRow;
+    std::string& pendingGestureKey;
+    std::string& pendingGestureVerb;
+    std::string& actionsExpandedFor;
+    std::vector<GestureActionOption> actionCatalog;
 
     std::function<void()> requestRebuild;
     std::function<void()> resetContentScroll;
@@ -60,6 +66,7 @@ namespace settings {
     std::function<std::unique_ptr<Node>(const ColorSpecPickerSetting&, std::vector<std::string>)> makeColorSpecPicker;
     std::function<void(Flex&, const SettingEntry&, const ListSetting&)> makeListBlock;
     std::function<void(Flex&, const SettingEntry&, const StringMapSetting&)> makeStringMapBlock;
+    bool supportsTaskbarWorkspaceGrouping = true;
   };
 
   [[nodiscard]] bool isBarWidgetListPath(const std::vector<std::string>& path);

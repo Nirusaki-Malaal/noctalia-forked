@@ -1,7 +1,8 @@
 #pragma once
 
-#include "core/key_modifiers.h"
+#include "core/input/key_modifiers.h"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -32,13 +33,14 @@ struct PointerEvent {
   double sy = 0.0;
   std::uint32_t time = 0;
   std::uint32_t button = 0;
-  std::uint32_t state = 0;
+  bool pressed = false;
   std::uint32_t axis = 0;
   std::uint32_t axisSource = 0;
   double axisValue = 0.0;
   std::int32_t axisDiscrete = 0;
   std::int32_t axisValue120 = 0;
   float axisLines = 0.0f;
+  std::uint32_t axisGestureSerial = 0;
 };
 
 struct KeyboardEvent {
@@ -70,12 +72,14 @@ public:
   using PointerEventCallback = std::function<void(const PointerEvent&)>;
   using KeyboardEventCallback = std::function<void(const KeyboardEvent&)>;
   using KeyboardFocusCallback = std::function<void(wl_surface* surface, bool entered)>;
+  using LockKeysChangeCallback = std::function<void()>;
 
   void bind(wl_seat* seat);
   void setCursorShapeManager(wp_cursor_shape_manager_v1* manager);
   void setPointerEventCallback(PointerEventCallback callback);
   void setKeyboardEventCallback(KeyboardEventCallback callback);
   void setKeyboardFocusCallback(KeyboardFocusCallback callback);
+  void setLockKeysChangeCallback(LockKeysChangeCallback callback);
   void setCursorShape(std::uint32_t serial, std::uint32_t shape);
   void forgetSurface(wl_surface* surface) noexcept;
   void cleanup();
@@ -104,6 +108,7 @@ public:
   static void
   handlePointerAxis(void* data, wl_pointer* pointer, std::uint32_t time, std::uint32_t axis, std::int32_t value);
   static void handlePointerAxisSource(void* data, wl_pointer* pointer, std::uint32_t axisSource);
+  static void handlePointerAxisStop(void* data, wl_pointer* pointer, std::uint32_t time, std::uint32_t axis);
   static void handlePointerAxisDiscrete(void* data, wl_pointer* pointer, std::uint32_t axis, std::int32_t discrete);
   static void handlePointerAxisValue120(void* data, wl_pointer* pointer, std::uint32_t axis, std::int32_t value120);
   static void handlePointerFrame(void* data, wl_pointer* pointer);
@@ -158,6 +163,16 @@ private:
   PointerEventCallback m_pointerEventCallback;
   std::vector<PointerEvent> m_pendingPointerEvents;
   std::uint32_t m_pendingAxisSource = 0;
+  // Detent info for an axis, received ahead of the axis event it belongs to.
+  struct AxisDetent {
+    bool valid = false;
+    std::int32_t discrete = 0;
+    std::int32_t value120 = 0;
+    float lines = 0.0f;
+  };
+  // Indexed by wl_pointer axis (vertical, horizontal).
+  std::array<AxisDetent, 2> m_pendingAxisDetents{};
+  std::array<std::uint32_t, 2> m_axisGestureSerial{};
   wl_surface* m_lastPointerSurface = nullptr;
   std::uint32_t m_pointerEnterSerial = 0;
   double m_lastPointerX = 0.0;
@@ -184,9 +199,11 @@ private:
   xkb_compose_state* m_composeState = nullptr;
   KeyboardEventCallback m_keyboardEventCallback;
   KeyboardFocusCallback m_keyboardFocusCallback;
+  LockKeysChangeCallback m_lockKeysChangeCallback;
+  LockKeysState m_lastLockKeysState;
 
   // Key repeat
-  SteadyClock::time_point m_lastUserActivitySteady{};
+  SteadyClock::time_point m_lastUserActivitySteady;
   std::int32_t m_repeatRate = 0;    // chars/sec; 0 = no repeat
   std::int32_t m_repeatDelayMs = 0; // initial delay in ms
   KeyboardEvent m_repeatKey;

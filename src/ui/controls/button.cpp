@@ -1,6 +1,8 @@
 #include "ui/controls/button.h"
 
+#include "core/input/keybind_matcher.h"
 #include "render/animation/animation_manager.h"
+#include "render/core/renderer.h"
 #include "render/scene/input_area.h"
 #include "ui/controls/glyph.h"
 #include "ui/controls/label.h"
@@ -45,7 +47,7 @@ namespace {
           ),
           .disabled = makeState(
               colorSpecFromRole(ColorRole::SurfaceVariant, kDisabledAlpha),
-              colorSpecFromRole(ColorRole::Outline, kDisabledAlpha),
+              colorSpecFromRole(ColorRole::Outline, Style::disabledOutlineAlpha),
               colorSpecFromRole(ColorRole::OnSurface, kDisabledAlpha)
           ),
           .selected = selectedState(),
@@ -82,7 +84,8 @@ namespace {
           ),
           .disabled = makeState(
               colorSpecFromRole(ColorRole::Secondary, kDisabledAlpha),
-              colorSpecFromRole(ColorRole::Outline, kDisabledAlpha), colorSpecFromRole(ColorRole::OnSecondary)
+              colorSpecFromRole(ColorRole::Outline, Style::disabledOutlineAlpha),
+              colorSpecFromRole(ColorRole::OnSecondary)
           ),
           .selected = selectedState(),
       };
@@ -101,7 +104,7 @@ namespace {
           ),
           .disabled = makeState(
               colorSpecFromRole(ColorRole::Error, kDisabledAlpha),
-              colorSpecFromRole(ColorRole::Outline, kDisabledAlpha), colorSpecFromRole(ColorRole::OnError)
+              colorSpecFromRole(ColorRole::Outline, Style::disabledOutlineAlpha), colorSpecFromRole(ColorRole::OnError)
           ),
           .selected = selectedState(),
       };
@@ -120,7 +123,7 @@ namespace {
           ),
           .disabled = makeState(
               colorSpecFromRole(ColorRole::Surface, kDisabledAlpha),
-              colorSpecFromRole(ColorRole::Outline, kDisabledAlpha),
+              colorSpecFromRole(ColorRole::Outline, Style::disabledOutlineAlpha),
               colorSpecFromRole(ColorRole::OnSurface, kDisabledAlpha)
           ),
           .selected = selectedState(),
@@ -220,6 +223,17 @@ Button::Button() {
       m_onClick();
     }
   });
+  area->setFocusable(true);
+  area->setOnFocusGain([this]() { applyVisualState(); });
+  area->setOnFocusLoss([this]() { applyVisualState(); });
+  area->setOnKeyDown([this](const InputArea::KeyData& key) {
+    if (!key.pressed || !m_enabled || !m_onClick) {
+      return;
+    }
+    if (KeybindMatcher::matches(KeybindAction::Validate, key.sym, key.modifiers)) {
+      m_onClick();
+    }
+  });
   area->setEnabled(false);
   m_inputArea = static_cast<InputArea*>(addChild(std::move(area)));
   m_inputArea->setParticipatesInLayout(false);
@@ -235,6 +249,8 @@ Button::Button() {
     // the next applyVisualState() will resync.
     applyVariant();
   });
+  m_buttonBordersConn =
+      Style::buttonBordersChanged().connect([this] { setBorder(m_targetBorder, effectiveBorderWidth()); });
 }
 
 Button::~Button() {
@@ -245,6 +261,12 @@ Button::~Button() {
 }
 
 void Button::setText(std::string_view text) {
+  // A glyph-only button must not grow the text-tier chrome (control height,
+  // wider padding) just because its text was cleared: creating the label is
+  // what flips the size tier, so skip it for empty text.
+  if (text.empty() && m_label == nullptr) {
+    return;
+  }
   ensureLabel();
   m_label->setText(text);
   m_label->setVisible(!text.empty());
@@ -266,6 +288,12 @@ void Button::setFontSize(float size) {
 void Button::setGlyphSize(float size) {
   ensureGlyph();
   m_glyph->setGlyphSize(size);
+}
+
+void Button::setControlHeight(float height) {
+  const float pinned = std::max(1.0f, height);
+  setMinHeight(pinned);
+  setMaxHeight(pinned);
 }
 
 void Button::setOnClick(std::function<void()> callback) {
@@ -324,6 +352,14 @@ void Button::setHoveredVisual(bool hovered) {
   applyVisualState();
 }
 
+void Button::setPressedVisual(bool pressed) {
+  if (m_pressedVisual == pressed) {
+    return;
+  }
+  m_pressedVisual = pressed;
+  applyVisualState();
+}
+
 void Button::setCursorShape(std::uint32_t shape) {
   if (m_inputArea != nullptr) {
     m_inputArea->setCursorShape(shape);
@@ -350,6 +386,20 @@ void Button::setTooltip(std::string_view text) {
   } else {
     m_inputArea->setTooltip(std::string(text));
   }
+}
+
+void Button::setTabStop(bool tabStop) {
+  if (m_inputArea != nullptr) {
+    m_inputArea->setTabStop(tabStop);
+  }
+}
+
+void Button::setKeyboardFocusHint(bool hint) {
+  if (m_keyboardFocusHint == hint) {
+    return;
+  }
+  m_keyboardFocusHint = hint;
+  applyVisualState();
 }
 
 void Button::ensureBadge() {
@@ -398,6 +448,7 @@ void Button::setSelected(bool selected) {
   }
   m_selected = selected;
   applyVisualState();
+  markPaintDirty();
 }
 
 void Button::setContentAlign(ButtonContentAlign align) { m_contentAlign = align; }
@@ -431,7 +482,7 @@ void Button::applyVariant() {
     m_palette.normal.bg.alpha *= m_surfaceOpacity;
     m_palette.disabled.bg.alpha *= m_surfaceOpacity;
   }
-  setBorder(m_palette.normal.border, m_palette.borderWidth);
+  setBorder(m_palette.normal.border, effectiveBorderWidth());
 
   // Only seed targets before the first visual state application. Once the
   // button has been painted, applyVisualState() must compare against the
@@ -504,7 +555,7 @@ void Button::ensureGlyph() {
 
 void Button::applyColors(const Color& bg, const Color& border, const Color& label) {
   setFill(bg);
-  setBorder(border, m_palette.borderWidth);
+  setBorder(border, effectiveBorderWidth());
   if (m_label != nullptr) {
     m_label->setColor(label);
   }
@@ -530,9 +581,22 @@ void Button::applyColors(const Color& bg, const Color& border, const Color& labe
   m_visualStateInitialized = true;
 }
 
+float Button::effectiveBorderWidth() const noexcept {
+  return Style::buttonBordersEnabled() ? m_palette.borderWidth : 0.0f;
+}
+
 void Button::resolveVisualStateColors(Color& targetBg, Color& targetBorder, Color& targetLabel) const {
+  const bool isKeyboardFocused = m_enabled && m_keyboardFocusHint;
+  const bool isInputFocused = m_enabled && m_inputArea != nullptr && m_inputArea->focused();
+  const bool keyboardNavFocus = isKeyboardFocused
+      && (m_variant == ButtonVariant::TabActive
+          || m_variant == ButtonVariant::Tab
+          || m_variant == ButtonVariant::Ghost);
   bool isHovered = m_enabled && (m_hoveredVisual || (!m_hoverSuppressed && hovered()));
-  bool isPressed = m_enabled && pressed();
+  if (isInputFocused && !keyboardNavFocus) {
+    isHovered = true;
+  }
+  bool isPressed = m_enabled && (m_pressedVisual || pressed());
   bool isSelected = m_enabled && m_selected;
 
   if (!m_enabled) {
@@ -547,6 +611,10 @@ void Button::resolveVisualStateColors(Color& targetBg, Color& targetBorder, Colo
     targetBg = resolveColorSpec(m_palette.selected->bg);
     targetBorder = resolveColorSpec(m_palette.selected->border);
     targetLabel = resolveColorSpec(m_palette.selected->label);
+  } else if (keyboardNavFocus) {
+    targetBg = resolveColorSpec(colorSpecFromRole(ColorRole::Secondary));
+    targetBorder = resolveColorSpec(clearColorSpec());
+    targetLabel = resolveColorSpec(colorSpecFromRole(ColorRole::OnSecondary));
   } else if (isHovered || isSelected) {
     targetBg = resolveColorSpec(m_palette.hover.bg);
     targetBorder = resolveColorSpec(m_palette.hover.border);
@@ -609,6 +677,21 @@ void Button::applyVisualState() {
   markPaintDirty();
 }
 
+void Button::applyLabelMaxWidth() {
+  if (m_label == nullptr) {
+    return;
+  }
+  const float maxBtnWidth = maxWidth();
+  if (maxBtnWidth > 0.0f) {
+    const float padding = paddingLeft() + paddingRight();
+    const float glyphW = (m_glyph != nullptr && m_glyph->visible()) ? m_glyph->width() + gap() : 0.0f;
+    m_label->setMaxWidth(std::max(0.0f, maxBtnWidth - padding - glyphW));
+    m_label->setEllipsize(TextEllipsize::End);
+  } else {
+    m_label->setMaxWidth(0.0f);
+  }
+}
+
 void Button::doLayout(Renderer& renderer) {
   const bool useCurrentSize = arrangingByLayout() || !sizeAssignedByLayout();
   const float assignedWidth = useCurrentSize ? width() : 0.0f;
@@ -617,6 +700,7 @@ void Button::doLayout(Renderer& renderer) {
   const bool glyphOnly = m_glyph != nullptr && !hasVisibleLabel;
 
   if (m_label != nullptr) {
+    applyLabelMaxWidth();
     m_label->measure(renderer);
   }
   if (m_glyph != nullptr) {
@@ -628,14 +712,14 @@ void Button::doLayout(Renderer& renderer) {
   // Buttons are often sized by a parent stretch pass. Preserve that assigned
   // box instead of collapsing back to intrinsic content width.
   if (assignedWidth > 0.0f || assignedHeight > 0.0f) {
-    setSize(std::max(width(), assignedWidth), std::max(height(), assignedHeight));
+    setSizeFromLayout(std::max(width(), assignedWidth), std::max(height(), assignedHeight));
   }
 
   if (glyphOnly && m_contentAlign == ButtonContentAlign::Center) {
     const bool hasAssignedWidth = assignedWidth > 0.0f;
     if (!hasAssignedWidth) {
       const float squareSize = std::max(width(), height());
-      setSize(squareSize, squareSize);
+      setSizeFromLayout(squareSize, squareSize);
     }
   }
 
@@ -719,7 +803,69 @@ void Button::doLayout(Renderer& renderer) {
 }
 
 LayoutSize Button::doMeasure(Renderer& renderer, const LayoutConstraints& constraints) {
+  applyLabelMaxWidth();
   return measureByLayout(renderer, constraints);
 }
 
 void Button::doArrange(Renderer& renderer, const LayoutRect& rect) { arrangeByLayout(renderer, rect); }
+
+std::vector<std::vector<std::unique_ptr<Button>>>
+wrapButtonsIntoRows(Renderer& renderer, std::vector<std::unique_ptr<Button>>& buttons, float maxWidth, float gap) {
+  std::vector<std::vector<std::unique_ptr<Button>>> rows;
+  if (buttons.empty()) {
+    return rows;
+  }
+
+  std::vector<std::unique_ptr<Button>> currentRow;
+  float currentRowWidth = 0.0f;
+
+  for (auto& button : buttons) {
+    if (!button) {
+      continue;
+    }
+    const LayoutSize measured = button->measure(renderer, LayoutConstraints{});
+    const float btnWidth = measured.width;
+
+    if (!currentRow.empty() && currentRowWidth + gap + btnWidth > maxWidth) {
+      rows.push_back(std::move(currentRow));
+      currentRow.clear();
+      currentRowWidth = 0.0f;
+    }
+
+    if (currentRow.empty()) {
+      currentRowWidth = btnWidth;
+    } else {
+      currentRowWidth += gap + btnWidth;
+    }
+    currentRow.push_back(std::move(button));
+  }
+
+  if (!currentRow.empty()) {
+    rows.push_back(std::move(currentRow));
+  }
+
+  buttons.clear();
+  return rows;
+}
+
+void populateRowContainer(
+    Flex& container, std::vector<std::vector<std::unique_ptr<Button>>> rows, float maxWidth, float gap
+) {
+  for (auto& rowButtons : rows) {
+    auto row = std::make_unique<Flex>();
+    row->setDirection(FlexDirection::Horizontal);
+    row->setAlign(FlexAlign::Center);
+    row->setGap(gap);
+    row->setFillWidth(true);
+    for (auto& btn : rowButtons) {
+      if (rowButtons.size() == 1) {
+        btn->setMaxWidth(maxWidth);
+      } else {
+        btn->setMaxWidth(0.0f);
+      }
+      btn->setFlexGrow(1.0f);
+      row->addChild(std::move(btn));
+    }
+    container.addChild(std::move(row));
+  }
+}

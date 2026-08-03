@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <cctype>
 #include <utility>
-#include <wayland-client.h>
 
 namespace {
 
@@ -130,10 +129,10 @@ std::optional<ActiveToplevel> WaylandToplevels::matchByTitleAndAppId(
     }
     std::uint64_t score = state.generation;
     if (preferredOutput != nullptr && state.output == preferredOutput) {
-      score += (1ull << 62);
+      score += (1ULL << 62);
     }
     if (state.activated) {
-      score += (1ull << 61);
+      score += (1ULL << 61);
     }
     if (!best.has_value() || score > bestScore) {
       best = ActiveToplevel{
@@ -232,13 +231,15 @@ void WaylandToplevels::onHandleState(zwlr_foreign_toplevel_handle_v1* handle, wl
   }
 
   bool activated = false;
+  bool minimized = false;
   if (state != nullptr) {
     auto* value = static_cast<const std::uint32_t*>(state->data);
     const auto count = state->size / sizeof(std::uint32_t);
     for (std::size_t i = 0; i < count; ++i) {
       if (value[i] == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_ACTIVATED) {
         activated = true;
-        break;
+      } else if (value[i] == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_MINIMIZED) {
+        minimized = true;
       }
     }
   }
@@ -254,6 +255,7 @@ void WaylandToplevels::onHandleState(zwlr_foreign_toplevel_handle_v1* handle, wl
   }
 
   it->second.activated = activated;
+  it->second.minimized = minimized;
   it->second.dirty = true;
   it->second.generation = ++m_generation;
 }
@@ -269,12 +271,21 @@ wl_output* WaylandToplevels::currentOutput() const {
   return it->second.output;
 }
 
+bool WaylandToplevels::matchesOutputFilter(const ToplevelState& state, wl_output* outputFilter) {
+  if (outputFilter == nullptr || state.output == outputFilter) {
+    return true;
+  }
+  // Some compositors omit output_enter for toplevels that predate the bind (observed on Hyprland),
+  // leaving the output unknown.
+  return !state.sawOutputEnter;
+}
+
 std::vector<std::string> WaylandToplevels::allAppIds(wl_output* outputFilter) const {
   std::vector<const ToplevelState*> ordered;
   ordered.reserve(m_handles.size());
   for (const auto& [handle, state] : m_handles) {
     (void)handle;
-    if (outputFilter != nullptr && state.output != outputFilter) {
+    if (!matchesOutputFilter(state, outputFilter)) {
       continue;
     }
     ordered.push_back(&state);
@@ -305,7 +316,7 @@ std::vector<ToplevelInfo> WaylandToplevels::windowsForApp(
   std::vector<MatchedWindow> matched;
   std::vector<ToplevelInfo> out;
   for (const auto& [handle, state] : m_handles) {
-    if (outputFilter != nullptr && state.output != outputFilter) {
+    if (!matchesOutputFilter(state, outputFilter)) {
       continue;
     }
     const auto appId = effectiveAppId(state.appId, state.title);
@@ -324,8 +335,10 @@ std::vector<ToplevelInfo> WaylandToplevels::windowsForApp(
               .info = ToplevelInfo{
                   .title = state.title,
                   .appId = appId,
+                  .identifier = appId + ":" + state.title,
                   .order = state.order,
                   .handle = handle,
+                  .outputAnnounced = state.sawOutputEnter,
               },
           }
       );
@@ -334,6 +347,44 @@ std::vector<ToplevelInfo> WaylandToplevels::windowsForApp(
   std::ranges::sort(matched, {}, &MatchedWindow::order);
   out.reserve(matched.size());
   for (auto& window : matched) {
+    out.push_back(std::move(window.info));
+  }
+  return out;
+}
+
+std::vector<ToplevelInfo> WaylandToplevels::windowsWithoutAppId(wl_output* outputFilter) const {
+  struct OrphanWindow {
+    std::uint64_t order = 0;
+    ToplevelInfo info;
+  };
+
+  std::vector<OrphanWindow> orphans;
+  for (const auto& [handle, state] : m_handles) {
+    if (!matchesOutputFilter(state, outputFilter)) {
+      continue;
+    }
+    if (!effectiveAppId(state.appId, state.title).empty()) {
+      continue;
+    }
+    orphans.push_back(
+        OrphanWindow{
+            .order = state.order,
+            .info = ToplevelInfo{
+                .title = state.title,
+                .appId = {},
+                .identifier = state.title,
+                .order = state.order,
+                .handle = handle,
+                .outputAnnounced = state.sawOutputEnter,
+            },
+        }
+    );
+  }
+  std::ranges::sort(orphans, {}, &OrphanWindow::order);
+
+  std::vector<ToplevelInfo> out;
+  out.reserve(orphans.size());
+  for (auto& window : orphans) {
     out.push_back(std::move(window.info));
   }
   return out;
@@ -358,6 +409,10 @@ void WaylandToplevels::closeHandle(zwlr_foreign_toplevel_handle_v1* handle) {
 void WaylandToplevels::onHandleOutputEnter(zwlr_foreign_toplevel_handle_v1* handle, wl_output* output) {
   auto it = m_handles.find(handle);
   if (it != m_handles.end()) {
+    it->second.sawOutputEnter = true;
+    if (!std::ranges::contains(it->second.activeOutputs, output)) {
+      it->second.activeOutputs.push_back(output);
+    }
     if (it->second.output != output) {
       it->second.output = output;
       it->second.dirty = true;
@@ -368,10 +423,16 @@ void WaylandToplevels::onHandleOutputEnter(zwlr_foreign_toplevel_handle_v1* hand
 
 void WaylandToplevels::onHandleOutputLeave(zwlr_foreign_toplevel_handle_v1* handle, wl_output* output) {
   auto it = m_handles.find(handle);
-  if (it != m_handles.end() && it->second.output == output) {
-    it->second.output = nullptr;
-    it->second.dirty = true;
-    it->second.generation = ++m_generation;
+  if (it != m_handles.end()) {
+    const auto pos = std::ranges::find(it->second.activeOutputs, output);
+    if (pos != it->second.activeOutputs.end()) {
+      it->second.activeOutputs.erase(pos);
+    }
+    if (it->second.output == output) {
+      it->second.output = it->second.activeOutputs.empty() ? nullptr : it->second.activeOutputs.back();
+      it->second.dirty = true;
+      it->second.generation = ++m_generation;
+    }
   }
 }
 

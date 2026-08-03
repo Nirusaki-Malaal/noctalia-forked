@@ -1,16 +1,24 @@
 #include "shell/wallpaper/wallpaper.h"
 
+#include "compositors/compositor_detect.h"
 #include "core/deferred_call.h"
 #include <cstring>
 #include "config/config_service.h"
+#include "core/files/directory_scanner.h"
 #include "core/log.h"
+#include "core/process/process.h"
 #include "core/random.h"
 #include "cursor-shape-v1-client-protocol.h"
 #include "ipc/ipc_service.h"
+#include "render/animation/animation.h"
+#include "render/backend/render_backend.h"
 #include "render/core/render_styles.h"
 #include "render/core/shared_texture_cache.h"
 #include "render/render_context.h"
+#include "shell/wallpaper/wallpaper_instance.h"
 #include "shell/wallpaper/wallpaper_paths.h"
+#include "theme/theme_service.h"
+#include "ui/builders.h"
 #include "ui/controls/box.h"
 #include "ui/palette.h"
 #include "util/file_utils.h"
@@ -26,11 +34,41 @@
 #include <optional>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 using Random::randomFloat;
 
 namespace {
+
+  constexpr Easing kWallpaperTransitionEasing = Easing::EaseInOutCubic;
+
+  [[nodiscard]] Color defaultWallpaperColor() { return rgba(0.0f, 0.0f, 0.0f, 1.0f); }
+
+  [[nodiscard]] float transitionProgressForTime(float time) {
+    return applyEasing(kWallpaperTransitionEasing, std::clamp(time, 0.0f, 1.0f));
+  }
+
+  void setTransitionTime(WallpaperInstance& instance, float time) {
+    instance.transitionTime = std::clamp(time, 0.0f, 1.0f);
+  }
+
+  [[nodiscard]] float transitionTargetTime(WallpaperTransitionDirection direction) {
+    return direction == WallpaperTransitionDirection::Forward ? 1.0f : 0.0f;
+  }
+
+  [[nodiscard]] std::optional<WallpaperTransitionDirection>
+  directionForPath(const WallpaperInstance& instance, const std::string& path) {
+    if (path == instance.currentPath) {
+      return WallpaperTransitionDirection::Reverse;
+    }
+
+    if (path == instance.pendingPath) {
+      return WallpaperTransitionDirection::Forward;
+    }
+
+    return std::nullopt;
+  }
 
   TransitionParams randomizeParams(WallpaperTransition type, float smoothness, float aspectRatio) {
     TransitionParams params;
@@ -64,12 +102,6 @@ namespace {
     return params;
   }
 
-  bool hasImageExtension(const std::filesystem::path& path) {
-    const std::string ext = StringUtils::toLower(path.extension().string());
-    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".webp" || ext == ".bmp" || ext == ".gif" ||
-           ext == ".mp4" || ext == ".webm" || ext == ".mkv" || ext == ".avi" || ext == ".mov";
-  }
-
   [[nodiscard]] std::optional<std::string>
   resolveWallpaperPath(std::string_view path, std::optional<std::string_view> callerCwd = std::nullopt) {
     if (path.empty()) {
@@ -80,7 +112,7 @@ namespace {
     }
     const std::filesystem::path resolved = FileUtils::resolvePath(path, callerCwd);
     std::error_code ec;
-    if (std::filesystem::exists(resolved, ec)) {
+    if (std::filesystem::is_regular_file(resolved, ec)) {
       return resolved.string();
     }
     return std::nullopt;
@@ -134,7 +166,7 @@ namespace {
         if (!it->is_regular_file(typeEc) || typeEc) {
           continue;
         }
-        if (hasImageExtension(it->path())) {
+        if (DirectoryScanner::isImagePath(it->path())) {
           out.push_back(it->path().string());
         }
       }
@@ -151,7 +183,7 @@ namespace {
       if (!entry.is_regular_file(typeEc) || typeEc) {
         continue;
       }
-      if (hasImageExtension(entry.path())) {
+      if (DirectoryScanner::isImagePath(entry.path())) {
         out.push_back(entry.path().string());
       }
     }
@@ -179,20 +211,12 @@ namespace {
   }
 
   bool lessCaseInsensitive(std::string_view a, std::string_view b) {
-    const std::size_t minLen = std::min(a.size(), b.size());
-    for (std::size_t i = 0; i < minLen; ++i) {
-      const auto ac = static_cast<unsigned char>(a[i]);
-      const auto bc = static_cast<unsigned char>(b[i]);
-      const auto alc = static_cast<unsigned char>(std::tolower(ac));
-      const auto blc = static_cast<unsigned char>(std::tolower(bc));
-      if (alc != blc) {
-        return alc < blc;
-      }
-    }
-    return a.size() < b.size();
+    return StringUtils::naturalCaseInsensitiveLess(a, b);
   }
 
-  std::string pickAlphabeticalWallpaperPath(std::vector<std::string> candidates, const std::string& currentPath) {
+  std::string pickAlphabeticalWallpaperPath(
+      std::vector<std::string> candidates, const std::string& currentPath, int direction = 1
+  ) {
     if (candidates.empty()) {
       return {};
     }
@@ -205,8 +229,10 @@ namespace {
     if (it == candidates.end()) {
       return candidates.front();
     }
-    const std::size_t idx = static_cast<std::size_t>(std::distance(candidates.begin(), it));
-    return candidates[(idx + 1) % candidates.size()];
+    const auto n = candidates.size();
+    const auto idx = static_cast<std::size_t>(std::distance(candidates.begin(), it));
+    const std::size_t step = (direction < 0) ? n - 1 : 1;
+    return candidates[(idx + step) % n];
   }
 
   std::string pickAutomationWallpaperPath(
@@ -246,6 +272,110 @@ namespace {
       return false;
     }
     return tryParseHexColor(path.substr(kPrefix.size()), out);
+  }
+
+  // Build the Span geometry for one output: the desktop bounding box across every
+  // ready output and this output's offset/size within it. Returns a zeroed result
+  // (which makes the shader fall back to Crop) when geometry is not yet available.
+  WallpaperSpanParams computeSpanParams(const std::vector<WaylandOutput>& outputs, std::uint32_t outputName) {
+    WallpaperSpanParams span;
+
+    bool haveBounds = false;
+    std::int32_t minX = 0;
+    std::int32_t minY = 0;
+    std::int32_t maxX = 0;
+    std::int32_t maxY = 0;
+    const WaylandOutput* self = nullptr;
+
+    for (const auto& out : outputs) {
+      if (!out.done || out.logicalWidth <= 0 || out.logicalHeight <= 0) {
+        continue;
+      }
+      const std::int32_t left = out.logicalX;
+      const std::int32_t top = out.logicalY;
+      const std::int32_t right = out.logicalX + out.logicalWidth;
+      const std::int32_t bottom = out.logicalY + out.logicalHeight;
+      if (!haveBounds) {
+        minX = left;
+        minY = top;
+        maxX = right;
+        maxY = bottom;
+        haveBounds = true;
+      } else {
+        minX = std::min(minX, left);
+        minY = std::min(minY, top);
+        maxX = std::max(maxX, right);
+        maxY = std::max(maxY, bottom);
+      }
+      if (out.name == outputName) {
+        self = &out;
+      }
+    }
+
+    if (!haveBounds || self == nullptr) {
+      return span;
+    }
+
+    span.offsetX = static_cast<float>(self->logicalX - minX);
+    span.offsetY = static_cast<float>(self->logicalY - minY);
+    span.monitorWidth = static_cast<float>(self->logicalWidth);
+    span.monitorHeight = static_cast<float>(self->logicalHeight);
+    span.totalWidth = static_cast<float>(maxX - minX);
+    span.totalHeight = static_cast<float>(maxY - minY);
+    return span;
+  }
+
+  void
+  notifyKdePlasmaWallpaper(const std::string& imagePath, const std::string& connector, const WaylandOutput* output) {
+    if (!compositors::isKde()) {
+      return;
+    }
+    if (imagePath.starts_with("color:")) {
+      return;
+    }
+
+    kLog.info("syncing wallpaper to KDE Plasma: {} (connector: {})", imagePath, connector);
+
+    std::string script;
+    if (output == nullptr) {
+      script = "var d = desktops();"
+               "for (var i = 0; i < d.length; i++) {"
+               "  d[i].wallpaperPlugin = 'org.kde.image';"
+               "  d[i].currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];"
+               "  d[i].writeConfig('Image', 'file://"
+          + imagePath
+          + "');"
+            "}";
+    } else {
+      script = "var d = desktops();"
+               "for (var i = 0; i < d.length; i++) {"
+               "  var g = screenGeometry(d[i].screen);"
+               "  if (g.x == "
+          + std::to_string(output->logicalX)
+          + " && g.y == "
+          + std::to_string(output->logicalY)
+          + " && g.width == "
+          + std::to_string(output->logicalWidth)
+          + " && g.height == "
+          + std::to_string(output->logicalHeight)
+          + ") {"
+            "    d[i].wallpaperPlugin = 'org.kde.image';"
+            "    d[i].currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];"
+            "    d[i].writeConfig('Image', 'file://"
+          + imagePath
+          + "');"
+            "  }"
+            "}";
+    }
+
+    const bool launched = process::runAsync(
+        {"dbus-send", "--session", "--dest=org.kde.plasmashell", "--type=method_call", "/PlasmaShell",
+         "org.kde.PlasmaShell.evaluateScript", "string:" + script}
+    );
+
+    if (!launched) {
+      kLog.warn("failed to launch dbus-send to sync plasma wallpaper");
+    }
   }
 
 } // namespace
@@ -341,12 +471,14 @@ void Wallpaper::onGpuResourcesInvalidated() {
 }
 
 bool Wallpaper::initialize(
-    WaylandConnection& wayland, ConfigService* config, RenderContext* renderContext, SharedTextureCache* textureCache
+    WaylandConnection& wayland, ConfigService* config, RenderContext* renderContext, SharedTextureCache* textureCache,
+    noctalia::theme::ThemeService* themeService
 ) {
   m_wayland = &wayland;
   m_config = config;
   m_renderContext = renderContext;
   m_textureCache = textureCache;
+  m_themeService = themeService;
 
   // Register reload callback unconditionally so toggling enabled in config works.
   m_config->addReloadCallback([this]() { reload(); }, "wallpaper");
@@ -372,7 +504,6 @@ bool Wallpaper::initialize(
   applyStartupAutomation(
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()
   );
-  syncInstances();
   return true;
 }
 
@@ -424,11 +555,24 @@ void Wallpaper::onOutputChange() {
     return;
   }
   syncInstances();
+
+  // Span fill mode maps a single image across the whole desktop, so a geometry
+  // change on any output shifts the slice shown on every other output. Refresh
+  // all instances; the node setters no-op when the span geometry is unchanged.
+  if (m_config->config().wallpaper.fillMode == WallpaperFillMode::Span) {
+    for (auto& inst : m_instances) {
+      updateRendererState(*inst);
+      if (inst->surface != nullptr) {
+        inst->surface->requestRedraw();
+      }
+    }
+  }
 }
 
-void Wallpaper::onStateChange() {
+std::vector<WallpaperChange> Wallpaper::onStateChange() {
   kLog.info("state file changed, checking for updates");
 
+  std::vector<WallpaperChange> changes;
   for (auto& inst : m_instances) {
     auto newPath = m_config->getWallpaperPath(inst->connectorName);
     if (inst->surface == nullptr || inst->wallpaperNode == nullptr) {
@@ -437,6 +581,7 @@ void Wallpaper::onStateChange() {
 
     if (newPath.empty()) {
       if (!inst->currentPath.empty() || inst->currentTexture.id != 0 || inst->nextTexture.id != 0) {
+        changes.push_back({.path = newPath, .connector = inst->connectorName});
         if (inst->transitionAnimId != 0) {
           inst->animations.cancel(inst->transitionAnimId);
           inst->transitionAnimId = 0;
@@ -451,7 +596,9 @@ void Wallpaper::onStateChange() {
         inst->currentPath.clear();
         inst->pendingPath.clear();
         inst->queuedPath.clear();
+        inst->transitionTime = 0.0f;
         inst->transitioning = false;
+        inst->transitionDirection = WallpaperTransitionDirection::Forward;
         updateRendererState(*inst);
         inst->surface->requestRedraw();
       }
@@ -459,13 +606,19 @@ void Wallpaper::onStateChange() {
     }
 
     if (inst->transitioning) {
-      if (newPath == inst->pendingPath) {
-        inst->queuedPath.clear();
+      switch (redirectActiveTransition(*inst, newPath)) {
+      case TransitionRedirect::AlreadyTargeting:
+        continue;
+      case TransitionRedirect::Redirected:
+        changes.push_back({.path = newPath, .connector = inst->connectorName});
+        continue;
+      case TransitionRedirect::Unrelated:
+        inst->queuedPath = newPath;
+        changes.push_back({.path = newPath, .connector = inst->connectorName});
         continue;
       }
 
-      inst->queuedPath = newPath;
-      continue;
+      std::unreachable();
     }
 
     if (newPath == inst->currentPath) {
@@ -474,7 +627,27 @@ void Wallpaper::onStateChange() {
 
     kLog.info("changing {} → {}", inst->connectorName, newPath);
     loadWallpaper(*inst, newPath);
+    changes.push_back({.path = newPath, .connector = inst->connectorName});
+
+    const WaylandOutput* output = nullptr;
+    if (m_wayland != nullptr) {
+      for (const auto& out : m_wayland->outputs()) {
+        if (out.name == inst->outputName) {
+          output = &out;
+          break;
+        }
+      }
+    }
+    notifyKdePlasmaWallpaper(newPath, inst->connectorName, output);
   }
+
+  // Any wallpaper change (manual selection, IPC, or automation) restarts the
+  // rotation interval so the next automatic switch is a full interval away.
+  if (!changes.empty()) {
+    using namespace std::chrono;
+    m_lastAutomationSwitchSecond = duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+  }
+  return changes;
 }
 
 void Wallpaper::onSecondTick() {
@@ -491,20 +664,86 @@ void Wallpaper::onSecondTick() {
   runAutomation(secondStamp);
 }
 
+bool Wallpaper::isConnectorKnown(std::string_view connector) const {
+  if (m_wayland == nullptr) {
+    return false;
+  }
+  return std::ranges::any_of(m_wayland->outputs(), [&](const WaylandOutput& out) {
+    return !out.connectorName.empty() && out.connectorName == connector;
+  });
+}
+
+void Wallpaper::applyResolvedWallpaper(const std::optional<std::string>& connector, const std::string& resolvedPath) {
+  const WaylandOutput* output = nullptr;
+  if (connector.has_value() && m_wayland != nullptr) {
+    for (const auto& out : m_wayland->outputs()) {
+      if (out.connectorName == *connector) {
+        output = &out;
+        break;
+      }
+    }
+  }
+  notifyKdePlasmaWallpaper(resolvedPath, connector.value_or(""), output);
+
+  if (const WallpaperFavorite* favorite = m_config->wallpaperFavorite(resolvedPath); favorite != nullptr) {
+    if (connector.has_value()) {
+      m_config->applyWallpaperSelection(connector, resolvedPath, favorite, {});
+      return;
+    }
+
+    std::vector<std::string> connectors;
+    if (m_wayland != nullptr) {
+      for (const auto& out : m_wayland->outputs()) {
+        if (!out.connectorName.empty()) {
+          connectors.push_back(out.connectorName);
+        }
+      }
+    }
+    m_config->applyWallpaperSelection(std::nullopt, resolvedPath, favorite, connectors);
+    return;
+  }
+
+  if (connector.has_value()) {
+    m_config->setWallpaperPath(connector, resolvedPath);
+    return;
+  }
+
+  // Match wallpaper panel "All monitors": per-output overrides win over default in
+  // getWallpaperPath(), so set every connected output plus default or the image never updates.
+  ConfigService::WallpaperBatch batch(*m_config);
+  if (m_wayland != nullptr) {
+    for (const auto& out : m_wayland->outputs()) {
+      if (!out.connectorName.empty()) {
+        m_config->setWallpaperPath(out.connectorName, resolvedPath);
+      }
+    }
+  }
+  m_config->setWallpaperPath(std::nullopt, resolvedPath);
+}
+
+bool Wallpaper::applyWallpaperImage(const std::optional<std::string>& connector, const std::string& path) {
+  if (m_config == nullptr) {
+    return false;
+  }
+  if (connector.has_value() && !isConnectorKnown(*connector)) {
+    return false;
+  }
+  const auto resolved = resolveWallpaperPath(path);
+  if (!resolved.has_value()) {
+    return false;
+  }
+  applyResolvedWallpaper(connector, *resolved);
+  return true;
+}
+
 void Wallpaper::registerIpc(IpcService& ipc) {
   auto validateOutputConnector = [this](std::string_view outputConnector) -> std::string {
-    if (m_wayland == nullptr) {
-      return {};
-    }
-    const auto& outputs = m_wayland->outputs();
-    const bool found = std::ranges::any_of(outputs, [&](const WaylandOutput& out) {
-      return !out.connectorName.empty() && out.connectorName == outputConnector;
-    });
-    if (found) {
+    if (m_wayland == nullptr || isConnectorKnown(outputConnector)) {
       return {};
     }
 
     std::vector<std::string> known;
+    const auto& outputs = m_wayland->outputs();
     for (const auto& out : outputs) {
       if (!out.connectorName.empty()) {
         known.push_back(out.connectorName);
@@ -515,21 +754,57 @@ void Wallpaper::registerIpc(IpcService& ipc) {
     return "error: unknown output \"" + std::string(outputConnector) + "\"" + suffix + "\n";
   };
 
+  // Map a switch outcome to an IPC response. NoChange (e.g. a single wallpaper in
+  // the directory) is not an error, so it does not use the "error:" prefix.
+  const auto switchResponse = [](SwitchOutcome outcome) -> std::string {
+    switch (outcome) {
+    case SwitchOutcome::Changed:
+      return "ok\n";
+    case SwitchOutcome::NoChange:
+      return "no other wallpaper available to switch to\n";
+    case SwitchOutcome::Unavailable:
+      return "error: no wallpapers available or wallpaper disabled\n";
+    }
+    return "error: failed to switch wallpaper\n";
+  };
+
+  const auto switchWallpaperHandler = [this, validateOutputConnector,
+                                       switchResponse](PickWallpaper action, const std::string& args) -> std::string {
+    const auto trimmed = StringUtils::trim(args);
+    std::optional<std::string_view> connector;
+    if (!trimmed.empty()) {
+      if (const std::string err = validateOutputConnector(trimmed); !err.empty()) {
+        return err;
+      }
+      connector = trimmed;
+    }
+    return switchResponse(switchWallpaperTo(action, connector));
+  };
+
   ipc.registerHandler(
       "wallpaper-random",
-      [this](const std::string& args) -> std::string {
-        const auto trimmed = StringUtils::trim(args);
-        std::optional<std::string_view> connector;
-        if (!trimmed.empty()) {
-          connector = trimmed;
-        }
-        if (!switchToRandomWallpaper(connector)) {
-          return "error: failed to pick a random wallpaper\n";
-        }
-        return "ok\n";
+      [switchWallpaperHandler](const std::string& args) -> std::string {
+        return switchWallpaperHandler(PickWallpaper::Random, args);
       },
-      "wallpaper-random [<connector>]", "Switch to a random wallpaper immediately"
+      "[connector]", "Switch to a random wallpaper immediately"
   );
+
+  ipc.registerHandler(
+      "wallpaper-next",
+      [switchWallpaperHandler](const std::string& args) -> std::string {
+        return switchWallpaperHandler(PickWallpaper::Next, args);
+      },
+      "[connector]", "Switch to the next wallpaper immediately"
+  );
+
+  ipc.registerHandler(
+      "wallpaper-previous",
+      [switchWallpaperHandler](const std::string& args) -> std::string {
+        return switchWallpaperHandler(PickWallpaper::Previous, args);
+      },
+      "[connector]", "Switch to the previous wallpaper immediately"
+  );
+
   ipc.registerHandler(
       "wallpaper-get",
       [this, validateOutputConnector](const std::string& args) -> std::string {
@@ -552,7 +827,8 @@ void Wallpaper::registerIpc(IpcService& ipc) {
         out.push_back('\n');
         return out;
       },
-      "wallpaper-get [<connector>]", "Print default wallpaper path, or effective path for an output"
+      "[connector]", "Print default wallpaper path, or effective path for an output",
+      IpcService::HandlerOptions{.actionEditorVisibility = IpcService::ActionEditorVisibility::Hidden}
   );
   ipc.registerHandler(
       "wallpaper-set",
@@ -581,31 +857,18 @@ void Wallpaper::registerIpc(IpcService& ipc) {
         if (const auto path = resolveWallpaperPath(parsed.path, callerCwd); path.has_value()) {
           resolved = *path;
         } else {
-          return "error: path does not exist\n";
+          return "error: path does not exist or is not a regular file\n";
         }
 
         if (outputConnector.has_value()) {
           if (const std::string error = validateOutputConnector(*outputConnector); !error.empty()) {
             return error;
           }
-          m_config->setWallpaperPath(*outputConnector, resolved);
-          return "ok\n";
         }
-
-        // Match wallpaper panel "All monitors": per-output overrides win over default in
-        // getWallpaperPath(), so set every connected output plus default or the image never updates.
-        ConfigService::WallpaperBatch batch(*m_config);
-        if (m_wayland != nullptr) {
-          for (const auto& out : m_wayland->outputs()) {
-            if (!out.connectorName.empty()) {
-              m_config->setWallpaperPath(out.connectorName, resolved);
-            }
-          }
-        }
-        m_config->setWallpaperPath(std::nullopt, resolved);
+        applyResolvedWallpaper(outputConnector, resolved);
         return "ok\n";
       },
-      "wallpaper-set [<connector>] <path>", "Set wallpaper for all or a specific output (persisted)"
+      "[connector] <path>", "Set wallpaper for all or a specific output (persisted)"
   );
 }
 
@@ -627,6 +890,11 @@ void Wallpaper::syncInstances() {
       releaseInstanceTextures(*inst);
       return true;
     }
+    if (!output->done || !output->hasUsableGeometry()) {
+      kLog.info("removing instance for output {} (geometry unavailable)", inst->outputName);
+      releaseInstanceTextures(*inst);
+      return true;
+    }
 
     // Check if a monitor override now disables this output
     if (const auto* ovr = wallpaper::findWallpaperMonitorOverride(m_config->config().wallpaper, *output);
@@ -636,12 +904,19 @@ void Wallpaper::syncInstances() {
       return true;
     }
 
+    // An external wallpaper source (e.g. mpvpaper plugin) now owns this output
+    if (m_externallyManagedOutputs.contains(output->connectorName)) {
+      kLog.info("removing instance for {} — managed by external source", output->connectorName);
+      releaseInstanceTextures(*inst);
+      return true;
+    }
+
     return false;
   });
 
   // Create instances for new outputs
   for (const auto& output : outputs) {
-    if (!output.done || output.connectorName.empty()) {
+    if (!output.done || output.connectorName.empty() || !output.hasUsableGeometry()) {
       continue;
     }
 
@@ -660,8 +935,23 @@ void Wallpaper::syncInstances() {
       kLog.info("skipping {} ({}) — disabled by monitor override", output.connectorName, output.description);
       continue;
     }
+    if (m_externallyManagedOutputs.contains(output.connectorName)) {
+      kLog.info("skipping {} ({}) — managed by external source", output.connectorName, output.description);
+      continue;
+    }
 
     createInstance(output);
+  }
+}
+
+void Wallpaper::setOutputExternallyManaged(const std::string& connector, bool managed) {
+  if (connector.empty()) {
+    return;
+  }
+  const bool changed =
+      managed ? m_externallyManagedOutputs.insert(connector).second : (m_externallyManagedOutputs.erase(connector) > 0);
+  if (changed && m_wallpaperEnabled && m_wayland != nullptr) {
+    syncInstances();
   }
 }
 
@@ -674,6 +964,12 @@ void Wallpaper::setAutomationGate(std::function<bool()> gate) { m_automationGate
 
 bool Wallpaper::automationAllowed() const noexcept { return !m_automationGate || m_automationGate(); }
 
+ThemeMode Wallpaper::directoryThemeMode() const noexcept {
+  const ThemeMode configured = m_config != nullptr ? m_config->config().theme.mode : ThemeMode::Dark;
+  const bool isLight = m_themeService != nullptr ? m_themeService->isLightMode() : configured == ThemeMode::Light;
+  return wallpaper::effectiveThemeMode(configured, isLight);
+}
+
 void Wallpaper::applyStartupAutomation(std::int64_t secondStamp) {
   const auto& wallpaper = m_config->config().wallpaper;
   const auto& automation = wallpaper.automation;
@@ -682,14 +978,17 @@ void Wallpaper::applyStartupAutomation(std::int64_t secondStamp) {
   }
 
   const auto& outputs = m_wayland->outputs();
-  const ThemeMode mode = m_config->config().theme.mode;
+  const ThemeMode mode = directoryThemeMode();
   bool attempted = false;
 
   ConfigService::WallpaperBatch batch(*m_config);
 
   if (wallpaper.perMonitorDirectories) {
     for (const auto& output : outputs) {
-      if (!output.done || output.connectorName.empty() || !wallpaperOutputEnabled(wallpaper, output)) {
+      if (!output.done
+          || output.connectorName.empty()
+          || !output.hasUsableGeometry()
+          || !wallpaperOutputEnabled(wallpaper, output)) {
         continue;
       }
 
@@ -708,12 +1007,19 @@ void Wallpaper::applyStartupAutomation(std::int64_t secondStamp) {
         continue;
       }
 
-      m_config->setWallpaperPath(output.connectorName, picked);
+      if (const WallpaperFavorite* favorite = m_config->wallpaperFavorite(picked); favorite != nullptr) {
+        m_config->applyWallpaperSelection(output.connectorName, picked, favorite, {});
+      } else {
+        m_config->setWallpaperPath(output.connectorName, picked);
+      }
       kLog.info("startup automation set {} → {}", output.connectorName, picked);
     }
   } else {
     for (const auto& output : outputs) {
-      if (output.done && !output.connectorName.empty() && wallpaperOutputEnabled(wallpaper, output)) {
+      if (output.done
+          && !output.connectorName.empty()
+          && output.hasUsableGeometry()
+          && wallpaperOutputEnabled(wallpaper, output)) {
         attempted = true;
         break;
       }
@@ -728,12 +1034,28 @@ void Wallpaper::applyStartupAutomation(std::int64_t secondStamp) {
         const std::string currentDefault = m_config->getDefaultWallpaperPath();
         const std::string picked = pickAutomationWallpaperPath(automation, std::move(candidates), currentDefault);
         if (!picked.empty()) {
-          for (const auto& output : outputs) {
-            if (output.done && !output.connectorName.empty() && wallpaperOutputEnabled(wallpaper, output)) {
-              m_config->setWallpaperPath(output.connectorName, picked);
+          if (const WallpaperFavorite* favorite = m_config->wallpaperFavorite(picked); favorite != nullptr) {
+            std::vector<std::string> connectors;
+            for (const auto& output : outputs) {
+              if (output.done
+                  && !output.connectorName.empty()
+                  && output.hasUsableGeometry()
+                  && wallpaperOutputEnabled(wallpaper, output)) {
+                connectors.push_back(output.connectorName);
+              }
             }
+            m_config->applyWallpaperSelection(std::nullopt, picked, favorite, connectors);
+          } else {
+            for (const auto& output : outputs) {
+              if (output.done
+                  && !output.connectorName.empty()
+                  && output.hasUsableGeometry()
+                  && wallpaperOutputEnabled(wallpaper, output)) {
+                m_config->setWallpaperPath(output.connectorName, picked);
+              }
+            }
+            m_config->setWallpaperPath(std::nullopt, picked);
           }
-          m_config->setWallpaperPath(std::nullopt, picked);
           kLog.info("startup automation set all outputs → {}", picked);
         }
       }
@@ -758,7 +1080,7 @@ void Wallpaper::runAutomation(std::int64_t secondStamp) {
     return;
   }
 
-  const ThemeMode mode = m_config->config().theme.mode;
+  const ThemeMode mode = directoryThemeMode();
 
   ConfigService::WallpaperBatch batch(*m_config);
 
@@ -788,7 +1110,11 @@ void Wallpaper::runAutomation(std::int64_t secondStamp) {
       if (picked.empty() || picked == currentPath) {
         continue;
       }
-      m_config->setWallpaperPath(inst->connectorName, picked);
+      if (const WallpaperFavorite* favorite = m_config->wallpaperFavorite(picked); favorite != nullptr) {
+        m_config->applyWallpaperSelection(inst->connectorName, picked, favorite, {});
+      } else {
+        m_config->setWallpaperPath(inst->connectorName, picked);
+      }
       kLog.info("automation set {} → {}", inst->connectorName, picked);
     }
   } else {
@@ -799,12 +1125,23 @@ void Wallpaper::runAutomation(std::int64_t secondStamp) {
       const std::string currentDefault = m_config->getDefaultWallpaperPath();
       const std::string picked = pickAutomationWallpaperPath(automation, std::move(candidates), currentDefault);
       if (!picked.empty()) {
-        for (const auto& inst : m_instances) {
-          if (!inst->connectorName.empty()) {
-            m_config->setWallpaperPath(inst->connectorName, picked);
+        if (const WallpaperFavorite* favorite = m_config->wallpaperFavorite(picked); favorite != nullptr) {
+          std::vector<std::string> connectors;
+          connectors.reserve(m_instances.size());
+          for (const auto& inst : m_instances) {
+            if (!inst->connectorName.empty()) {
+              connectors.push_back(inst->connectorName);
+            }
           }
+          m_config->applyWallpaperSelection(std::nullopt, picked, favorite, connectors);
+        } else {
+          for (const auto& inst : m_instances) {
+            if (!inst->connectorName.empty()) {
+              m_config->setWallpaperPath(inst->connectorName, picked);
+            }
+          }
+          m_config->setWallpaperPath(std::nullopt, picked);
         }
-        m_config->setWallpaperPath(std::nullopt, picked);
         kLog.info("automation set all outputs → {}", picked);
       }
     }
@@ -812,15 +1149,25 @@ void Wallpaper::runAutomation(std::int64_t secondStamp) {
   m_lastAutomationSwitchSecond = secondStamp;
 }
 
-bool Wallpaper::switchToRandomWallpaper(std::optional<std::string_view> connector) {
+Wallpaper::SwitchOutcome Wallpaper::switchWallpaperTo(PickWallpaper action, std::optional<std::string_view> connector) {
   if (m_config == nullptr || !m_config->config().wallpaper.enabled || m_instances.empty()) {
-    return false;
+    return SwitchOutcome::Unavailable;
   }
 
   const auto& wallpaper = m_config->config().wallpaper;
-  const ThemeMode mode = wallpaper.perMonitorDirectories
-      ? (m_config->config().theme.mode == ThemeMode::Light ? ThemeMode::Light : ThemeMode::Dark)
-      : ThemeMode::Dark;
+  const ThemeMode mode = directoryThemeMode();
+
+  const auto pick = [action](std::vector<std::string> candidates, const std::string& currentPath) -> std::string {
+    switch (action) {
+    case PickWallpaper::Random:
+      return pickRandomWallpaperPath(candidates, currentPath);
+    case PickWallpaper::Next:
+      return pickAlphabeticalWallpaperPath(std::move(candidates), currentPath, 1);
+    case PickWallpaper::Previous:
+      return pickAlphabeticalWallpaperPath(std::move(candidates), currentPath, -1);
+    }
+    return {};
+  };
 
   if (connector.has_value()) {
     if (m_wayland != nullptr) {
@@ -829,7 +1176,7 @@ bool Wallpaper::switchToRandomWallpaper(std::optional<std::string_view> connecto
         return !out.connectorName.empty() && out.connectorName == *connector;
       });
       if (!found) {
-        return false;
+        return SwitchOutcome::Unavailable;
       }
     }
 
@@ -841,7 +1188,7 @@ bool Wallpaper::switchToRandomWallpaper(std::optional<std::string_view> connecto
       }
     }
     if (targetInst == nullptr) {
-      return false;
+      return SwitchOutcome::Unavailable;
     }
 
     const WaylandOutput* output = nullptr;
@@ -858,20 +1205,21 @@ bool Wallpaper::switchToRandomWallpaper(std::optional<std::string_view> connecto
                                               : wallpaper::resolveGlobalWallpaperDirectory(wallpaper, mode);
     collectWallpaperCandidates(dir, wallpaper.automation.recursive, candidates);
     if (candidates.empty()) {
-      return false;
+      return SwitchOutcome::Unavailable;
     }
     const std::string currentPath = m_config->getWallpaperPath(std::string(*connector));
-    const std::string picked = pickRandomWallpaperPath(candidates, currentPath);
+    const std::string picked = pick(std::move(candidates), currentPath);
     if (picked.empty() || picked == currentPath) {
-      return false;
+      return SwitchOutcome::NoChange;
     }
     m_config->setWallpaperPath(std::string(*connector), picked);
     kLog.info("ipc set {} → {}", *connector, picked);
-    return true;
+    return SwitchOutcome::Changed;
   }
 
   ConfigService::WallpaperBatch batch(*m_config);
   bool anyChanged = false;
+  bool sawCandidates = false;
 
   if (wallpaper.perMonitorDirectories) {
     for (const auto& inst : m_instances) {
@@ -894,8 +1242,9 @@ bool Wallpaper::switchToRandomWallpaper(std::optional<std::string_view> connecto
       if (candidates.empty()) {
         continue;
       }
+      sawCandidates = true;
       const std::string currentPath = m_config->getWallpaperPath(inst->connectorName);
-      const std::string picked = pickRandomWallpaperPath(candidates, currentPath);
+      const std::string picked = pick(std::move(candidates), currentPath);
       if (picked.empty() || picked == currentPath) {
         continue;
       }
@@ -908,9 +1257,10 @@ bool Wallpaper::switchToRandomWallpaper(std::optional<std::string_view> connecto
     const std::string dir = wallpaper::resolveGlobalWallpaperDirectory(wallpaper, mode);
     collectWallpaperCandidates(dir, wallpaper.automation.recursive, candidates);
     if (!candidates.empty()) {
+      sawCandidates = true;
       const std::string currentDefault = m_config->getDefaultWallpaperPath();
-      const std::string picked = pickRandomWallpaperPath(candidates, currentDefault);
-      if (!picked.empty()) {
+      const std::string picked = pick(std::move(candidates), currentDefault);
+      if (!picked.empty() && picked != currentDefault) {
         for (const auto& inst : m_instances) {
           if (!inst->connectorName.empty()) {
             m_config->setWallpaperPath(inst->connectorName, picked);
@@ -923,7 +1273,10 @@ bool Wallpaper::switchToRandomWallpaper(std::optional<std::string_view> connecto
     }
   }
 
-  return anyChanged;
+  if (anyChanged) {
+    return SwitchOutcome::Changed;
+  }
+  return sawCandidates ? SwitchOutcome::NoChange : SwitchOutcome::Unavailable;
 }
 
 void Wallpaper::createInstance(const WaylandOutput& output) {
@@ -948,10 +1301,11 @@ void Wallpaper::createInstance(const WaylandOutput& output) {
 
   instance->surface = std::make_unique<LayerSurface>(*m_wayland, std::move(surfaceConfig));
   instance->surface->setRenderContext(m_renderContext);
+  instance->surface->setClickThrough(true);
 
-  instance->sceneRoot = std::make_unique<Node>();
+  instance->sceneRoot = ui::node({});
   instance->sceneRoot->setAnimationManager(&instance->animations);
-  auto fillNode = std::make_unique<Box>();
+  auto fillNode = ui::box({});
   instance->fillNode = static_cast<Box*>(instance->sceneRoot->addChild(std::move(fillNode)));
   auto wallpaperNode = std::make_unique<WallpaperNode>();
   instance->wallpaperNode = static_cast<WallpaperNode*>(instance->sceneRoot->addChild(std::move(wallpaperNode)));
@@ -959,8 +1313,8 @@ void Wallpaper::createInstance(const WaylandOutput& output) {
 
   auto* inst = instance.get();
   instance->surface->setConfigureCallback([this, inst, wallpaperPath](std::uint32_t width, std::uint32_t height) {
-    const float sw = static_cast<float>(width);
-    const float sh = static_cast<float>(height);
+    const auto sw = static_cast<float>(width);
+    const auto sh = static_cast<float>(height);
     inst->sceneRoot->setSize(sw, sh);
     inst->fillNode->setPosition(0.0f, 0.0f);
     inst->fillNode->setSize(sw, sh);
@@ -1031,12 +1385,11 @@ void Wallpaper::loadWallpaper(WallpaperInstance& instance, const std::string& pa
   if (!instance.transitioning && path == instance.currentPath) {
     return;
   }
-  if (instance.transitioning && path == instance.pendingPath) {
-    return;
-  }
 
   if (instance.transitioning) {
-    instance.queuedPath = path;
+    if (redirectActiveTransition(instance, path) == TransitionRedirect::Unrelated) {
+      instance.queuedPath = path;
+    }
     return;
   }
 
@@ -1117,6 +1470,8 @@ void Wallpaper::loadWallpaper(WallpaperInstance& instance, const std::string& pa
     instance.currentPath = path;
     instance.pendingPath.clear();
     instance.queuedPath.clear();
+    instance.transitionTime = 0.0f;
+    instance.transitionDirection = WallpaperTransitionDirection::Forward;
     updateRendererState(instance);
     instance.surface->requestRedraw();
     m_changed.emit();
@@ -1130,8 +1485,35 @@ void Wallpaper::loadWallpaper(WallpaperInstance& instance, const std::string& pa
   startTransition(instance);
 }
 
+Wallpaper::TransitionRedirect
+Wallpaper::redirectActiveTransition(WallpaperInstance& instance, const std::string& path) {
+  if (!instance.transitioning) {
+    return TransitionRedirect::Unrelated;
+  }
+
+  const auto direction = directionForPath(instance, path);
+  if (!direction.has_value()) {
+    return TransitionRedirect::Unrelated;
+  }
+
+  instance.queuedPath.clear();
+  if (instance.transitionDirection == *direction) {
+    return TransitionRedirect::AlreadyTargeting;
+  }
+
+  startTransitionAnimation(instance, instance.transitionTime, *direction);
+  return TransitionRedirect::Redirected;
+}
+
 void Wallpaper::startTransition(WallpaperInstance& instance) {
   const auto& wpConfig = m_config->config().wallpaper;
+
+  if (wpConfig.transitions.empty()) {
+    instance.transitioning = true;
+    instance.transitionDirection = WallpaperTransitionDirection::Forward;
+    finishTransition(instance);
+    return;
+  }
 
   float aspectRatio = 1.777f;
   if (instance.surface->height() > 0) {
@@ -1143,44 +1525,88 @@ void Wallpaper::startTransition(WallpaperInstance& instance) {
       transitions[static_cast<std::size_t>(std::floor(randomFloat(0.0f, static_cast<float>(transitions.size()))))];
   instance.activeTransition = picked;
   instance.transitionParams = randomizeParams(picked, wpConfig.edgeSmoothness, aspectRatio);
+  startTransitionAnimation(instance, 0.0f, WallpaperTransitionDirection::Forward);
+}
+
+void Wallpaper::startTransitionAnimation(
+    WallpaperInstance& instance, float fromTime, WallpaperTransitionDirection direction
+) {
+  if (const auto animId = std::exchange(instance.transitionAnimId, 0); animId != 0) {
+    instance.animations.cancel(animId);
+  }
+
+  const auto& wpConfig = m_config->config().wallpaper;
+  fromTime = std::clamp(fromTime, 0.0f, 1.0f);
+  const float toTime = transitionTargetTime(direction);
+
   instance.transitioning = true;
-  instance.transitionProgress = 0.0f;
+  instance.transitionDirection = direction;
+  setTransitionTime(instance, fromTime);
+
+  const float durationMs = std::abs(toTime - fromTime) * wpConfig.transitionDurationMs;
+  if (durationMs <= 0.0f) {
+    setTransitionTime(instance, toTime);
+    finishTransition(instance);
+    return;
+  }
 
   auto* inst = &instance;
-  instance.transitionAnimId = instance.animations.animateUnscaled(
-      0.0f, 1.0f, wpConfig.transitionDurationMs, Easing::EaseInOutCubic,
-      [inst](float v) { inst->transitionProgress = v; },
-      [this, inst]() {
-        // Transition complete — release old current, promote next to current
-        releaseTexture(inst->currentTexture, inst->currentPath);
-        inst->currentSourceKind = inst->nextSourceKind;
-        inst->currentTexture = inst->nextTexture;
-        inst->currentColor = inst->nextColor;
-        inst->nextTexture = {};
-        inst->nextSourceKind = WallpaperSourceKind::Image;
-        inst->nextColor = rgba(0.0f, 0.0f, 0.0f, 1.0f);
-        inst->currentPath = inst->pendingPath;
-        inst->pendingPath.clear();
-        inst->transitionProgress = 0.0f;
-        inst->transitioning = false;
-        updateRendererState(*inst);
-        // The frame loop stops once there are no active animations, so the
-        // promoted final wallpaper needs one explicit redraw.
-        inst->surface->requestRedraw();
-        m_changed.emit();
-
-        if (!inst->queuedPath.empty() && inst->queuedPath != inst->currentPath) {
-          const std::string queuedPath = inst->queuedPath;
-          inst->queuedPath.clear();
-          loadWallpaper(*inst, queuedPath);
-        } else {
-          inst->queuedPath.clear();
-        }
-      }
+  // The transition runs on its own configured duration, decoupled from the global
+  // motion system: animateTimer ignores both the animation-speed multiplier and the
+  // animations-enabled toggle (disabling animations must not skip the crossfade).
+  instance.transitionAnimId = instance.animations.animateTimer(
+      fromTime, toTime, durationMs, Easing::Linear, [inst](float time) { setTransitionTime(*inst, time); },
+      [this, inst]() { finishTransition(*inst); }
   );
 
   updateRendererState(instance);
   instance.surface->requestRedraw();
+}
+
+void Wallpaper::finishTransition(WallpaperInstance& instance) {
+  const bool displayedWallpaperChanged = instance.transitionDirection == WallpaperTransitionDirection::Forward;
+  instance.transitionAnimId = 0;
+
+  if (displayedWallpaperChanged) {
+    promotePendingWallpaper(instance);
+  } else {
+    discardPendingWallpaper(instance);
+  }
+
+  instance.transitionTime = 0.0f;
+  instance.transitioning = false;
+  instance.transitionDirection = WallpaperTransitionDirection::Forward;
+  updateRendererState(instance);
+  instance.surface->requestRedraw();
+
+  if (displayedWallpaperChanged) {
+    m_changed.emit();
+  }
+
+  runQueuedWallpaper(instance);
+}
+
+void Wallpaper::promotePendingWallpaper(WallpaperInstance& instance) {
+  releaseTexture(instance.currentTexture, instance.currentPath);
+  instance.currentSourceKind = std::exchange(instance.nextSourceKind, WallpaperSourceKind::Image);
+  instance.currentTexture = std::exchange(instance.nextTexture, {});
+  instance.currentColor = std::exchange(instance.nextColor, defaultWallpaperColor());
+  instance.currentPath = std::exchange(instance.pendingPath, std::string{});
+}
+
+void Wallpaper::discardPendingWallpaper(WallpaperInstance& instance) {
+  releaseTexture(instance.nextTexture, instance.pendingPath);
+  instance.nextSourceKind = WallpaperSourceKind::Image;
+  instance.nextColor = defaultWallpaperColor();
+  instance.pendingPath.clear();
+}
+
+void Wallpaper::runQueuedWallpaper(WallpaperInstance& instance) {
+  const auto queuedPath = std::exchange(instance.queuedPath, std::string{});
+
+  if (!queuedPath.empty() && queuedPath != instance.currentPath) {
+    loadWallpaper(instance, queuedPath);
+  }
 }
 
 void Wallpaper::updateRendererState(WallpaperInstance& instance) {
@@ -1256,7 +1682,15 @@ void Wallpaper::updateRendererState(WallpaperInstance& instance) {
       static_cast<float>(instance.currentTexture.height), static_cast<float>(instance.nextTexture.width),
       static_cast<float>(instance.nextTexture.height)
   );
-  wallpaperNode->setTransition(instance.activeTransition, instance.transitionProgress, instance.transitionParams);
+  wallpaperNode->setTransition(
+      instance.activeTransition, transitionProgressForTime(instance.transitionTime), instance.transitionParams
+  );
   wallpaperNode->setFillMode(wpConfig.fillMode);
   wallpaperNode->setFillColor(fillColor);
+
+  if (wpConfig.fillMode == WallpaperFillMode::Span && m_wayland != nullptr) {
+    wallpaperNode->setSpan(computeSpanParams(m_wayland->outputs(), instance.outputName));
+  } else {
+    wallpaperNode->setSpan(WallpaperSpanParams{});
+  }
 }

@@ -1,6 +1,6 @@
 #include "ui/controls/select.h"
 
-#include "core/keybind_matcher.h"
+#include "core/input/keybind_matcher.h"
 #include "cursor-shape-v1-client-protocol.h"
 #include "i18n/i18n.h"
 #include "render/animation/animation_manager.h"
@@ -48,6 +48,7 @@ Select::Select() {
   m_triggerPreview = static_cast<ColorSwatchPreviewStrip*>(addChild(std::move(triggerPreview)));
 
   auto triggerLabel = std::make_unique<Label>();
+  triggerLabel->setMaxLines(1);
   m_triggerLabel = static_cast<Label*>(addChild(std::move(triggerLabel)));
 
   auto triggerGlyph = std::make_unique<Glyph>();
@@ -84,11 +85,14 @@ Select::Select() {
     applyVisualState();
     markPaintDirty();
   });
-  triggerArea->setOnKeyDown([this](const InputArea::KeyData& key) { handleKey(key.sym, key.utf32, key.pressed); });
+  triggerArea->setOnKeyDown([this](const InputArea::KeyData& key) {
+    handleKey(key.sym, key.utf32, key.modifiers, key.pressed);
+  });
   m_triggerArea = static_cast<InputArea*>(addChild(std::move(triggerArea)));
 
   applyVisualState();
   m_paletteConn = paletteChanged().connect([this] { applyVisualState(); });
+  m_inputBordersConn = Style::inputBordersChanged().connect([this] { applyVisualState(); });
 }
 
 Select::~Select() {
@@ -115,12 +119,16 @@ void Select::setOptions(std::vector<std::string> options) {
   markLayoutDirty();
 }
 
-void Select::setSelectedIndex(std::size_t index) {
+void Select::setSelectedIndex(std::size_t index) { setSelectedIndexInternal(index, true); }
+
+void Select::setSelectedIndexSilently(std::size_t index) { setSelectedIndexInternal(index, false); }
+
+void Select::setSelectedIndexInternal(std::size_t index, bool notify) {
   if (index >= m_options.size()) {
     return;
   }
   if (m_selectedIndex == index) {
-    if (m_notifyOnReselect && m_onSelectionChanged) {
+    if (notify && m_notifyOnReselect && m_onSelectionChanged) {
       m_onSelectionChanged(m_selectedIndex, selectedText());
     }
     return;
@@ -129,7 +137,7 @@ void Select::setSelectedIndex(std::size_t index) {
   syncTriggerText();
   applyVisualState();
   markLayoutDirty();
-  if (m_onSelectionChanged) {
+  if (notify && m_onSelectionChanged) {
     m_onSelectionChanged(m_selectedIndex, selectedText());
   }
 }
@@ -305,14 +313,12 @@ LayoutSize Select::doMeasure(Renderer& renderer, const LayoutConstraints& constr
 
 void Select::doArrange(Renderer& renderer, const LayoutRect& rect) { arrangeByLayout(renderer, rect); }
 
-void Select::handleKey(std::uint32_t sym, std::uint32_t /*utf32*/, bool pressed) {
+void Select::handleKey(std::uint32_t sym, std::uint32_t /*utf32*/, std::uint32_t modifiers, bool pressed) {
   if (!m_enabled || !pressed) {
     return;
   }
 
-  if (KeybindMatcher::matches(KeybindAction::Down, sym, 0)
-      || KeybindMatcher::matches(KeybindAction::Up, sym, 0)
-      || KeybindMatcher::matches(KeybindAction::Validate, sym, 0)) {
+  if (KeybindMatcher::matches(KeybindAction::Validate, sym, modifiers)) {
     if (!m_open) {
       toggleOpen();
     }
@@ -335,18 +341,25 @@ void Select::applyVisualState() {
 
   if (!m_enabled) {
     triggerBg = resolved(ColorRole::SurfaceVariant, m_surfaceOpacity * 0.75f);
-    triggerBorder = resolved(ColorRole::Outline, 0.6f);
+    triggerBorder = resolved(ColorRole::Outline, Style::disabledOutlineAlpha);
     triggerText = colorSpecFromRole(ColorRole::OnSurface, 0.55f);
   } else if (triggerHovered || triggerPressed) {
     triggerBg = resolved(ColorRole::SurfaceVariant, m_surfaceOpacity);
     triggerBorder = resolved(ColorRole::Hover);
   } else if (triggerFocused) {
-    triggerBorder = resolved(ColorRole::Primary);
+    triggerBorder = resolveColorSpec(focusRingColorSpec());
   }
 
   m_triggerLabel->setColor(triggerText);
   m_triggerGlyph->setColor(triggerText);
   m_triggerGlyph->setRotation(m_caretProgress * std::numbers::pi_v<float>);
+
+  float resolvedBorderWidth = 0.0f;
+  if (triggerFocused) {
+    resolvedBorderWidth = Style::focusRingWidth;
+  } else if (Style::inputBordersEnabled()) {
+    resolvedBorderWidth = Style::borderWidth;
+  }
 
   m_triggerBackground->setStyle(
       RoundedRectStyle{
@@ -355,7 +368,7 @@ void Select::applyVisualState() {
           .fillMode = FillMode::Solid,
           .radius = Style::scaledRadiusMd(),
           .softness = 1.0f,
-          .borderWidth = Style::borderWidth,
+          .borderWidth = resolvedBorderWidth,
       }
   );
 }
@@ -427,8 +440,10 @@ void Select::openPopupDropdown() {
   const float triggerWidth = absRight - absLeft;
   const float triggerHeight = absBottom - absTop;
 
-  // Compute menu width: match trigger width, but also consider widest option label
-  float menuWidth = std::max(minWidth(), triggerWidth);
+  // At least the trigger width, growing to fit the widest option label up to a cap.
+  // fontSize is pre-scaled by callers, so deriving the cap from it tracks UI scale.
+  const float menuWidth = std::max(minWidth(), triggerWidth);
+  const float maxMenuWidth = std::max(menuWidth, Style::menuAutoMaxWidth * (m_fontSize / Style::fontSizeBody));
 
   SelectPopupContext::DropdownRequest request{
       .anchorX = static_cast<std::int32_t>(std::round(absLeft)),
@@ -436,10 +451,8 @@ void Select::openPopupDropdown() {
       .anchorWidth = static_cast<std::int32_t>(std::round(triggerWidth)),
       .anchorHeight = static_cast<std::int32_t>(std::round(triggerHeight)),
       .menuWidth = menuWidth,
-      .optionHeight = m_controlHeight,
+      .maxMenuWidth = maxMenuWidth,
       .fontSize = m_fontSize,
-      .glyphSize = m_glyphSize,
-      .horizontalPadding = m_horizontalPadding,
       .options = m_options,
       .indicatorColors = m_indicatorColors,
       .optionSwatchPreviews = m_optionSwatchPreviews,
@@ -459,7 +472,6 @@ void Select::openPopupDropdown() {
             m_open = false;
             animateCaret(false);
           },
-      .onHoverChanged = nullptr,
   };
 
   m_open = true;

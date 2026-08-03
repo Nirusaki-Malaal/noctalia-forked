@@ -1,6 +1,9 @@
 #include "scripting/plugin_service_host.h"
 
 #include "core/log.h"
+#include "i18n/i18n.h"
+#include "notification/notifications.h"
+#include "scripting/plugin_api.h"
 #include "scripting/plugin_ipc.h"
 #include "scripting/plugin_manifest.h"
 #include "scripting/plugin_registry.h"
@@ -30,8 +33,10 @@ namespace scripting {
     }
   } // namespace
 
-  PluginServiceHost::PluginServiceHost(ScriptApiContext& scriptApi, HttpClient* httpClient, ClipboardService* clipboard)
-      : m_scriptApi(scriptApi), m_httpClient(httpClient), m_clipboard(clipboard) {}
+  PluginServiceHost::PluginServiceHost(
+      ScriptApiContext& scriptApi, HttpClient* httpClient, ClipboardService* clipboard, FileWatcher* fileWatcher
+  )
+      : m_scriptApi(scriptApi), m_httpClient(httpClient), m_clipboard(clipboard), m_fileWatcher(fileWatcher) {}
 
   PluginServiceHost::~PluginServiceHost() {
     for (auto& service : m_services) {
@@ -93,18 +98,21 @@ namespace scripting {
     }
     auto service = std::make_unique<Service>();
     service->entryId = entryId;
+    service->sourcePath = source;
     service->lastSeededSettings = std::move(seeded);
     service->runtime = std::make_shared<ScriptRuntime>(
         entryId, service->lastSeededSettings, m_scriptApi, source.parent_path(), m_httpClient, m_clipboard
     );
     subscribeAndArm(*service);
     service->runtime->start(source.string(), std::move(code), {});
+    setupScriptWatch(*service);
     PluginIpcRouter::instance().registerEndpoint(service.get());
     return service;
   }
 
-  void PluginServiceHost::stopService(Service& service) {
+  void PluginServiceHost::stopService(Service& service, ScriptExitReason exitReason) {
     PluginIpcRouter::instance().unregisterEndpoint(&service);
+    teardownScriptWatch(service);
     service.updateTimer.stop();
     if (service.alive) {
       *service.alive = false;
@@ -114,7 +122,7 @@ namespace scripting {
         service.runtime->unsubscribe(service.subscription);
         service.subscription = 0;
       }
-      service.runtime->stop();
+      service.runtime->stop(exitReason);
     }
   }
 
@@ -167,13 +175,27 @@ namespace scripting {
       }
 
       Service& service = **existing;
-      if (settingsEqual(*seeded, service.lastSeededSettings)) {
+      const bool sourceChanged = service.sourcePath != entry.sourcePath;
+      const bool settingsChanged = !settingsEqual(*seeded, service.lastSeededSettings);
+      if (!sourceChanged && !settingsChanged) {
+        continue;
+      }
+      // A settings-only change reconfigures a service that opts in via onConfigChanged
+      // in place, no VM teardown, so its in-memory runtime state survives.
+      if (settingsChanged && !sourceChanged && service.runtime->hasOnConfigChanged()) {
+        service.lastSeededSettings = *seeded;
+        (void)service.runtime->enqueueSettingsChanged(service.lastSeededSettings);
+        kLog.info("reconfigured service '{}' in place after settings change", id);
         continue;
       }
       std::string code = readFile(entry.sourcePath);
       if (code.empty()) {
         kLog.warn("service '{}': empty or unreadable source on refresh {}", id, entry.sourcePath.string());
         continue;
+      }
+      if (sourceChanged) {
+        teardownScriptWatch(service);
+        service.sourcePath = entry.sourcePath;
       }
       service.updateTimer.stop();
       if (service.subscription != 0) {
@@ -183,12 +205,80 @@ namespace scripting {
       service.runtime->stop();
       service.lastSeededSettings = *seeded;
       service.runtime = std::make_shared<ScriptRuntime>(
-          id, service.lastSeededSettings, m_scriptApi, entry.sourcePath.parent_path(), m_httpClient, m_clipboard
+          id, service.lastSeededSettings, m_scriptApi, service.sourcePath.parent_path(), m_httpClient, m_clipboard
       );
       subscribeAndArm(service);
-      service.runtime->start(entry.sourcePath.string(), std::move(code), {});
-      kLog.info("restarted service '{}' after settings change", id);
+      service.runtime->start(service.sourcePath.string(), std::move(code), {});
+      if (sourceChanged) {
+        setupScriptWatch(service);
+      }
+      kLog.info("restarted service '{}' after {} change", id, sourceChanged ? "source" : "settings");
     }
+  }
+
+  void PluginServiceHost::enablePlugin(std::string_view pluginId) {
+    const std::string entryPrefix = std::string(pluginId) + ":";
+    for (const auto& service : m_services) {
+      if (!service->entryId.starts_with(entryPrefix) || service->runtime == nullptr) {
+        continue;
+      }
+      const auto entry = PluginRegistry::instance().resolve(service->entryId);
+      if (!entry.has_value()
+          || entry->manifest == nullptr
+          || entry->manifest->pluginApiVersion < kServiceLifecyclePluginApiVersion) {
+        continue;
+      }
+      kLog.info("enabling service '{}'", service->entryId);
+      (void)service->runtime->enqueueCall("onEnable", {});
+    }
+  }
+
+  void PluginServiceHost::onOutputChange() {
+    for (auto& service : m_services) {
+      if (service->runtime != nullptr) {
+        (void)service->runtime->enqueueCall("onOutputsChanged", {});
+      }
+    }
+  }
+
+  void PluginServiceHost::setupScriptWatch(Service& service) {
+    if (service.watchId != 0 || service.sourcePath.empty() || m_fileWatcher == nullptr) {
+      return;
+    }
+    Service* svc = &service;
+    service.watchId = m_fileWatcher->watch(
+        service.sourcePath, [this, svc] { reloadService(*svc); }, FileWatcher::WatchTrigger::WriteCompleted
+    );
+  }
+
+  void PluginServiceHost::teardownScriptWatch(Service& service) {
+    if (service.watchId == 0 || m_fileWatcher == nullptr) {
+      return;
+    }
+    m_fileWatcher->unwatch(service.watchId);
+    service.watchId = 0;
+  }
+
+  void PluginServiceHost::reloadService(Service& service) {
+    std::string code = readFile(service.sourcePath);
+    auto name = service.sourcePath.filename().string();
+    if (code.empty()) {
+      kLog.warn("service '{}': failed to reload '{}'", service.entryId, service.sourcePath.string());
+      notify::error("Noctalia", i18n::tr("bar.widgets.scripted.reload-failed"), name);
+      return;
+    }
+    if (service.runtime == nullptr) {
+      kLog.warn("service '{}': runtime unavailable for reload", service.entryId);
+      notify::error("Noctalia", i18n::tr("bar.widgets.scripted.reload-failed"), name);
+      return;
+    }
+
+    service.updateTimer.stop();
+    service.updateIntervalMs = 1000;
+    service.runtime->reload(service.sourcePath.string(), std::move(code), {});
+    armTimer(service);
+    kLog.info("hot reload: reloaded service '{}'", service.entryId);
+    notify::info("Noctalia", i18n::tr("bar.widgets.scripted.reloaded"), name);
   }
 
   void PluginServiceHost::armTimer(Service& service) {

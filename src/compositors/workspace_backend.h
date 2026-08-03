@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <poll.h>
 #include <string>
 #include <unordered_map>
@@ -9,6 +10,7 @@
 
 struct wl_output;
 struct ext_workspace_manager_v1;
+struct org_kde_plasma_virtual_desktop_management;
 struct zdwl_ipc_manager_v2;
 
 struct Workspace {
@@ -22,6 +24,16 @@ struct Workspace {
 };
 
 struct WorkspaceWindow {
+  std::string windowId;
+  std::string workspaceKey;
+  std::string appId;
+  std::string title;
+  std::int32_t x = 0;
+  std::int32_t y = 0;
+  std::string outputName;
+};
+
+struct WorkspaceWindowAssignment {
   std::string windowId;
   std::string workspaceKey;
   std::string appId;
@@ -88,6 +100,12 @@ public:
   virtual void bindDwlIpcWorkspace(zdwl_ipc_manager_v2* manager) = 0;
 };
 
+class KdeVirtualDesktopProtocolBinder {
+public:
+  virtual ~KdeVirtualDesktopProtocolBinder() = default;
+  virtual void bindKdeVirtualDesktop(org_kde_plasma_virtual_desktop_management* management) = 0;
+};
+
 class WorkspaceOutputNameResolver {
 public:
   using Resolver = std::function<std::string(wl_output*)>;
@@ -131,6 +149,8 @@ namespace compositors {
     // distinctly from WorkspaceBackend::focusWindow so backends that implement
     // both interfaces don't hit a conflicting-return-type override.
     virtual bool focusWindowById(const std::string& /*windowId*/) { return false; }
+    // Currently focused compositor window id, when the backend tracks focus.
+    [[nodiscard]] virtual std::optional<std::string> focusedWindowId() const { return std::nullopt; }
     [[nodiscard]] virtual bool canTrackOverviewState() const noexcept { return false; }
     [[nodiscard]] virtual bool hasOverviewState() const noexcept { return false; }
     [[nodiscard]] virtual bool isOverviewOpen() const noexcept { return true; }

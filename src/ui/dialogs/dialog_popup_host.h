@@ -17,10 +17,10 @@ class Node;
 class RectNode;
 class RenderContext;
 class WaylandConnection;
+struct XdgPopupParent;
 struct KeyboardEvent;
 struct PointerEvent;
 struct wl_surface;
-struct wl_output;
 struct xdg_surface;
 
 // Shared base for the three xdg_popup-backed dialog popups (GlyphPicker,
@@ -86,9 +86,7 @@ protected:
   // Build the PopupSurface as a child of an xdg parent. Uses the same scene/
   // input/prepareFrame plumbing as openPopup() but bypasses LayerPopupHostRegistry
   // parent resolution.
-  [[nodiscard]] bool openPopupAsChild(
-      PopupSurfaceConfig config, xdg_surface* parentXdgSurface, wl_surface* parentWlSurface, wl_output* output
-  );
+  [[nodiscard]] bool openPopupAsChild(PopupSurfaceConfig config, const XdgPopupParent& parent);
 
   // Tear the popup down — endAttachedPopup, invoke `onSheetClose()` hook,
   // reset the scene tree, drop the PopupSurface. Safe to call repeatedly.
@@ -105,7 +103,7 @@ protected:
   void cancel();
 
   // Effective UI scale (clamped to a safe minimum). Reads
-  // ConfigService::config().shell.uiScale.
+  // ConfigService::config().accessibility.uiScale.
   [[nodiscard]] float uiScale() const;
 
   [[nodiscard]] InputDispatcher& inputDispatcher() noexcept { return m_inputDispatcher; }
@@ -115,8 +113,9 @@ protected:
   [[nodiscard]] RenderContext* renderContext() const noexcept { return m_renderContext; }
 
   // Construct the standard PopupSurfaceConfig with the shared constraint
-  // flags, anchor/gravity NONE, grab=true, and the parent context's
-  // centering offset. Subclasses use this when wiring the surface in
+  // flags, anchor/gravity NONE, grab=false (dialogs dismiss via Escape /
+  // close only — not outside click), and the parent context's centering
+  // offset. Subclasses use this when wiring the surface in
   // `openPopup`-equivalent code if they need a custom config.
   [[nodiscard]] PopupSurfaceConfig
   defaultPopupConfig(const LayerPopupParentContext& parent, std::uint32_t width, std::uint32_t height) const;

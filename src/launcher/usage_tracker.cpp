@@ -2,10 +2,9 @@
 
 #include "util/file_utils.h"
 
-#include <algorithm>
 #include <filesystem>
 #include <fstream>
-#include <json.hpp>
+#include <nlohmann/json.hpp>
 
 namespace {
   constexpr std::size_t kMaxRecentlyUsedCount = 20;

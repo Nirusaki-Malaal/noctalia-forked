@@ -95,10 +95,73 @@ namespace StringUtils {
 
   [[nodiscard]] inline std::string toLower(std::string_view s) {
     std::string out(s);
-    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
-      return static_cast<char>(std::tolower(c));
-    });
+    std::ranges::transform(out, out.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return out;
+  }
+
+  // Case-insensitive natural (alphanumeric) order: "image(2)" < "image(10)".
+  // Returns <0, 0, or >0 like strcmp.
+  [[nodiscard]] inline int naturalCaseInsensitiveCompare(std::string_view a, std::string_view b) {
+    std::size_t i = 0;
+    std::size_t j = 0;
+    while (i < a.size() && j < b.size()) {
+      const auto ac = static_cast<unsigned char>(a[i]);
+      const auto bc = static_cast<unsigned char>(b[j]);
+      const bool aDigit = std::isdigit(ac) != 0;
+      const bool bDigit = std::isdigit(bc) != 0;
+      if (aDigit && bDigit) {
+        std::size_t aZero = i;
+        while (aZero < a.size() && a[aZero] == '0') {
+          ++aZero;
+        }
+        std::size_t bZero = j;
+        while (bZero < b.size() && b[bZero] == '0') {
+          ++bZero;
+        }
+        std::size_t aEnd = aZero;
+        while (aEnd < a.size() && std::isdigit(static_cast<unsigned char>(a[aEnd])) != 0) {
+          ++aEnd;
+        }
+        std::size_t bEnd = bZero;
+        while (bEnd < b.size() && std::isdigit(static_cast<unsigned char>(b[bEnd])) != 0) {
+          ++bEnd;
+        }
+        const std::size_t aLen = aEnd - aZero;
+        const std::size_t bLen = bEnd - bZero;
+        if (aLen != bLen) {
+          return aLen < bLen ? -1 : 1;
+        }
+        for (std::size_t k = 0; k < aLen; ++k) {
+          if (a[aZero + k] != b[bZero + k]) {
+            return static_cast<unsigned char>(a[aZero + k]) < static_cast<unsigned char>(b[bZero + k]) ? -1 : 1;
+          }
+        }
+        const std::size_t aDigits = aEnd - i;
+        const std::size_t bDigits = bEnd - j;
+        if (aDigits != bDigits) {
+          return aDigits < bDigits ? -1 : 1;
+        }
+        i = aEnd;
+        j = bEnd;
+        continue;
+      }
+
+      const auto alc = static_cast<unsigned char>(std::tolower(ac));
+      const auto blc = static_cast<unsigned char>(std::tolower(bc));
+      if (alc != blc) {
+        return alc < blc ? -1 : 1;
+      }
+      ++i;
+      ++j;
+    }
+    if (i == a.size() && j == b.size()) {
+      return 0;
+    }
+    return i == a.size() ? -1 : 1;
+  }
+
+  [[nodiscard]] inline bool naturalCaseInsensitiveLess(std::string_view a, std::string_view b) {
+    return naturalCaseInsensitiveCompare(a, b) < 0;
   }
 
   [[nodiscard]] inline std::string pathTail(std::string_view path) {
@@ -133,8 +196,50 @@ namespace StringUtils {
     return encoded;
   }
 
+  [[nodiscard]] inline std::string urlDecode(std::string_view text) {
+    auto hexValue = [](unsigned char ch) -> int {
+      if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+      }
+      if (ch >= 'A' && ch <= 'F') {
+        return ch - 'A' + 10;
+      }
+      if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+      }
+      return -1;
+    };
+
+    std::string decoded;
+    decoded.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i) {
+      const char ch = text[i];
+      if (ch == '%' && i + 2 < text.size()) {
+        const int hi = hexValue(static_cast<unsigned char>(text[i + 1]));
+        const int lo = hexValue(static_cast<unsigned char>(text[i + 2]));
+        if (hi >= 0 && lo >= 0) {
+          decoded.push_back(static_cast<char>((hi << 4) | lo));
+          i += 2;
+          continue;
+        }
+      }
+      if (ch == '+') {
+        decoded.push_back(' ');
+        continue;
+      }
+      decoded.push_back(ch);
+    }
+    return decoded;
+  }
+
   inline void toLowerInPlace(std::string& s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::ranges::transform(s, s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  }
+
+  [[nodiscard]] inline bool equalsInsensitive(std::string_view lhs, std::string_view rhs) {
+    return std::ranges::equal(lhs, rhs, [](unsigned char a, unsigned char b) {
+      return std::tolower(a) == std::tolower(b);
+    });
   }
 
   [[nodiscard]] inline bool containsInsensitive(std::string_view haystack, std::string_view needle) {
@@ -145,7 +250,7 @@ namespace StringUtils {
     std::string rhs(needle);
     toLowerInPlace(lhs);
     toLowerInPlace(rhs);
-    return lhs.find(rhs) != std::string::npos;
+    return lhs.contains(rhs);
   }
 
   [[nodiscard]] inline std::string trimLeadingBlankLines(std::string_view text) {
@@ -161,7 +266,7 @@ namespace StringUtils {
       }
       const std::string_view line = text.substr(start, lineEnd - start);
       const bool blankLine =
-          line.empty() || std::all_of(line.begin(), line.end(), [](unsigned char ch) { return std::isspace(ch) != 0; });
+          line.empty() || std::ranges::all_of(line, [](unsigned char ch) { return std::isspace(ch) != 0; });
       if (!blankLine) {
         break;
       }
@@ -215,13 +320,13 @@ namespace StringUtils {
       cp = lead;
     } else if ((lead & 0xE0) == 0xC0) {
       len = 2;
-      cp = lead & 0x1Fu;
+      cp = lead & 0x1FU;
     } else if ((lead & 0xF0) == 0xE0) {
       len = 3;
-      cp = lead & 0x0Fu;
+      cp = lead & 0x0FU;
     } else if ((lead & 0xF8) == 0xF0) {
       len = 4;
-      cp = lead & 0x07u;
+      cp = lead & 0x07U;
     } else {
       return false;
     }
@@ -233,7 +338,7 @@ namespace StringUtils {
       if ((byte & 0xC0) != 0x80) {
         return false;
       }
-      cp = (cp << 6) | (byte & 0x3Fu);
+      cp = (cp << 6) | (byte & 0x3FU);
     }
     return (cp >= 0xE000 && cp <= 0xF8FF) || (cp >= 0xF0000 && cp <= 0xFFFFD) || (cp >= 0x100000 && cp <= 0x10FFFD);
   }
@@ -292,19 +397,19 @@ namespace StringUtils {
 
       if (s[i] == '&') {
         std::string_view rest = s.substr(i);
-        if (rest.substr(0, 4) == "&lt;") {
+        if (rest.starts_with("&lt;")) {
           out += '<';
           i += 4;
-        } else if (rest.substr(0, 4) == "&gt;") {
+        } else if (rest.starts_with("&gt;")) {
           out += '>';
           i += 4;
-        } else if (rest.substr(0, 5) == "&amp;") {
+        } else if (rest.starts_with("&amp;")) {
           out += '&';
           i += 5;
-        } else if (rest.substr(0, 6) == "&quot;") {
+        } else if (rest.starts_with("&quot;")) {
           out += '"';
           i += 6;
-        } else if (rest.substr(0, 6) == "&apos;") {
+        } else if (rest.starts_with("&apos;")) {
           out += '\'';
           i += 6;
         } else {
@@ -386,8 +491,7 @@ namespace StringUtils {
   }
 
   [[nodiscard]] inline bool isBlank(std::string_view text) {
-    return text.empty()
-        || std::all_of(text.begin(), text.end(), [](unsigned char ch) { return std::isspace(ch) != 0; });
+    return text.empty() || std::ranges::all_of(text, [](unsigned char ch) { return std::isspace(ch) != 0; });
   }
 
   [[nodiscard]] inline std::string shellQuote(std::string_view text) {
@@ -456,8 +560,8 @@ namespace StringUtils {
     if (read != sizeof(bytes)) {
       return {};
     }
-    bytes[6] = (bytes[6] & 0x0Fu) | 0x40u;
-    bytes[8] = (bytes[8] & 0x3Fu) | 0x80u;
+    bytes[6] = (bytes[6] & 0x0FU) | 0x40U;
+    bytes[8] = (bytes[8] & 0x3FU) | 0x80U;
     return std::format(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-"
         "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",

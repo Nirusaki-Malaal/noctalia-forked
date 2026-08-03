@@ -1,7 +1,7 @@
 #pragma once
 
 #include "app/poll_source.h"
-#include "render/core/texture_manager.h"
+#include "render/core/texture_handle.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -17,6 +17,7 @@
 #include <vector>
 
 class GlSharedContext;
+class TextureManager;
 
 class AsyncTextureCache : public PollSource {
 public:
@@ -60,6 +61,7 @@ public:
   [[nodiscard]] TextureHandle peek(const std::string& path, int targetSize = 0, bool mipmap = false) const;
   void release(const std::string& path, int targetSize = 0, bool mipmap = false);
   void trimUnused(std::size_t maxUnusedEntries = 0);
+  void abandonGpuResources() noexcept;
   void reloadResidentTextures();
 
   [[nodiscard]] int pollTimeoutMs() const override { return -1; }

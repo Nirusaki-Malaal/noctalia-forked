@@ -1,5 +1,7 @@
 #include "render/programs/spinner_program.h"
 
+#include "render/core/render_styles.h"
+
 #include <array>
 #include <stdexcept>
 
@@ -106,6 +108,8 @@ void SpinnerProgram::destroy() {
   m_thicknessLocation = -1;
   m_transformLocation = -1;
 }
+
+void SpinnerProgram::abandon() noexcept { m_program.abandon(); }
 
 void SpinnerProgram::draw(
     float surfaceWidth, float surfaceHeight, float width, float height, const SpinnerStyle& style, const Mat3& transform

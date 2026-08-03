@@ -2,27 +2,93 @@
 #include "core/deferred_call.h"
 #include "i18n/i18n.h"
 #include "render/text/font_weight_catalog.h"
-#include "shell/avatar_path.h"
+#include "shell/profile/avatar_path.h"
 #include "shell/settings/settings_window.h"
+#include "system/day_night_schedule.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
+namespace {
+
+  bool settingPathNeedsSceneRebuild(const std::vector<std::string>& path) {
+    if (path.size() == 2 && path[0] == "shell") {
+      return path[1] == "corner_radius_scale" || path[1] == "font_family" || path[1] == "lang";
+    }
+    if (path.size() == 2 && path[0] == "accessibility") {
+      return path[1] == "ui_scale";
+    }
+    return false;
+  }
+
+  bool settingPathsNeedSceneRebuild(const std::vector<std::vector<std::string>>& paths) {
+    return std::ranges::any_of(paths, [](const auto& path) { return settingPathNeedsSceneRebuild(path); });
+  }
+
+  std::string settingsMutationError(const ConfigService& config, std::string fallback) {
+    return config.lastMutationError().empty() ? fallback : config.lastMutationError();
+  }
+
+  bool isCustomSchedulePath(const std::vector<std::string>& path) {
+    return path.size() == 2
+        && path[0] == "location"
+        && (path[1] == "custom_schedule" || path[1] == "sunset" || path[1] == "sunrise");
+  }
+
+} // namespace
+
+// Custom scheduling with unusable times schedules nothing. The write itself is valid, so surface it
+// as a banner rather than rejecting it — the user is likely mid-edit between the toggle and the times.
+void SettingsWindow::warnOnUnusableCustomSchedule(const std::vector<std::string>& path) {
+  if (m_config == nullptr || !isCustomSchedulePath(path)) {
+    return;
+  }
+  const LocationConfig& location = m_config->config().location;
+  if (location.customSchedule && !day_night_schedule::hasUsableCustomTimes(location)) {
+    showTransientStatus(i18n::tr("settings.errors.custom-schedule-times"), true);
+  }
+}
+
 void SettingsWindow::markSettingsWriteSuccess(bool requestRebuild) {
+  if (m_editorSheetPopup != nullptr && m_editorSheetPopup->isOpen()) {
+    m_editorSheetPopup->clearStatusMessage();
+  }
   m_statusMessage.clear();
   m_statusIsError = false;
   m_pendingResetPageScope.clear();
+  m_pendingResetSettingPaths.clear();
   if (requestRebuild) {
     requestSceneRebuild();
   }
 }
 
 void SettingsWindow::markSettingsWriteError(std::string message) {
+  if (m_editorSheetPopup != nullptr && m_editorSheetPopup->isOpen()) {
+    m_editorSheetPopup->setStatusMessage(std::move(message), true);
+    return;
+  }
   m_statusMessage = std::move(message);
   m_statusIsError = true;
   requestSceneRebuild();
+}
+
+void SettingsWindow::finishSettingsWrite(
+    bool changed, bool forceSceneRebuild, bool pageResetPathsChanged, bool registryAlreadyCurrent,
+    bool rebuildWhenUnchanged
+) {
+  const bool hadStatus = !m_statusMessage.empty();
+  const bool hadPendingReset = !m_pendingResetPageScope.empty() || !m_pendingResetSettingPaths.empty();
+  markSettingsWriteSuccess(false);
+  if (forceSceneRebuild || hadStatus || hadPendingReset) {
+    requestSceneRebuild();
+  } else if (changed || rebuildWhenUnchanged) {
+    requestContentRebuild(
+        changed ? !registryAlreadyCurrent : true, pageResetPathsChanged || rebuildWhenUnchanged, true
+    );
+  }
 }
 
 void SettingsWindow::showTransientStatus(std::string message, bool isError) {
@@ -54,11 +120,17 @@ void SettingsWindow::setSettingOverride(std::vector<std::string> path, ConfigOve
       markSettingsWriteError(i18n::tr(shell::avatarApplyErrorTranslationKey(result.error)));
       return;
     }
-    if (m_config->setOverride(path, std::move(value))) {
-      markSettingsWriteSuccess();
+    bool changed = false;
+    const bool needsSceneRebuild = settingPathNeedsSceneRebuild(path);
+    const ConfigOverrideValue patchValue = value;
+    const auto previousResetPaths = currentPageResetPaths();
+    if (m_config->setOverride(path, std::move(value), &changed)) {
+      const bool registryPatched = changed && !needsSceneRebuild && tryPatchSettingsRegistryValue(path, patchValue);
+      finishSettingsWrite(changed, needsSceneRebuild, previousResetPaths != currentPageResetPaths(), registryPatched);
+      warnOnUnusableCustomSchedule(path);
       return;
     }
-    markSettingsWriteError(i18n::tr("settings.errors.write"));
+    markSettingsWriteError(settingsMutationError(*m_config, i18n::tr("settings.errors.write")));
   });
 }
 
@@ -73,11 +145,18 @@ void SettingsWindow::setSettingOverrides(
       markSettingsWriteSuccess(!m_statusMessage.empty());
       return;
     }
-    if (m_config->setOverrides(std::move(overrides))) {
-      markSettingsWriteSuccess(true);
+    bool changed = false;
+    const bool needsSceneRebuild = std::ranges::any_of(overrides, [](const auto& overrideEntry) {
+      return settingPathNeedsSceneRebuild(overrideEntry.first);
+    });
+    const auto patchOverrides = overrides;
+    const auto previousResetPaths = currentPageResetPaths();
+    if (m_config->setOverrides(std::move(overrides), &changed)) {
+      const bool registryPatched = changed && !needsSceneRebuild && tryPatchSettingsRegistryOverrides(patchOverrides);
+      finishSettingsWrite(changed, needsSceneRebuild, previousResetPaths != currentPageResetPaths(), registryPatched);
       return;
     }
-    markSettingsWriteError(i18n::tr("settings.errors.batch-write"));
+    markSettingsWriteError(settingsMutationError(*m_config, i18n::tr("settings.errors.batch-write")));
   });
 }
 
@@ -86,9 +165,19 @@ void SettingsWindow::clearSettingOverride(std::vector<std::string> path) {
     if (m_config == nullptr) {
       return;
     }
-    (void)m_config->clearOverride(path);
-    // Rebuild even when there was nothing to clear so inherit/default controls refresh.
-    markSettingsWriteSuccess();
+    bool changed = false;
+    const bool needsSceneRebuild = settingPathNeedsSceneRebuild(path);
+    const auto previousResetPaths = currentPageResetPaths();
+    if (!m_config->clearOverrides({path}, &changed)) {
+      markSettingsWriteError(i18n::tr("settings.errors.write"));
+      return;
+    }
+
+    const std::vector<std::vector<std::string>> paths{path};
+    const bool registryPatched = changed && !needsSceneRebuild && tryPatchSettingsRegistryResetValues(paths);
+    finishSettingsWrite(
+        changed, needsSceneRebuild, previousResetPaths != currentPageResetPaths(), registryPatched, true
+    );
   });
 }
 
@@ -99,22 +188,19 @@ void SettingsWindow::clearSettingOverrides(std::vector<std::vector<std::string>>
     }
 
     bool changed = false;
-    bool failed = false;
-    for (const auto& path : paths) {
-      if (m_config->clearOverride(path)) {
-        changed = true;
-      } else {
-        failed = true;
-      }
-    }
-
+    const bool needsSceneRebuild = settingPathsNeedSceneRebuild(paths);
+    const auto previousResetPaths = currentPageResetPaths();
+    const bool success = m_config->clearOverrides(paths, &changed);
     m_pendingResetPageScope.clear();
-    if (failed) {
+    if (!success) {
       markSettingsWriteError(i18n::tr("settings.errors.reset-page"));
       return;
     }
 
-    markSettingsWriteSuccess(changed);
+    const bool registryPatched = changed && !needsSceneRebuild && tryPatchSettingsRegistryResetValues(paths);
+    finishSettingsWrite(
+        changed, needsSceneRebuild, previousResetPaths != currentPageResetPaths(), registryPatched, true
+    );
   });
 }
 

@@ -1,8 +1,9 @@
 #include "shell/wallpaper/panel/wallpaper_panel.h"
 
 #include "config/config_service.h"
-#include "core/keybind_matcher.h"
+#include "core/input/keybind_matcher.h"
 #include "core/log.h"
+#include "core/random.h"
 #include "core/ui_phase.h"
 #include "i18n/i18n.h"
 #include "render/core/renderer.h"
@@ -15,6 +16,7 @@
 #include "theme/builtin_palettes.h"
 #include "theme/community_palettes.h"
 #include "theme/custom_palettes.h"
+#include "theme/theme_service.h"
 #include "ui/builders.h"
 #include "ui/dialogs/color_picker_dialog.h"
 #include "ui/palette.h"
@@ -28,12 +30,23 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <random>
 #include <string_view>
 #include <system_error>
 #include <unordered_set>
 #include <utility>
 
 namespace {
+
+  [[nodiscard]] bool isDescendantOf(const Node* node, const Node* ancestor) {
+    if (node == nullptr || ancestor == nullptr)
+      return false;
+    for (const Node* p = node->parent(); p != nullptr; p = p->parent()) {
+      if (p == ancestor)
+        return true;
+    }
+    return false;
+  }
 
   constexpr Logger kLog("wp-panel");
   constexpr auto kFilterDebounceInterval = std::chrono::milliseconds(120);
@@ -71,15 +84,15 @@ namespace {
         i18n::tr("theme.scheme.m3-content"),     i18n::tr("theme.scheme.m3-tonal-spot"),
         i18n::tr("theme.scheme.m3-fruit-salad"), i18n::tr("theme.scheme.m3-rainbow"),
         i18n::tr("theme.scheme.m3-monochrome"),  i18n::tr("theme.scheme.vibrant"),
-        i18n::tr("theme.scheme.faithful"),       i18n::tr("theme.scheme.dysfunctional"),
-        i18n::tr("theme.scheme.muted"),
+        i18n::tr("theme.scheme.faithful"),       i18n::tr("theme.scheme.soft"),
+        i18n::tr("theme.scheme.dysfunctional"),  i18n::tr("theme.scheme.muted"),
     };
   }
 
   [[nodiscard]] std::vector<std::string> wallpaperSchemeValues() {
     return {
-        "m3-content", "m3-tonal-spot", "m3-fruit-salad", "m3-rainbow", "m3-monochrome",
-        "vibrant",    "faithful",      "dysfunctional",  "muted",
+        "m3-content", "m3-tonal-spot", "m3-fruit-salad", "m3-rainbow",    "m3-monochrome",
+        "vibrant",    "faithful",      "soft",           "dysfunctional", "muted",
     };
   }
 
@@ -176,22 +189,17 @@ namespace {
   }
 
   [[nodiscard]] int caseInsensitiveNameOrder(std::string_view a, std::string_view b) {
-    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
-      const auto ac = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(a[i])));
-      const auto bc = static_cast<unsigned char>(std::tolower(static_cast<unsigned char>(b[i])));
-      if (ac != bc) {
-        return ac < bc ? -1 : 1;
-      }
-    }
-    if (a.size() == b.size()) {
-      return 0;
-    }
-    return a.size() < b.size() ? -1 : 1;
+    return StringUtils::naturalCaseInsensitiveCompare(a, b);
   }
 
   [[nodiscard]] std::optional<std::filesystem::file_time_type> entryModifiedTime(const WallpaperEntry& entry) {
     if (entry.isDir || entry.absPath.string().starts_with("color:")) {
       return std::nullopt;
+    }
+    // Scanned entries carry the mtime captured during the directory walk, so the
+    // sort comparator never stats. Pinned favorites lack it and stat once here.
+    if (entry.hasMtime) {
+      return entry.mtime;
     }
     std::error_code ec;
     const auto mtime = std::filesystem::last_write_time(entry.absPath, ec);
@@ -199,6 +207,18 @@ namespace {
       return std::nullopt;
     }
     return mtime;
+  }
+
+  // Ordering key for SortMode::Random. Hashing the path against a seed keeps the
+  // shuffled order fixed until the seed changes, so filtering or starring a tile
+  // rebuilds the visible entries without reordering the grid.
+  [[nodiscard]] std::uint64_t randomOrderKey(const WallpaperEntry& entry, std::uint64_t seed) {
+    std::uint64_t hash = std::filesystem::hash_value(entry.absPath) ^ seed;
+    hash ^= hash >> 30U;
+    hash *= 0xBF58476D1CE4E5B9ULL;
+    hash ^= hash >> 27U;
+    hash *= 0x94D049BB133111EBULL;
+    return hash ^ (hash >> 31U);
   }
 
   [[nodiscard]] bool favoriteVisibleInBrowseContext(
@@ -251,7 +271,7 @@ public:
     }
   }
 
-  [[nodiscard]] std::size_t itemCount() const override { return m_entries == nullptr ? 0u : m_entries->size(); }
+  [[nodiscard]] std::size_t itemCount() const override { return m_entries == nullptr ? 0U : m_entries->size(); }
 
   [[nodiscard]] std::unique_ptr<Node> createTile() override {
     auto tile = std::make_unique<WallpaperTile>(0.0f, 0.0f, m_scale);
@@ -344,17 +364,27 @@ private:
   StarCallback m_onStarToggle;
 };
 
-WallpaperPanel::WallpaperPanel(WaylandConnection* wayland, ConfigService* config, ThumbnailService* thumbnails)
-    : m_wayland(wayland), m_config(config), m_thumbnails(thumbnails) {
+WallpaperPanel::WallpaperPanel(
+    WaylandConnection* wayland, ConfigService* config, ThumbnailService* thumbnails, WallpaperScanner* scanner,
+    noctalia::theme::ThemeService* themeService
+)
+    : m_wayland(wayland), m_config(config), m_thumbnails(thumbnails), m_scanner(scanner), m_themeService(themeService) {
   if (m_config != nullptr) {
     m_flatten = m_config->stateBool("wallpaper_panel", "flatten").value_or(false);
     if (const std::optional<std::string> sort = m_config->stateString("wallpaper_panel", "sort")) {
       m_sortMode = sortModeFromState(*sort);
     }
   }
+  if (m_scanner != nullptr) {
+    m_scanner->setOnComplete([this]() { onScanComplete(); });
+  }
 }
 
-WallpaperPanel::~WallpaperPanel() = default;
+WallpaperPanel::~WallpaperPanel() {
+  if (m_scanner != nullptr) {
+    m_scanner->setOnComplete(nullptr);
+  }
+}
 
 PanelPlacement WallpaperPanel::panelPlacement() const noexcept {
   return m_config == nullptr ? PanelPlacement::Attached : m_config->config().shell.panel.wallpaperPlacement;
@@ -367,7 +397,6 @@ void WallpaperPanel::create() {
       .out = &m_rootLayout,
       .align = FlexAlign::Stretch,
       .gap = Style::spaceSm * scale,
-      .padding = Style::spaceMd * scale,
   });
 
   auto toolbar = ui::row({
@@ -382,8 +411,8 @@ void WallpaperPanel::create() {
           .out = &m_title,
           .text = i18n::tr("wallpaper.panel.title"),
           .fontSize = Style::fontSizeTitle * scale,
-          .color = colorSpecFromRole(ColorRole::Primary),
           .fontWeight = FontWeight::Bold,
+          .color = colorSpecFromRole(ColorRole::Primary),
       })
   );
 
@@ -395,7 +424,7 @@ void WallpaperPanel::create() {
           .controlHeight = Style::controlHeightSm * scale,
           .horizontalPadding = Style::spaceMd * scale,
           .surfaceOpacity = panelCardOpacity(),
-          .width = 360.0f * scale,
+          .width = 210.0f * scale,
           .height = 0.0f,
           .onChange =
               [this](const std::string& text) {
@@ -525,7 +554,9 @@ void WallpaperPanel::create() {
           .padding = Style::spaceXs * scale,
           .radius = Style::scaledRadiusMd(scale),
           .onClick = [this]() {
-            m_scanner.invalidate();
+            if (m_scanner != nullptr) {
+              m_scanner->invalidate();
+            }
             refreshVisibleEntries();
             resetSelection();
             rebindGrid();
@@ -692,6 +723,9 @@ void WallpaperPanel::create() {
           .flexGrow = 1.0f,
           .onSelectionChanged =
               [this](std::optional<std::size_t> idx) {
+                if (m_syncingGridSelectionVisual) {
+                  return;
+                }
                 if (idx.has_value() && *idx < m_visibleEntries.size()) {
                   m_selectedVisibleIndex = *idx;
                 } else {
@@ -701,6 +735,51 @@ void WallpaperPanel::create() {
               },
           .configure = [](VirtualGridView& grid) { grid.setFillWidth(true); },
       })
+  );
+
+  if (m_grid != nullptr && m_grid->focusArea() != nullptr) {
+    m_grid->focusArea()->setOnFocusGain([this]() {
+      m_gridKeyboardActive = true;
+      if (m_grid != nullptr && hasVisibleSelection()) {
+        m_syncingGridSelectionVisual = true;
+        m_grid->setSelectedIndex(m_selectedVisibleIndex);
+        m_syncingGridSelectionVisual = false;
+      }
+    });
+    m_grid->focusArea()->setOnFocusLoss([this]() {
+      m_gridKeyboardActive = false;
+      if (m_grid != nullptr) {
+        m_syncingGridSelectionVisual = true;
+        m_grid->setSelectedIndex(std::nullopt);
+        m_syncingGridSelectionVisual = false;
+      }
+    });
+  }
+
+  // Loading state shown while the directory scan runs on the worker thread.
+  // Occupies the body in place of the grid (only one is visible at a time).
+  root->addChild(
+      ui::column(
+          {
+              .out = &m_loadingBox,
+              .align = FlexAlign::Center,
+              .justify = FlexJustify::Center,
+              .gap = Style::spaceMd * scale,
+              .fillWidth = true,
+              .flexGrow = 1.0f,
+              .visible = false,
+          },
+          ui::spinner({
+              .out = &m_spinner,
+              .spinnerSize = Style::fontSizeTitle * scale * 1.6f,
+              .spinning = false,
+          }),
+          ui::label({
+              .text = i18n::tr("wallpaper.panel.loading"),
+              .fontSize = Style::fontSizeBody * scale,
+              .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
+          })
+      )
   );
 
   setRoot(std::move(root));
@@ -792,6 +871,7 @@ void WallpaperPanel::onOpen(std::string_view /*context*/) {
   m_navStack.clear();
   populateMonitorChoices();
   syncSortButtonGlyph();
+  reseedRandomSort();
   refreshVisibleEntries();
   resetSelection();
   rebindGrid();
@@ -832,6 +912,9 @@ void WallpaperPanel::onClose() {
   m_favoritePaletteSourceSegmented = nullptr;
   m_favoritePaletteDetailSelect = nullptr;
   m_grid = nullptr;
+  m_loadingBox = nullptr;
+  m_spinner = nullptr;
+  m_scanPending = false;
 
   clearReleasedRoot();
   m_lastWidth = 0.0f;
@@ -843,6 +926,37 @@ bool WallpaperPanel::handleGlobalKey(std::uint32_t sym, std::uint32_t modifiers,
   if (!pressed || preedit) {
     return false;
   }
+
+  auto& dispatcher = PanelManager::instance().inputDispatcher();
+  InputArea* focused = dispatcher.focusedArea();
+
+  if (m_favoriteThemeSegmented != nullptr && focused == m_favoriteThemeSegmented->focusArea()) {
+    const bool moveIntoGrid = KeybindMatcher::matches(KeybindAction::Down, sym, modifiers)
+        || KeybindMatcher::matches(KeybindAction::TabNext, sym, modifiers);
+    if (moveIntoGrid && m_grid != nullptr && m_grid->focusArea() != nullptr) {
+      dispatcher.setFocus(m_grid->focusArea());
+      if (!hasVisibleSelection() && !m_visibleEntries.empty()) {
+        selectVisibleIndex(0);
+      }
+      return true;
+    }
+  }
+
+  if (m_favoritePaletteSourceSegmented != nullptr && focused == m_favoritePaletteSourceSegmented->focusArea()) {
+    const bool moveIntoGrid = KeybindMatcher::matches(KeybindAction::Down, sym, modifiers);
+    if (moveIntoGrid && m_grid != nullptr && m_grid->focusArea() != nullptr) {
+      dispatcher.setFocus(m_grid->focusArea());
+      if (!hasVisibleSelection() && !m_visibleEntries.empty()) {
+        selectVisibleIndex(0);
+      }
+      return true;
+    }
+  }
+
+  if (focused != nullptr && !isDescendantOf(focused, m_grid)) {
+    return false;
+  }
+
   return handleKeyEvent(sym, modifiers);
 }
 
@@ -882,7 +996,9 @@ std::filesystem::path WallpaperPanel::rootDirectoryForSelection() const {
     return {};
   }
   const auto& wp = m_config->config().wallpaper;
-  const ThemeMode mode = m_config->config().theme.mode;
+  const ThemeMode configured = m_config->config().theme.mode;
+  const bool isLight = m_themeService != nullptr ? m_themeService->isLightMode() : configured == ThemeMode::Light;
+  const ThemeMode mode = wallpaper::effectiveThemeMode(configured, isLight);
 
   const auto& choice = m_monitorChoices[m_selectedMonitorIndex];
   if (choice.connector.empty() || !wp.perMonitorDirectories) {
@@ -1155,14 +1271,52 @@ void WallpaperPanel::syncThemeControls() {
 
 void WallpaperPanel::refreshScan() {
   const auto dir = activeDirectoryForSelection();
-  if (!dir.empty()) {
-    m_scanner.scan(dir, m_flatten);
+  if (dir.empty() || m_scanner == nullptr) {
+    m_scanPending = false;
+    return;
   }
+  // requestScan() returns false when a worker scan was queued — the entries
+  // arrive later via onScanComplete(). A cached/fresh dir returns true.
+  m_scanPending = !m_scanner->requestScan(dir, m_flatten);
 }
 
 void WallpaperPanel::refreshVisibleEntries() {
   refreshScan();
   applyFilter();
+  syncLoadingState();
+}
+
+void WallpaperPanel::onScanComplete() {
+  // The scanner outlives the panel's UI; ignore late results after teardown.
+  if (m_rootLayout == nullptr) {
+    return;
+  }
+  const auto dir = activeDirectoryForSelection();
+  m_scanPending = !dir.empty() && m_scanner != nullptr && m_scanner->scanning(dir, m_flatten);
+
+  applyFilter();
+  rebindGrid();
+  syncBrowseChrome();
+  syncLoadingState();
+  m_dirty = true;
+  PanelManager::instance().refresh();
+}
+
+void WallpaperPanel::syncLoadingState() {
+  const bool loading = m_scanPending;
+  if (m_loadingBox != nullptr) {
+    m_loadingBox->setVisible(loading);
+  }
+  if (m_grid != nullptr) {
+    m_grid->setVisible(!loading);
+  }
+  if (m_spinner != nullptr) {
+    if (loading) {
+      m_spinner->start();
+    } else {
+      m_spinner->stop();
+    }
+  }
 }
 
 void WallpaperPanel::applyFilter() {
@@ -1173,13 +1327,13 @@ void WallpaperPanel::applyFilter() {
   appendFilteredFavoriteEntries(m_visibleEntries, favoritePaths, dir, rootDir);
   m_pinnedFavoriteCount = m_visibleEntries.size();
 
-  if (!dir.empty()) {
-    const auto& result = m_scanner.scan(dir, m_flatten);
-
+  const WallpaperScanResult* result =
+      (dir.empty() || m_scanner == nullptr) ? nullptr : m_scanner->cached(dir, m_flatten);
+  if (result != nullptr) {
     const std::string needle = StringUtils::toLower(m_filterQuery);
     const bool filterActive = !needle.empty();
-    m_visibleEntries.reserve(m_visibleEntries.size() + result.entries.size());
-    for (const auto& entry : result.entries) {
+    m_visibleEntries.reserve(m_visibleEntries.size() + result->entries.size());
+    for (const auto& entry : result->entries) {
       if (!entry.isDir) {
         const std::string normalized = FileUtils::normalizeWallpaperPath(entry.absPath.string());
         if (favoritePaths.contains(normalized)) {
@@ -1210,7 +1364,7 @@ void WallpaperPanel::rebindGrid(bool resetScroll) {
   if (resetScroll || m_visibleEntries.empty()) {
     m_grid->scrollView().setScrollOffset(0.0f);
   }
-  if (m_visibleEntries.empty() || !hasVisibleSelection()) {
+  if (m_visibleEntries.empty() || !hasVisibleSelection() || !m_gridKeyboardActive) {
     m_grid->setSelectedIndex(std::nullopt);
   } else {
     m_grid->setSelectedIndex(m_selectedVisibleIndex);
@@ -1434,6 +1588,9 @@ WallpaperPanel::SortMode WallpaperPanel::sortModeFromState(std::string_view valu
   if (value == "date_desc") {
     return SortMode::DateDesc;
   }
+  if (value == "random") {
+    return SortMode::Random;
+  }
   return SortMode::NameAsc;
 }
 
@@ -1445,6 +1602,8 @@ std::string_view WallpaperPanel::sortModeStateValue(SortMode mode) {
     return "date_asc";
   case SortMode::DateDesc:
     return "date_desc";
+  case SortMode::Random:
+    return "random";
   case SortMode::NameAsc:
   default:
     return "name_asc";
@@ -1459,6 +1618,8 @@ std::string_view WallpaperPanel::sortModeGlyph(SortMode mode) {
     return "sort-ascending-2";
   case SortMode::DateDesc:
     return "sort-descending-2";
+  case SortMode::Random:
+    return "arrows-random";
   case SortMode::NameAsc:
   default:
     return "sort-a-z";
@@ -1473,6 +1634,8 @@ const char* WallpaperPanel::sortModeTooltipKey(SortMode mode) {
     return "wallpaper.panel.sort-date-asc";
   case SortMode::DateDesc:
     return "wallpaper.panel.sort-date-desc";
+  case SortMode::Random:
+    return "wallpaper.panel.sort-random";
   case SortMode::NameAsc:
   default:
     return "wallpaper.panel.sort-name-asc";
@@ -1513,6 +1676,9 @@ void WallpaperPanel::cycleSortMode() {
     next = SortMode::DateDesc;
     break;
   case SortMode::DateDesc:
+    next = SortMode::Random;
+    break;
+  case SortMode::Random:
     next = SortMode::NameAsc;
     break;
   }
@@ -1524,6 +1690,9 @@ void WallpaperPanel::setSortMode(SortMode mode) {
     return;
   }
   m_sortMode = mode;
+  if (mode == SortMode::Random) {
+    reseedRandomSort();
+  }
   if (m_config != nullptr) {
     (void)m_config->setStateString("wallpaper_panel", "sort", std::string(sortModeStateValue(mode)));
   }
@@ -1532,6 +1701,10 @@ void WallpaperPanel::setSortMode(SortMode mode) {
   rebindGrid();
   m_dirty = true;
   PanelManager::instance().refresh();
+}
+
+void WallpaperPanel::reseedRandomSort() {
+  m_randomSeed = std::uniform_int_distribution<std::uint64_t>{}(Random::rng());
 }
 
 void WallpaperPanel::sortVisibleEntries() {
@@ -1566,6 +1739,14 @@ void WallpaperPanel::sortVisibleEntries() {
         }
       } else if (aTime.has_value() != bTime.has_value()) {
         return aTime.has_value();
+      }
+      return caseInsensitiveNameOrder(a.name, b.name) < 0;
+    }
+    case SortMode::Random: {
+      const std::uint64_t aKey = randomOrderKey(a, m_randomSeed);
+      const std::uint64_t bKey = randomOrderKey(b, m_randomSeed);
+      if (aKey != bKey) {
+        return aKey < bKey;
       }
       return caseInsensitiveNameOrder(a.name, b.name) < 0;
     }

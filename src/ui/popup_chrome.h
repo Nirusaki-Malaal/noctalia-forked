@@ -2,12 +2,15 @@
 
 #include "config/config_types.h"
 #include "shell/surface/shadow.h"
-#include "wayland/popup_surface.h"
 
 #include <cstdint>
 
+class Box;
 class Node;
+class PopupSurface;
 class RectNode;
+struct InputRect;
+struct PopupSurfaceConfig;
 
 namespace popup_chrome {
 
@@ -56,5 +59,9 @@ namespace popup_chrome {
       Node& parent, const Geometry& geometry, const ShellConfig::ShadowConfig& shadow, float radius,
       float backgroundOpacity = 1.0f
   );
+  // Rounded popup card background at the fixed content rect. Hosts that scroll a
+  // ContextMenuControl draw the card here so its corners stay pinned to the viewport
+  // instead of scrolling away with the rows.
+  Box* addCardBackground(Node& parent, const Geometry& geometry, float contentScale);
 
 } // namespace popup_chrome

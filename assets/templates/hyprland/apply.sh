@@ -44,7 +44,7 @@ detect_mode() {
 
 apply_lua() {
   local include_line='-- For Noctalia Color templates
-require("noctalia")'
+require("noctalia").apply_theme()'
 
   mkdir -p "$config_dir"
 
@@ -53,7 +53,7 @@ require("noctalia")'
     return
   fi
 
-  # Avoid appending duplicate Noctalia includes
+  # Append only if there is no Noctalia include at all
   if ! grep -qF 'require("noctalia")' "$lua_config_file"; then
     printf '\n%s\n' "$include_line" >>"$lua_config_file"
   fi

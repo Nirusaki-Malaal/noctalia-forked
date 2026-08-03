@@ -1,5 +1,6 @@
 #include "ui/controls/scroll_view.h"
 
+#include "render/animation/animation_manager.h"
 #include "render/core/render_styles.h"
 #include "render/scene/input_area.h"
 #include "render/scene/rect_node.h"
@@ -8,6 +9,7 @@
 #include "ui/style.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <linux/input-event-codes.h>
 #include <memory>
@@ -16,6 +18,21 @@
 namespace {
 
   constexpr float kDefaultWidth = 260.0f;
+  constexpr float kMinFlingVelocity = 0.12f;
+  constexpr float kFlingDeceleration = 0.003f;
+  constexpr float kMinScrollAnimDurationMs = 50.0f;
+  constexpr float kMaxScrollAnimDurationMs = 900.0f;
+  constexpr float kScrollAnimMsPerPx = 0.45f;
+  constexpr float kFlingAnimMsPerPx = 0.55f;
+
+  float primaryPosition(const InputArea::PointerData& data, ScrollOrientation orientation) {
+    return orientation == ScrollOrientation::Horizontal ? data.localX : data.localY;
+  }
+
+  std::uint32_t scrollAxis(ScrollOrientation orientation) {
+    return orientation == ScrollOrientation::Horizontal ? WL_POINTER_AXIS_HORIZONTAL_SCROLL
+                                                        : WL_POINTER_AXIS_VERTICAL_SCROLL;
+  }
 
 } // namespace
 
@@ -38,29 +55,55 @@ ScrollView::ScrollView() {
 
   auto viewportArea = std::make_unique<InputArea>();
   viewportArea->setOnPress([this](const InputArea::PointerData& data) {
-    if (data.button != BTN_LEFT || !data.pressed || !scrollable()) {
+    if (data.button != BTN_LEFT || !scrollable()) {
       return;
     }
-    m_dragStartLocalY = data.localY;
-    m_dragStartOffset = m_scrollOffset;
+    if (data.pressed) {
+      stopScrollAnimation();
+      m_dragging = true;
+      m_dragStartPosition = primaryPosition(data, m_orientation);
+      m_dragStartOffset = m_scrollOffset;
+      m_lastDragPosition = m_dragStartPosition;
+      m_lastDragSampleAt = std::chrono::steady_clock::now();
+      m_dragVelocity = 0.0f;
+      return;
+    }
+    if (m_dragging) {
+      m_dragging = false;
+      startFling();
+    }
+  });
+  viewportArea->setOnLeave([this]() {
+    if (!m_dragging) {
+      return;
+    }
+    m_dragging = false;
+    startFling();
   });
   viewportArea->setOnMotion([this](const InputArea::PointerData& data) {
     if (m_viewportArea == nullptr || !m_viewportArea->pressed() || !scrollable()) {
       return;
     }
-    const float delta = data.localY - m_dragStartLocalY;
-    setScrollOffset(m_dragStartOffset - delta);
-  });
-  viewportArea->setOnAxis([this](const InputArea::PointerData& data) {
-    if (!scrollable()) {
-      return;
+    const auto now = std::chrono::steady_clock::now();
+    const float dtMs = std::chrono::duration<float, std::milli>(now - m_lastDragSampleAt).count();
+    if (dtMs > 0.0f && dtMs < 80.0f) {
+      const float position = primaryPosition(data, m_orientation);
+      m_dragVelocity = (position - m_lastDragPosition) / dtMs;
     }
+    const float position = primaryPosition(data, m_orientation);
+    m_lastDragPosition = position;
+    m_lastDragSampleAt = now;
 
-    if (data.axis != WL_POINTER_AXIS_VERTICAL_SCROLL) {
-      return;
+    const float delta = position - m_dragStartPosition;
+    applyScrollOffsetValue(clampOffset(m_dragStartOffset - delta));
+  });
+  viewportArea->setOnAxisHandler([this](const InputArea::PointerData& data) {
+    if (!scrollable() || data.axis != scrollAxis(m_orientation)) {
+      return false;
     }
 
     scrollBy(data.scrollDelta(m_scrollWheelStep));
+    return true;
   });
   m_viewportArea = static_cast<InputArea*>(addChild(std::move(viewportArea)));
 
@@ -76,7 +119,91 @@ ScrollView::ScrollView() {
   applyPalette();
 }
 
+void ScrollView::setOrientation(ScrollOrientation orientation) {
+  if (m_orientation == orientation) {
+    return;
+  }
+  stopScrollAnimation();
+  m_orientation = orientation;
+  m_scrollOffset = 0.0f;
+  m_targetScrollOffset = 0.0f;
+  if (m_scrollbar != nullptr) {
+    m_scrollbar->setOrientation(orientation);
+  }
+  markLayoutDirty();
+}
+
 void ScrollView::setScrollOffset(float offset) {
+  stopScrollAnimation();
+  applyScrollOffsetValue(clampOffset(offset));
+}
+
+void ScrollView::scrollBy(float delta) {
+  if (delta == 0.0f) {
+    return;
+  }
+  const float base = m_scrollAnimId != 0 ? m_targetScrollOffset : m_scrollOffset;
+  animateScrollTo(clampOffset(base + delta));
+}
+
+void ScrollView::stopScrollAnimation() {
+  if (m_scrollAnimId != 0 && animationManager() != nullptr) {
+    animationManager()->cancel(m_scrollAnimId);
+    m_scrollAnimId = 0;
+  }
+  m_targetScrollOffset = m_scrollOffset;
+}
+
+void ScrollView::animateScrollTo(float target, float durationMs) {
+  const float clampedTarget = clampOffset(target);
+
+  if (animationManager() == nullptr) {
+    applyScrollOffsetValue(clampedTarget);
+    return;
+  }
+
+  stopScrollAnimation();
+  m_targetScrollOffset = clampedTarget;
+
+  if (std::abs(clampedTarget - m_scrollOffset) < 0.5f) {
+    applyScrollOffsetValue(clampedTarget);
+    return;
+  }
+
+  const float distance = std::abs(clampedTarget - m_scrollOffset);
+  const float resolvedDuration = durationMs > 0.0f
+      ? durationMs
+      : std::clamp(distance * kScrollAnimMsPerPx, kMinScrollAnimDurationMs, static_cast<float>(Style::animNormal));
+
+  m_scrollAnimId = animationManager()->animate(
+      m_scrollOffset, clampedTarget, resolvedDuration, Easing::EaseOutCubic,
+      [this](float value) { applyScrollOffsetValue(value); }, [this]() { m_scrollAnimId = 0; }, this
+  );
+  markPaintDirty();
+}
+
+void ScrollView::startFling() {
+  if (animationManager() == nullptr) {
+    return;
+  }
+
+  const float offsetVelocity = -m_dragVelocity;
+  if (std::abs(offsetVelocity) < kMinFlingVelocity) {
+    return;
+  }
+
+  const float flingDistance = (offsetVelocity * std::abs(offsetVelocity)) / (2.0f * kFlingDeceleration);
+  const float target = clampOffset(m_scrollOffset + flingDistance);
+  if (std::abs(target - m_scrollOffset) < 1.0f) {
+    return;
+  }
+
+  const float duration =
+      std::clamp(std::abs(flingDistance) * kFlingAnimMsPerPx, kMinScrollAnimDurationMs, kMaxScrollAnimDurationMs);
+  animateScrollTo(target, duration);
+}
+
+void ScrollView::applyScrollOffsetValue(float offset) {
   const float clamped = clampOffset(offset);
   if (std::abs(clamped - m_scrollOffset) < 0.001f) {
     return;
@@ -92,13 +219,18 @@ void ScrollView::setScrollOffset(float offset) {
   }
 }
 
-void ScrollView::scrollBy(float delta) { setScrollOffset(m_scrollOffset + delta); }
-
 void ScrollView::setScrollbarVisible(bool visible) {
   if (m_showScrollbar == visible) {
     return;
   }
   m_showScrollbar = visible;
+  markLayoutDirty();
+}
+
+void ScrollView::setScrollbarInsetV(float inset) {
+  if (m_scrollbar != nullptr) {
+    m_scrollbar->setTrackInset(inset);
+  }
   markLayoutDirty();
 }
 
@@ -141,7 +273,7 @@ void ScrollView::setSoftness(float softness) {
 void ScrollView::setCardStyle(float scale, float fillOpacity, bool showBorder) {
   setFill(colorSpecFromRole(ColorRole::SurfaceVariant, fillOpacity));
   if (showBorder) {
-    setBorder(colorSpecFromRole(ColorRole::Outline, 0.5f), Style::borderWidth);
+    setBorder(colorSpecFromRole(ColorRole::Outline), Style::borderWidth);
   } else {
     clearBorder();
   }
@@ -154,6 +286,7 @@ void ScrollView::bindState(ScrollViewState* state) {
   m_boundState = state;
   if (m_boundState != nullptr) {
     m_scrollOffset = m_boundState->offset;
+    m_targetScrollOffset = m_scrollOffset;
   }
   markLayoutDirty();
 }
@@ -171,12 +304,17 @@ void ScrollView::setViewportPaddingV(float padding) {
 }
 
 float ScrollView::contentViewportWidth() const noexcept {
-  const float gutter = m_scrollbarShown ? (Style::scrollbarWidth + Style::scrollbarGap) : 0.0f;
+  const float gutter = m_orientation == ScrollOrientation::Vertical && m_scrollbarShown
+      ? (Style::scrollbarWidth + Style::scrollbarGap)
+      : 0.0f;
   return std::max(0.0f, width() - m_viewportPaddingH * 2.0f - gutter);
 }
 
 float ScrollView::contentViewportHeight() const noexcept {
-  return std::max(0.0f, height() - m_viewportPaddingV * 2.0f);
+  const float gutter = m_orientation == ScrollOrientation::Horizontal && m_scrollbarShown
+      ? (Style::scrollbarWidth + Style::scrollbarGap)
+      : 0.0f;
+  return std::max(0.0f, height() - m_viewportPaddingV * 2.0f - gutter);
 }
 
 void ScrollView::applyPalette() {
@@ -202,49 +340,86 @@ void ScrollView::doLayout(Renderer& renderer) {
   const float w = width() > 0.0f ? width() : kDefaultWidth;
   const float viewportX = m_viewportPaddingH;
   const float viewportY = m_viewportPaddingV;
-  const float viewportW = std::max(0.0f, w - m_viewportPaddingH * 2.0f);
+  const float availableW = std::max(0.0f, w - m_viewportPaddingH * 2.0f);
 
   m_content->setPosition(0.0f, 0.0f);
-  LayoutConstraints contentConstraints;
-  contentConstraints.setExactWidth(viewportW);
-  LayoutSize contentSize = m_content->measure(renderer, contentConstraints);
-  m_content->arrange(renderer, LayoutRect{.x = 0.0f, .y = 0.0f, .width = viewportW, .height = contentSize.height});
 
-  const float naturalH = contentSize.height + m_viewportPaddingV * 2.0f;
-  const float h = height() > 0.0f ? height() : naturalH;
-  const float viewportH = std::max(0.0f, h - m_viewportPaddingV * 2.0f);
-  m_viewportHeight = viewportH;
-  m_viewportWidth = viewportW;
-  setSize(w, h);
+  if (m_orientation == ScrollOrientation::Horizontal) {
+    LayoutSize contentSize = m_content->measure(renderer, {});
+    m_scrollbarShown = m_showScrollbar && contentSize.width > availableW + 0.5f;
+    const float gutter = m_scrollbarShown ? (Style::scrollbarWidth + Style::scrollbarGap) : 0.0f;
+    const float contentWidth = std::max(availableW, contentSize.width);
 
-  m_background->setPosition(0.0f, 0.0f);
-  m_background->setFrameSize(w, h);
-  m_viewportArea->setPosition(viewportX, viewportY);
-  m_viewportArea->setFrameSize(viewportW, viewportH);
-
-  m_scrollbarShown = m_showScrollbar && m_content->height() > viewportH + 0.5f;
-  const float gutter = m_scrollbarShown ? (Style::scrollbarWidth + Style::scrollbarGap) : 0.0f;
-  const float contentWidth = std::max(0.0f, viewportW - gutter);
-  if (std::abs(m_content->width() - contentWidth) >= 0.5f) {
-    contentConstraints = {};
+    LayoutConstraints contentConstraints;
     contentConstraints.setExactWidth(contentWidth);
     contentSize = m_content->measure(renderer, contentConstraints);
     m_content->arrange(renderer, LayoutRect{.x = 0.0f, .y = 0.0f, .width = contentWidth, .height = contentSize.height});
+
+    const float naturalH = contentSize.height + m_viewportPaddingV * 2.0f + gutter;
+    const float h = height() > 0.0f ? height() : naturalH;
+    const float viewportH = std::max(0.0f, h - m_viewportPaddingV * 2.0f - gutter);
+    m_viewportWidth = availableW;
+    m_viewportHeight = viewportH;
+    setSize(w, h);
+
+    m_background->setPosition(0.0f, 0.0f);
+    m_background->setFrameSize(w, h);
+    m_viewportArea->setPosition(viewportX, viewportY);
+    m_viewportArea->setFrameSize(availableW, viewportH);
+
+    m_maxScrollOffset = std::max(0.0f, contentWidth - availableW);
+    m_scrollbar->setPosition(viewportX, viewportY + viewportH + Style::scrollbarGap);
+    m_scrollbar->setVisible(m_showScrollbar);
+    m_scrollbar->update(availableW, contentWidth, m_scrollOffset);
+  } else {
+    LayoutConstraints contentConstraints;
+    contentConstraints.setExactWidth(availableW);
+    LayoutSize contentSize = m_content->measure(renderer, contentConstraints);
+    m_content->arrange(renderer, LayoutRect{.x = 0.0f, .y = 0.0f, .width = availableW, .height = contentSize.height});
+
+    const float naturalH = contentSize.height + m_viewportPaddingV * 2.0f;
+    const float h = height() > 0.0f ? height() : naturalH;
+    const float viewportH = std::max(0.0f, h - m_viewportPaddingV * 2.0f);
+    m_viewportHeight = viewportH;
+    m_viewportWidth = availableW;
+    setSize(w, h);
+
+    m_background->setPosition(0.0f, 0.0f);
+    m_background->setFrameSize(w, h);
+    m_viewportArea->setPosition(viewportX, viewportY);
+    m_viewportArea->setFrameSize(availableW, viewportH);
+
+    m_scrollbarShown = m_showScrollbar && m_content->height() > viewportH + 0.5f;
+    const float gutter = m_scrollbarShown ? (Style::scrollbarWidth + Style::scrollbarGap) : 0.0f;
+    const float contentWidth = std::max(0.0f, availableW - gutter);
+    if (std::abs(m_content->width() - contentWidth) >= 0.5f) {
+      contentConstraints = {};
+      contentConstraints.setExactWidth(contentWidth);
+      contentSize = m_content->measure(renderer, contentConstraints);
+      m_content->arrange(
+          renderer, LayoutRect{.x = 0.0f, .y = 0.0f, .width = contentWidth, .height = contentSize.height}
+      );
+    }
+
+    const float contentHeight = m_content->height();
+    m_maxScrollOffset = std::max(0.0f, contentHeight - viewportH);
+    const float scrollbarX = m_viewportPaddingH + m_viewportWidth - Style::scrollbarWidth;
+    m_scrollbar->setPosition(scrollbarX, m_viewportPaddingV);
+    m_scrollbar->setVisible(m_showScrollbar);
+    m_scrollbar->update(viewportH, contentHeight, m_scrollOffset);
   }
 
-  const float contentHeight = m_content->height();
-  m_maxScrollOffset = std::max(0.0f, contentHeight - viewportH);
   if (m_boundState != nullptr) {
     m_scrollOffset = clampOffset(m_boundState->offset);
     m_boundState->offset = m_scrollOffset;
   } else {
     m_scrollOffset = clampOffset(m_scrollOffset);
   }
-
-  const float scrollbarX = m_viewportPaddingH + m_viewportWidth - Style::scrollbarWidth;
-  m_scrollbar->setPosition(scrollbarX, m_viewportPaddingV);
-  m_scrollbar->setVisible(m_showScrollbar);
-  m_scrollbar->update(viewportH, contentHeight, m_scrollOffset);
+  if (m_scrollAnimId != 0) {
+    m_targetScrollOffset = clampOffset(m_targetScrollOffset);
+  } else {
+    m_targetScrollOffset = m_scrollOffset;
+  }
 
   applyScrollOffset();
 }
@@ -257,10 +432,18 @@ void ScrollView::doArrange(Renderer& renderer, const LayoutRect& rect) { arrange
 
 void ScrollView::applyScrollOffset() {
   if (m_content != nullptr) {
-    m_content->setPosition(0.0f, -m_scrollOffset);
+    if (m_orientation == ScrollOrientation::Horizontal) {
+      m_content->setPosition(-m_scrollOffset, 0.0f);
+    } else {
+      m_content->setPosition(0.0f, -m_scrollOffset);
+    }
   }
   if (m_scrollbar != nullptr && m_scrollbarShown) {
-    m_scrollbar->update(m_viewportHeight, m_content != nullptr ? m_content->height() : 0.0f, m_scrollOffset);
+    const float viewportExtent = m_orientation == ScrollOrientation::Horizontal ? m_viewportWidth : m_viewportHeight;
+    const float contentExtent = m_content != nullptr
+        ? (m_orientation == ScrollOrientation::Horizontal ? m_content->width() : m_content->height())
+        : 0.0f;
+    m_scrollbar->update(viewportExtent, contentExtent, m_scrollOffset);
   }
 }
 

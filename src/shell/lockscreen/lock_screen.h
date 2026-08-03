@@ -2,6 +2,7 @@
 
 #include "auth/pam_authenticator.h"
 #include "capture/screencopy_capture.h"
+#include "core/timer_manager.h"
 
 #include <cstdint>
 #include <functional>
@@ -21,12 +22,17 @@ struct wl_surface;
 struct wl_output;
 class ConfigService;
 
+class CompositorPlatform;
 class FingerprintAuthenticator;
+class HttpClient;
 class LockSurface;
+class MprisService;
 class RenderContext;
+class SessionActionRunner;
 class SharedTextureCache;
 class SystemBus;
 class WaylandConnection;
+class WeatherService;
 
 class LockScreen {
 public:
@@ -35,10 +41,13 @@ public:
 
   bool initialize(
       WaylandConnection& wayland, RenderContext* renderContext, ConfigService* configService,
-      SharedTextureCache* textureCache, SystemBus* systemBus
+      SharedTextureCache* textureCache, SystemBus* systemBus, CompositorPlatform* compositorPlatform
   );
   void setSessionHooks(std::function<void()> onLocked, std::function<void()> onUnlocked);
   void setLockEngagedCallback(std::function<void()> callback);
+  void setLoginBoxServices(
+      SessionActionRunner* sessionActions, MprisService* mpris, const WeatherService* weather, HttpClient* httpClient
+  );
   bool lock();
   void primeDesktopCaptures();
   void clearPrimedDesktopCaptures();
@@ -47,9 +56,13 @@ public:
   void onFontChanged();
   void onThemeChanged();
   void onGpuResourcesInvalidated();
+  void prepareForGraphicsReset() noexcept;
   void onWallpaperChanged();
   void onConfigChanged();
+  void onLockKeysChanged();
+  void onKeyboardLayoutChanged();
   void requestLayout();
+  void requestUpdate();
   void onPointerEvent(const PointerEvent& event);
   void onKeyboardEvent(const KeyboardEvent& event);
   [[nodiscard]] bool isActive() const noexcept;
@@ -81,6 +94,9 @@ private:
   void syncInstances();
   void captureDesktopSnapshots();
   [[nodiscard]] bool shouldUseBlurredDesktop() const;
+  [[nodiscard]] bool allSurfacesReady() const;
+  bool tryFlushPendingAfterLocked();
+  void dispatchPendingAfterLocked();
   void applyLockscreenStyle(LockSurface& surface) const;
   void applyOutputRestriction();
   void applyWallpaperStyleToSurfaces();
@@ -90,6 +106,9 @@ private:
   void resetLockState();
   void clearInstances();
   void updatePromptOnSurfaces();
+  void updateIndicatorsOnSurfaces();
+  void applyIndicatorsToSurface(LockSurface& surface) const;
+  void cycleKeyboardLayout();
   void handlePasswordEdited(const std::string& value);
   void tryAuthenticate();
   void handleAuthResult(std::uint64_t generation, PamAuthenticator::Result result);
@@ -97,7 +116,6 @@ private:
   void startFingerprint();
   void stopFingerprint();
   void handleFingerprintStatus(const std::string& message, bool isError);
-  [[nodiscard]] std::string passwordPamService() const;
   static void clearSensitiveString(std::string& value);
 
   WaylandConnection* m_wayland = nullptr;
@@ -105,6 +123,7 @@ private:
   ConfigService* m_configService = nullptr;
   SharedTextureCache* m_textureCache = nullptr;
   SystemBus* m_systemBus = nullptr;
+  CompositorPlatform* m_compositorPlatform = nullptr;
   ext_session_lock_v1* m_lock = nullptr;
   std::vector<Instance> m_instances;
   std::unordered_map<wl_output*, ScreencopyImage> m_desktopCaptures;
@@ -125,4 +144,9 @@ private:
   std::function<void()> m_onSessionLocked;
   std::function<void()> m_onSessionUnlocked;
   std::function<void()> m_onLockEngaged;
+  SessionActionRunner* m_sessionActions = nullptr;
+  MprisService* m_mpris = nullptr;
+  const WeatherService* m_weather = nullptr;
+  HttpClient* m_httpClient = nullptr;
+  Timer m_suspendTimeoutTimer;
 };

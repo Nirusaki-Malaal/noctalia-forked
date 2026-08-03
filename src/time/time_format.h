@@ -12,7 +12,7 @@ std::string formatTimeAgo(std::chrono::system_clock::time_point tp);
 // Same wording as formatTimeAgo, but duration is computed from steady_clock (e.g. Notification::receivedTime).
 [[nodiscard]] std::string formatElapsedSince(std::chrono::steady_clock::time_point since);
 
-// Formats a duration as "{d}d {h}h {m}m" / "{h}h {m}m" / "{m}m" / "<1m".
+// Formats a duration using translated day/hour/minute units.
 [[nodiscard]] std::string formatDuration(std::chrono::seconds duration);
 
 // Formats seconds as clock-style "M:SS" or "H:MM:SS". Returns "0:00" for <= 0.
@@ -28,6 +28,17 @@ std::string formatTimeAgo(std::chrono::system_clock::time_point tp);
 // Bare chrono specs such as "%H:%M" are accepted, as are strftime-style no-pad
 // numeric specifiers such as "%-I".
 [[nodiscard]] std::string formatLocalTime(const char* fmt);
+
+// Empty selects system-local time. Non-empty values must name a zone in the active timezone database.
+[[nodiscard]] bool isValidTimezone(std::string_view tzName);
+
+// Formats current time for a specific timezone with a C++20 chrono format string.
+// Falls back to local time if the timezone is invalid or empty.
+[[nodiscard]] std::string formatTimezoneTime(const char* fmt, std::string_view tzName);
+
+// Formats a Unix timestamp in a specific timezone. Empty/invalid timezone falls back to local.
+[[nodiscard]] std::string
+formatTimezoneUnixTime(std::int64_t unixSeconds, std::string_view fmt, std::string_view tzName);
 
 // Formats a Unix timestamp in local time. Accepts the same date-format syntax as formatLocalTime(),
 // and handles strftime "%s" as Unix epoch seconds in Noctalia-owned code.

@@ -1,7 +1,6 @@
 #include "shell/bar/widgets/power_profile_widget.h"
 
 #include "dbus/power/power_profiles_service.h"
-#include "render/core/renderer.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
 #include "ui/builders.h"
@@ -13,8 +12,7 @@
 PowerProfileWidget::PowerProfileWidget(PowerProfilesService* powerProfiles) : m_powerProfiles(powerProfiles) {}
 
 void PowerProfileWidget::create() {
-  auto area = std::make_unique<InputArea>();
-  area->setOnClick([this](const InputArea::PointerData& /*data*/) { cycleProfile(); });
+  auto area = ui::inputArea({});
   m_area = area.get();
 
   area->addChild(
@@ -74,11 +72,4 @@ void PowerProfileWidget::syncState(Renderer& renderer) {
     rootNode->setOpacity(m_available ? 1.0f : 0.55f);
   }
   requestRedraw();
-}
-
-void PowerProfileWidget::cycleProfile() {
-  if (m_powerProfiles == nullptr) {
-    return;
-  }
-  (void)m_powerProfiles->cycleActiveProfile();
 }

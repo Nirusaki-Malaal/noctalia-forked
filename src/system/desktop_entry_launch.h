@@ -1,17 +1,25 @@
 #pragma once
 
-#include "system/desktop_entry.h"
-
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+struct DesktopAction;
+struct DesktopEntry;
 
 namespace desktop_entry_launch {
 
   struct LaunchOptions {
     std::string activationToken;
     bool runAsSystemdService = false;
+    std::string customCommand;
+    // When true, try org.freedesktop.Application Activate/ActivateAction before Exec.
+    bool dbusActivatable = false;
+    // Desktop-file id (stem) used as the D-Bus well-known name; required when dbusActivatable.
+    std::string dbusAppId;
+    // Empty → Activate; otherwise ActivateAction(action_name, ...).
+    std::string desktopActionId;
   };
 
   struct PrepareOptions {

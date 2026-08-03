@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/files/file_watcher.h"
 #include "core/timer_manager.h"
 #include "scripting/plugin_ipc.h"
 #include "scripting/script_runtime.h"
@@ -28,7 +29,9 @@ namespace scripting {
   // plugin's UI entries (widgets, panels) consume it via noctalia.state.
   class PluginServiceHost {
   public:
-    PluginServiceHost(ScriptApiContext& scriptApi, HttpClient* httpClient, ClipboardService* clipboard);
+    PluginServiceHost(
+        ScriptApiContext& scriptApi, HttpClient* httpClient, ClipboardService* clipboard, FileWatcher* fileWatcher
+    );
     ~PluginServiceHost();
 
     PluginServiceHost(const PluginServiceHost&) = delete;
@@ -42,13 +45,24 @@ namespace scripting {
     // whose effective settings changed. Called on config reload.
     void refresh(const PluginSettingsMap& pluginSettings);
 
+    // Invoke the optional onEnable() callback for every service belonging to
+    // a plugin after an explicit successful enable.
+    void enablePlugin(std::string_view pluginId);
+
+    // Notify every service that the set/geometry of connected outputs changed, so a
+    // service can reconcile (e.g. relaunch a per-output child). The current output
+    // list is read via noctalia.outputs() inside the callback.
+    void onOutputChange();
+
   private:
     // A service is reachable by IPC via the `all` target (it is a singleton with no
     // output): `noctalia msg plugin <author/plugin:entry> all <event> [payload]`.
     struct Service : public PluginIpcEndpoint {
       std::string entryId;
+      std::filesystem::path sourcePath;
       std::shared_ptr<ScriptRuntime> runtime;
       ScriptRuntime::SubscriberId subscription = 0;
+      FileWatcher::WatchId watchId = 0;
       Timer updateTimer;
       int updateIntervalMs = 1000;
       ScriptSettings lastSeededSettings;
@@ -62,6 +76,9 @@ namespace scripting {
     };
 
     void armTimer(Service& service);
+    void setupScriptWatch(Service& service);
+    void teardownScriptWatch(Service& service);
+    void reloadService(Service& service);
     // Subscribe to the service's runtime (to track update-interval changes) and arm
     // its update timer. Shared by start() and refresh().
     void subscribeAndArm(Service& service);
@@ -71,7 +88,7 @@ namespace scripting {
     makeService(const std::string& entryId, const std::filesystem::path& source, ScriptSettings seeded);
     // Full teardown for removal/shutdown: unregister IPC, stop timer + runtime, and
     // mark the alive token dead so any in-flight callback is a no-op.
-    void stopService(Service& service);
+    void stopService(Service& service, ScriptExitReason exitReason = ScriptExitReason::Reload);
     // Build the effective seeded settings for an entry (manifest defaults + plugin
     // overrides). Returns nullopt if the entry no longer resolves.
     [[nodiscard]] std::optional<ScriptSettings>
@@ -80,6 +97,7 @@ namespace scripting {
     ScriptApiContext& m_scriptApi;
     HttpClient* m_httpClient = nullptr;
     ClipboardService* m_clipboard = nullptr;
+    FileWatcher* m_fileWatcher = nullptr;
     std::vector<std::unique_ptr<Service>> m_services;
   };
 

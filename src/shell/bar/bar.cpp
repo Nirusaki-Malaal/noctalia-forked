@@ -2,27 +2,26 @@
 
 #include "compositors/compositor_platform.h"
 #include "config/config_service.h"
+#include "core/deferred_call.h"
 #include "core/log.h"
+#include "core/process/process.h"
 #include "core/scoped_timer.h"
+#include "core/timer_manager.h"
 #include "core/ui_phase.h"
-#include "dbus/power/power_profiles_service.h"
-#include "dbus/tray/tray_service.h"
-#include "dbus/upower/upower_service.h"
+#include "idle/idle_inhibitor.h"
+#include "ipc/ipc_arg_parse.h"
 #include "ipc/ipc_service.h"
 #include "render/render_context.h"
 #include "render/scene/input_area.h"
+#include "shell/bar/bar_corner_shape.h"
 #include "shell/bar/bar_reserved_zone.h"
 #include "shell/bar/widget.h"
+#include "shell/bar/widget_gesture_defaults.h"
 #include "shell/bar/widgets/plugin_widget.h"
+#include "shell/bar/widgets/taskbar_widget.h"
 #include "shell/panel/panel_manager.h"
 #include "shell/surface/shadow.h"
 #include "shell/tooltip/tooltip_manager.h"
-#include "system/easyeffects_service.h"
-#include "system/gamma_service.h"
-#include "system/system_monitor_service.h"
-#include "system/weather_service.h"
-#include "theme/theme_service.h"
-#include "time/time_service.h"
 #include "ui/builders.h"
 #include "ui/palette.h"
 #include "ui/style.h"
@@ -31,22 +30,95 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <charconv>
 #include <cmath>
 #include <linux/input-event-codes.h>
 #include <optional>
 #include <ranges>
-#include <system_error>
 #include <unordered_set>
 #include <wayland-client-core.h>
+#include <wayland-client-protocol.h>
 
 namespace {
 
+  constexpr Logger kLog("bar");
+  constexpr std::chrono::milliseconds kWorkspaceRevealDebounce{80};
+  constexpr std::chrono::milliseconds kWorkspacePeekHold{450};
   constexpr std::int32_t kAutoHideTriggerPx = 3;
   constexpr float kAutoHideSlideExtraPx = 4.0f;
-  constexpr std::uint32_t kAttachedPanelResizeTestDefaultExtent = 360;
-  constexpr std::uint32_t kAttachedPanelResizeTestMaxExtent = 4096;
-  constexpr float kAttachedPanelResizeTestCycleHoldMs = 1800.0f;
+
+  [[nodiscard]] std::string activeWorkspaceId(const std::vector<Workspace>& workspaces) {
+    for (const auto& workspace : workspaces) {
+      if (workspace.active) {
+        if (!workspace.id.empty()) {
+          return workspace.id;
+        }
+        if (!workspace.name.empty()) {
+          return workspace.name;
+        }
+        return std::to_string(workspace.index);
+      }
+    }
+    return {};
+  }
+
+  [[nodiscard]] bool barConfigUsesSlideSurface(const BarConfig& cfg) noexcept { return cfg.isAutoHideEnabled(); }
+
+  [[nodiscard]] bool barSupportsSlideBehavior(const BarConfig& cfg) noexcept { return cfg.isAutoHideEnabled(); }
+
+  [[nodiscard]] bool barPointerHideAllowed(const BarInstance& instance) noexcept {
+    if (instance.barConfig.smartAutoHide) {
+      return !instance.smartAutoHidePinnedVisible;
+    }
+    return instance.barConfig.autoHide;
+  }
+
+  [[nodiscard]] bool workspaceKeyMatchesAssignment(std::string_view assignmentKey, const Workspace& workspace) {
+    if (assignmentKey.empty()) {
+      return false;
+    }
+    if (!workspace.id.empty() && assignmentKey == workspace.id) {
+      return true;
+    }
+    if (!workspace.name.empty() && assignmentKey == workspace.name) {
+      return true;
+    }
+    if (workspace.index > 0 && assignmentKey == std::to_string(workspace.index)) {
+      return true;
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool activeWorkspaceHasWindows(const CompositorPlatform& platform, wl_output* output) {
+    const auto workspaces = platform.workspaces(output);
+    const Workspace* active = nullptr;
+    for (const auto& workspace : workspaces) {
+      if (workspace.active) {
+        active = &workspace;
+        break;
+      }
+    }
+    if (active == nullptr) {
+      return false;
+    }
+
+    const auto assignments = platform.workspaceWindowAssignments(output);
+    for (const auto& assignment : assignments) {
+      if (workspaceKeyMatchesAssignment(assignment.workspaceKey, *active)) {
+        return true;
+      }
+    }
+    if (!assignments.empty()) {
+      return false;
+    }
+    return active->occupied;
+  }
+
+  [[nodiscard]] bool smartAutoHideWantsPinnedVisible(const CompositorPlatform& platform, wl_output* output) {
+    if (platform.hasOverviewState() && platform.isOverviewOpen()) {
+      return true;
+    }
+    return !activeWorkspaceHasWindows(platform, output);
+  }
 
   [[nodiscard]] FontWeight parseWidgetLabelFontWeight(const WidgetConfig& config, FontWeight fallback) {
     const auto it = config.settings.find("font_weight");
@@ -76,66 +148,10 @@ namespace {
   }
 
   [[nodiscard]] int barAutoHideEdgeGutter(const BarConfig& cfg) noexcept {
-    if (!cfg.autoHide || cfg.marginEdge <= 0) {
+    if (!barConfigUsesSlideSurface(cfg) || cfg.marginEdge <= 0) {
       return 0;
     }
     return cfg.marginEdge;
-  }
-
-  // "Concave corners": a per-corner radius < 0 marks that corner Concave, bulging
-  // outward by |value|. Only the two corners on the bar's inner edge (away from
-  // the screen) can grow into reserved surface space, so the inner bulge (and the
-  // logical inset that hosts it) is taken from those two corners and capped at
-  // thickness/2 to match the rect shader's per-corner radius clamp. With all radii
-  // >= 0 the result is byte-for-byte the previous plain rounded rect.
-  struct BarConcaveShape {
-    CornerShapes corners{};
-    Radii radii;
-    RectInsets logicalInset{};
-    float innerBulge = 0.0f; // px the surface/box grow on the inner edge
-  };
-
-  [[nodiscard]] BarConcaveShape barConcaveShape(const BarConfig& cfg) {
-    const auto shapeFor = [](std::int32_t v) { return v < 0 ? CornerShape::Concave : CornerShape::Convex; };
-    const auto mag = [](std::int32_t v) { return static_cast<float>(v < 0 ? -v : v); };
-
-    BarConcaveShape g;
-    g.corners = CornerShapes{
-        .tl = shapeFor(cfg.radiusTopLeft),
-        .tr = shapeFor(cfg.radiusTopRight),
-        .br = shapeFor(cfg.radiusBottomRight),
-        .bl = shapeFor(cfg.radiusBottomLeft),
-    };
-    g.radii =
-        Radii{mag(cfg.radiusTopLeft), mag(cfg.radiusTopRight), mag(cfg.radiusBottomRight), mag(cfg.radiusBottomLeft)};
-
-    const float cap = static_cast<float>(cfg.thickness) * 0.5f;
-    const auto innerBulge = [&](std::int32_t a, std::int32_t b) {
-      float r = 0.0f;
-      if (a < 0) {
-        r = std::max(r, mag(a));
-      }
-      if (b < 0) {
-        r = std::max(r, mag(b));
-      }
-      return std::min(r, cap);
-    };
-
-    const std::string_view pos = cfg.position;
-    if (pos == "bottom") {
-      g.innerBulge = innerBulge(cfg.radiusTopLeft, cfg.radiusTopRight);
-      g.logicalInset.top = g.innerBulge;
-    } else if (pos == "left") {
-      g.innerBulge = innerBulge(cfg.radiusTopRight, cfg.radiusBottomRight);
-      g.logicalInset.right = g.innerBulge;
-    } else if (pos == "right") {
-      g.innerBulge = innerBulge(cfg.radiusTopLeft, cfg.radiusBottomLeft);
-      g.logicalInset.left = g.innerBulge;
-    } else { // top
-      g.innerBulge = innerBulge(cfg.radiusBottomLeft, cfg.radiusBottomRight);
-      g.logicalInset.bottom = g.innerBulge;
-    }
-    return g;
   }
 
   [[nodiscard]] std::vector<InputRect>
@@ -218,21 +234,30 @@ namespace {
   Widget* widgetAtPoint(const std::vector<std::unique_ptr<Widget>>& widgets, float sceneX, float sceneY) {
     for (const auto& widgetPtr : std::views::reverse(widgets)) {
       auto* widget = widgetPtr.get();
-      if (widget == nullptr || widget->root() == nullptr || !widget->root()->visible()) {
+      if (widget == nullptr
+          || widget->isBarClickThrough()
+          || widget->outerNode() == nullptr
+          || !widget->outerNode()->visible()) {
         continue;
       }
-      if (Node::hitTest(widget->root(), sceneX, sceneY) != nullptr || pointInsideNode(widget->root(), sceneX, sceneY)) {
+      // Bounds only, never Node::hitTest: hit outsets deliberately extend a widget's clickable
+      // band past its ink (bar.cpp applies the hover pill padding that way), and treating that
+      // band as "on a widget" would carve unreachable holes out of the dead zone.
+      if (pointInsideNode(widget->outerNode(), sceneX, sceneY)) {
         return widget;
       }
     }
     for (const auto& widgetPtr : std::views::reverse(widgets)) {
       auto* widget = widgetPtr.get();
-      auto* root = widget != nullptr ? widget->root() : nullptr;
+      if (widget == nullptr || widget->isBarClickThrough()) {
+        continue;
+      }
+      auto* root = widget != nullptr ? widget->outerNode() : nullptr;
       auto* bounds = widget != nullptr ? widget->layoutBoundsNode() : nullptr;
       if (root == nullptr || bounds == nullptr || bounds == root || root->parent() != bounds || !bounds->visible()) {
         continue;
       }
-      if (Node::hitTest(bounds, sceneX, sceneY) != nullptr || pointInsideNode(bounds, sceneX, sceneY)) {
+      if (pointInsideNode(bounds, sceneX, sceneY)) {
         return widget;
       }
     }
@@ -259,14 +284,14 @@ namespace {
     const bool aBottom = (anchor & LayerShellAnchor::Bottom) != 0;
     const bool aLeft = (anchor & LayerShellAnchor::Left) != 0;
     const bool aRight = (anchor & LayerShellAnchor::Right) != 0;
-    const float mTop = static_cast<float>(surface->marginTop());
-    const float mRight = static_cast<float>(surface->marginRight());
-    const float mBottom = static_cast<float>(surface->marginBottom());
-    const float mLeft = static_cast<float>(surface->marginLeft());
-    const float surfW = static_cast<float>(surface->width());
-    const float surfH = static_cast<float>(surface->height());
-    const float outputW = static_cast<float>(outputInfo.logicalWidth);
-    const float outputH = static_cast<float>(outputInfo.logicalHeight);
+    const auto mTop = static_cast<float>(surface->marginTop());
+    const auto mRight = static_cast<float>(surface->marginRight());
+    const auto mBottom = static_cast<float>(surface->marginBottom());
+    const auto mLeft = static_cast<float>(surface->marginLeft());
+    const auto surfW = static_cast<float>(surface->width());
+    const auto surfH = static_cast<float>(surface->height());
+    const auto outputW = static_cast<float>(outputInfo.effectiveLogicalWidth());
+    const auto outputH = static_cast<float>(outputInfo.effectiveLogicalHeight());
 
     float x = 0.0f;
     float y = 0.0f;
@@ -288,6 +313,120 @@ namespace {
     return {x, y};
   }
 
+  bool isBarDeadZone(const BarInstance& instance, float sceneX, float sceneY) {
+    if (widgetAtPoint(instance, sceneX, sceneY) != nullptr) {
+      return false;
+    }
+    return pointInsideNode(instance.startSection, sceneX, sceneY)
+        || pointInsideNode(instance.centerSection, sceneX, sceneY)
+        || pointInsideNode(instance.endSection, sceneX, sceneY)
+        || pointInsideNode(instance.sceneRoot.get(), sceneX, sceneY);
+  }
+
+  // The dead zone has no widget to anchor to, so a panel action anchors at the pointer instead.
+  void openPanelAtBarPointer(
+      BarInstance& instance, float sx, float sy, CompositorPlatform* platform, std::string_view sourceBarName,
+      std::string_view panelId, std::string_view context, bool toggle
+  ) {
+    auto& panelManager = PanelManager::instance();
+    if (toggle && panelManager.isOpenPanel(std::string(panelId))) {
+      panelManager.closePanel();
+      return;
+    }
+
+    float anchorX = sx;
+    float anchorY = sy;
+    if (platform != nullptr && instance.output != nullptr) {
+      if (const auto* out = platform->findOutputByWl(instance.output); out != nullptr && out->hasUsableGeometry()) {
+        const auto [surfaceX, surfaceY] = surfaceOriginForOutputLocal(instance, *out);
+        anchorX += surfaceX;
+        anchorY += surfaceY;
+      }
+    }
+    panelManager.openPanel(
+        std::string(panelId),
+        PanelOpenRequest{
+            .output = instance.output,
+            .anchorX = anchorX,
+            .anchorY = anchorY,
+            .hasAnchorPosition = true,
+            .context = std::string(context),
+            .sourceBarName = std::string(sourceBarName),
+        }
+    );
+  }
+
+  bool dispatchBarDeadZoneGesture(
+      BarInstance& instance, noctalia::bar::Gesture gesture, float sx, float sy, CompositorPlatform* platform,
+      const noctalia::bar::WidgetActionDispatcher& dispatcher
+  ) {
+    const auto* action = instance.deadZoneBindings.find(gesture);
+    if (action == nullptr) {
+      return false;
+    }
+
+    if (action->kind == noctalia::bar::WidgetAction::Kind::Ipc && noctalia::bar::isAnchoredPanelVerb(action->verb)) {
+      const auto args = noctalia::bar::parsePanelVerbArgs(action->args);
+      if (args.panelId.empty()) {
+        kLog.error(
+            "bar.{}.dead_zone.actions.{}: \"{}\" needs a panel id", instance.barConfig.name, gestureConfigKey(gesture),
+            action->verb
+        );
+        return false;
+      }
+      openPanelAtBarPointer(
+          instance, sx, sy, platform, instance.barConfig.name, args.panelId, args.panelContext,
+          action->verb == "panel-toggle"
+      );
+      return true;
+    }
+
+    // The dispatcher reports the command and the failure itself; repeating it here would double
+    // every line on a held scroll.
+    return dispatcher.run(*action, IpcInvocationContext{.barName = instance.barConfig.name, .output = instance.output});
+  }
+
+  bool handleBarDeadZoneButton(
+      BarInstance& instance, float sx, float sy, std::uint32_t button, CompositorPlatform* platform,
+      const noctalia::bar::WidgetActionDispatcher& dispatcher
+  ) {
+    if (!isBarDeadZone(instance, sx, sy)) {
+      return false;
+    }
+    const auto gesture = noctalia::bar::gestureForButton(button);
+    if (!gesture.has_value()) {
+      return false;
+    }
+    return dispatchBarDeadZoneGesture(instance, *gesture, sx, sy, platform, dispatcher);
+  }
+
+  bool handleBarDeadZoneAxis(
+      BarInstance& instance, float sx, float sy, const PointerEvent& event, CompositorPlatform* platform,
+      const noctalia::bar::WidgetActionDispatcher& dispatcher
+  ) {
+    if (!isBarDeadZone(instance, sx, sy)) {
+      return false;
+    }
+
+    // Routed through a scene-less InputArea for detent accumulation. Cycle actions fire once per
+    // gesture; other actions fire for every step, matching a widget's `scroll_repeat = "auto"`.
+    instance.deadZoneAxisSink.setOnAxisHandler([&](const InputArea::PointerData& data) {
+      const auto gesture = noctalia::bar::gestureForScroll(data.axis, data.scrollSteps());
+      if (!gesture.has_value()) {
+        return false;
+      }
+      const auto* action = instance.deadZoneBindings.find(*gesture);
+      if (!data.scrollStepStartsGesture() && action != nullptr && dispatcher.cycles(*action)) {
+        return true;
+      }
+      return dispatchBarDeadZoneGesture(instance, *gesture, sx, sy, platform, dispatcher);
+    });
+    return instance.deadZoneAxisSink.dispatchAxis(
+        sx, sy, event.axis, event.axisSource, event.axisValue, event.axisDiscrete, event.axisValue120, event.axisLines,
+        event.axisGestureSerial
+    );
+  }
+
   std::uint32_t positionToAnchor(const std::string& position) {
     if (position == "bottom") {
       return LayerShellAnchor::Bottom | LayerShellAnchor::Left | LayerShellAnchor::Right;
@@ -302,12 +441,149 @@ namespace {
     return LayerShellAnchor::Top | LayerShellAnchor::Left | LayerShellAnchor::Right;
   }
 
-  constexpr Logger kLog("bar");
-
   ColorSpec withOpacity(const ColorSpec& color, float opacity) {
     ColorSpec out = color;
     out.alpha = std::clamp(out.alpha * std::clamp(opacity, 0.0f, 1.0f), 0.0f, 1.0f);
     return out;
+  }
+
+  // Hover highlight: peak fill alpha of the widget-foreground tint, and the cross-axis inset
+  // (logical px, content-scaled) of per-member pills inside capsule groups.
+  constexpr float kWidgetHoverFillAlpha = 0.1f;
+  constexpr float kGroupHoverCrossInset = 2.0f;
+
+  // Sizes a run's hover overlays after the capsule geometry is final. Single runs (and plain
+  // widgets) get one overlay covering the whole shell; group runs get one pill per member so
+  // only the hovered member lights up.
+  void placeCapsuleHoverBoxes(
+      BarCapsuleRun& run, bool isVertical, float shellW, float shellH, float contentX, float contentY,
+      float capsuleRadius, float widgetHoverPadding
+  ) {
+    if (run.hoverBoxes.empty()) {
+      return;
+    }
+    if (run.container == nullptr) {
+      Box* box = run.hoverBoxes.front();
+      if (box == nullptr) {
+        return;
+      }
+      box->setPosition(0.0f, 0.0f);
+      box->setSize(shellW, shellH);
+      box->setRadius(capsuleRadius);
+      return;
+    }
+    const float scale = run.contentScale;
+    const float crossInset = kGroupHoverCrossInset * scale;
+    // Use the normal per-widget inset, independent of the shared capsule's configurable
+    // padding, so grouped and standalone widgets receive the same hover treatment.
+    const float mainInset = widgetHoverPadding * scale;
+    const float shellMain = isVertical ? shellH : shellW;
+    const float shellCross = isVertical ? shellW : shellH;
+    const float contentMain = isVertical ? contentY : contentX;
+    const float crossExtent = std::max(0.0f, shellCross - 2.0f * crossInset);
+    for (std::size_t i = 0; i < run.widgets.size() && i < run.hoverBoxes.size(); ++i) {
+      // outerNode(), not root(): the outer gesture area is what the run container lays out, so it
+      // carries the member's position; root() sits at (0,0) inside it.
+      Node* member = run.widgets[i] != nullptr ? run.widgets[i]->outerNode() : nullptr;
+      Box* box = run.hoverBoxes[i];
+      if (member == nullptr || box == nullptr) {
+        continue;
+      }
+      // Skip hidden members — Flex leaves them at stale (0,0) geometry.
+      if (!member->visible() || !member->participatesInLayout()) {
+        box->setSize(0.0f, 0.0f);
+        continue;
+      }
+      const float rootStart = contentMain + (isVertical ? member->y() : member->x());
+      const float rootExtent = isVertical ? member->height() : member->width();
+      const float mainStart = std::max(0.0f, rootStart - mainInset);
+      const float mainExtent = std::max(0.0f, std::min(shellMain, rootStart + rootExtent + mainInset) - mainStart);
+      if (isVertical) {
+        box->setPosition(crossInset, mainStart);
+        box->setSize(crossExtent, mainExtent);
+      } else {
+        box->setPosition(mainStart, crossInset);
+        box->setSize(mainExtent, crossExtent);
+      }
+      const float pillRadius = std::max(0.0f, std::min(box->width(), box->height()) * 0.5f);
+      box->setRadius(std::min(pillRadius, std::max(0.0f, capsuleRadius - crossInset)));
+    }
+  }
+
+  // Extends each member's hit target across the capsule padding and half the gap to its
+  // neighbors, so hover/click coverage matches the capsule ink instead of stopping at the
+  // content edge. Runs after applyBarWidgetHitTargets (which replaces outsets each layout).
+  void extendCapsuleHitTargets(std::vector<BarCapsuleRun>& runs, bool isVertical) {
+    for (auto& run : runs) {
+      if (run.shell == nullptr || run.hoverBoxes.empty()) {
+        continue;
+      }
+
+      // Single runs (capsule or ghost pill): the hover overlay rect is the hit region.
+      if (run.container == nullptr) {
+        Widget* widget = !run.widgets.empty() ? run.widgets.front() : nullptr;
+        Box* box = run.hoverBoxes.front();
+        auto* area = widget != nullptr ? widget->outerNode() : nullptr;
+        if (area == nullptr || box == nullptr || !area->visible() || !area->participatesInLayout()) {
+          continue;
+        }
+        const float areaStart = isVertical ? area->y() : area->x();
+        const float areaEnd = areaStart + (isVertical ? area->height() : area->width());
+        const float boxStart = isVertical ? box->y() : box->x();
+        const float boxEnd = boxStart + (isVertical ? box->height() : box->width());
+        auto outset = area->hitTestOutset();
+        if (isVertical) {
+          outset.top += std::max(0.0f, areaStart - boxStart);
+          outset.bottom += std::max(0.0f, boxEnd - areaEnd);
+        } else {
+          outset.left += std::max(0.0f, areaStart - boxStart);
+          outset.right += std::max(0.0f, boxEnd - areaEnd);
+        }
+        area->setHitTestOutset(outset);
+        continue;
+      }
+
+      // Tile only laid-out members; hidden ones keep stale geometry.
+      std::vector<std::size_t> laidOut;
+      laidOut.reserve(run.widgets.size());
+      for (std::size_t i = 0; i < run.widgets.size(); ++i) {
+        Widget* widget = run.widgets[i];
+        auto* root = widget != nullptr ? widget->outerNode() : nullptr;
+        if (root == nullptr || !root->visible() || !root->participatesInLayout()) {
+          continue;
+        }
+        laidOut.push_back(i);
+      }
+
+      const float shellMain = isVertical ? run.shell->height() : run.shell->width();
+      const float containerMain = isVertical ? run.container->y() : run.container->x();
+      auto memberStart = [&](std::size_t i) {
+        const Node* node = run.widgets[i]->outerNode();
+        return containerMain + (isVertical ? node->y() : node->x());
+      };
+      auto memberEnd = [&](std::size_t i) {
+        const Node* node = run.widgets[i]->outerNode();
+        return memberStart(i) + (isVertical ? node->height() : node->width());
+      };
+      for (std::size_t vi = 0; vi < laidOut.size(); ++vi) {
+        const std::size_t i = laidOut[vi];
+        Node* area = run.widgets[i]->outerNode();
+        const float sliceStart = vi > 0 ? (memberEnd(laidOut[vi - 1]) + memberStart(i)) * 0.5f : 0.0f;
+        const float sliceEnd =
+            vi + 1 < laidOut.size() ? (memberEnd(i) + memberStart(laidOut[vi + 1])) * 0.5f : shellMain;
+        auto outset = area->hitTestOutset();
+        const float before = std::max(0.0f, memberStart(i) - sliceStart);
+        const float after = std::max(0.0f, sliceEnd - memberEnd(i));
+        if (isVertical) {
+          outset.top += before;
+          outset.bottom += after;
+        } else {
+          outset.left += before;
+          outset.right += after;
+        }
+        area->setHitTestOutset(outset);
+      }
+    }
   }
 
   struct BarVisualGeometry {
@@ -336,14 +612,21 @@ namespace {
     const std::int32_t mEdge = barConfig.marginEdge;
     const auto sb = shell::surface_shadow::bleed(barConfig.shadow, shadowConfig);
     const int edgeGutter = barAutoHideEdgeGutter(barConfig);
+    const auto concave = barConcaveShape(barConfig);
+    const int insetL = static_cast<int>(std::ceil(std::max(0.0f, concave.logicalInset.left)));
+    const int insetT = static_cast<int>(std::ceil(std::max(0.0f, concave.logicalInset.top)));
+    const int insetR = static_cast<int>(std::ceil(std::max(0.0f, concave.logicalInset.right)));
+    const int insetB = static_cast<int>(std::ceil(std::max(0.0f, concave.logicalInset.bottom)));
     // Reserve room for a concave-corner spike on the inner edge (opaque bar material),
     // in addition to the shadow bleed that renders beyond the spike tips.
-    const int concaveBulge = static_cast<int>(std::lround(barConcaveShape(barConfig).innerBulge));
+    const int concaveBulge = static_cast<int>(std::lround(concave.innerBulge));
+
+    const std::int32_t edgeMargin = barEdgeLayerMargin(barConfig, shadowConfig);
 
     BarSurfaceSpec spec;
     if (!vertical) {
-      spec.marginLeft = std::max(0, mEnds - sb.left);
-      spec.marginRight = std::max(0, mEnds - sb.right);
+      spec.marginLeft = std::max(0, mEnds - sb.left - insetL);
+      spec.marginRight = std::max(0, mEnds - sb.right - insetR);
       if (isBottom) {
         if (edgeGutter > 0) {
           // Surface reaches the screen edge (no layer margin); the margin is folded
@@ -351,7 +634,7 @@ namespace {
           // bleed here — it lives inside the gutter, not beyond it.
           spec.surfaceHeight = static_cast<std::uint32_t>(sb.up + concaveBulge + barConfig.thickness + edgeGutter);
         } else {
-          spec.marginBottom = std::max(0, mEdge - sb.down);
+          spec.marginBottom = edgeMargin;
           spec.surfaceHeight =
               static_cast<std::uint32_t>(sb.up + concaveBulge + barConfig.thickness + std::min(mEdge, sb.down));
         }
@@ -359,19 +642,19 @@ namespace {
         if (edgeGutter > 0) {
           spec.surfaceHeight = static_cast<std::uint32_t>(sb.down + concaveBulge + barConfig.thickness + edgeGutter);
         } else {
-          spec.marginTop = std::max(0, mEdge - sb.up);
+          spec.marginTop = edgeMargin;
           spec.surfaceHeight =
               static_cast<std::uint32_t>(std::min(mEdge, sb.up) + barConfig.thickness + sb.down + concaveBulge);
         }
       }
     } else {
-      spec.marginTop = std::max(0, mEnds - sb.up);
-      spec.marginBottom = std::max(0, mEnds - sb.down);
+      spec.marginTop = std::max(0, mEnds - sb.up - insetT);
+      spec.marginBottom = std::max(0, mEnds - sb.down - insetB);
       if (isRight) {
         if (edgeGutter > 0) {
           spec.surfaceWidth = static_cast<std::uint32_t>(sb.left + concaveBulge + barConfig.thickness + edgeGutter);
         } else {
-          spec.marginRight = std::max(0, mEdge - sb.right);
+          spec.marginRight = edgeMargin;
           spec.surfaceWidth =
               static_cast<std::uint32_t>(sb.left + concaveBulge + barConfig.thickness + std::min(mEdge, sb.right));
         }
@@ -379,7 +662,7 @@ namespace {
         if (edgeGutter > 0) {
           spec.surfaceWidth = static_cast<std::uint32_t>(sb.right + concaveBulge + barConfig.thickness + edgeGutter);
         } else {
-          spec.marginLeft = std::max(0, mEdge - sb.left);
+          spec.marginLeft = edgeMargin;
           spec.surfaceWidth =
               static_cast<std::uint32_t>(std::min(mEdge, sb.left) + barConfig.thickness + sb.right + concaveBulge);
         }
@@ -396,7 +679,7 @@ namespace {
     const auto base = computeBarSurfaceSpec(cfg, shadow);
     const bool isVertical = (cfg.position == "left" || cfg.position == "right");
     const float current = isVertical ? surfaceWidth : surfaceHeight;
-    const float normal = static_cast<float>(isVertical ? base.surfaceWidth : base.surfaceHeight);
+    const auto normal = static_cast<float>(isVertical ? base.surfaceWidth : base.surfaceHeight);
     return std::max(0.0f, current - normal);
   }
 
@@ -415,6 +698,7 @@ namespace {
         && a.position == b.position
         && a.enabled == b.enabled
         && a.autoHide == b.autoHide
+        && a.smartAutoHide == b.smartAutoHide
         && a.reserveSpace == b.reserveSpace
         && a.layer == b.layer
         && a.thickness == b.thickness
@@ -423,6 +707,7 @@ namespace {
         && a.radiusTopRight == b.radiusTopRight
         && a.radiusBottomLeft == b.radiusBottomLeft
         && a.radiusBottomRight == b.radiusBottomRight
+        && a.concaveEdgeCorners == b.concaveEdgeCorners
         && a.marginEnds == b.marginEnds
         && a.marginEdge == b.marginEdge
         && a.shadow == b.shadow
@@ -455,26 +740,31 @@ namespace {
       const BarConfig& cfg, const ShellConfig::ShadowConfig& shadow, float surfaceWidth, float surfaceHeight,
       float innerSurfaceExtension = 0.0f
   ) {
-    const float barThickness = static_cast<float>(cfg.thickness);
-    const float marginEnds = static_cast<float>(cfg.marginEnds);
-    const float marginEdge = static_cast<float>(cfg.marginEdge);
+    const auto barThickness = static_cast<float>(cfg.thickness);
+    const auto marginEnds = static_cast<float>(cfg.marginEnds);
+    const auto marginEdge = static_cast<float>(cfg.marginEdge);
     const bool isBottom = cfg.position == "bottom";
     const bool isRight = cfg.position == "right";
     const bool isVertical = (cfg.position == "left" || cfg.position == "right");
     const auto sbi = shell::surface_shadow::bleed(cfg.shadow, shadow);
-    const float bleedLeft = static_cast<float>(sbi.left);
-    const float bleedRight = static_cast<float>(sbi.right);
-    const float bleedUp = static_cast<float>(sbi.up);
-    const float bleedDown = static_cast<float>(sbi.down);
+    const auto concave = barConcaveShape(cfg);
+    const float insetL = std::ceil(std::max(0.0f, concave.logicalInset.left));
+    const float insetT = std::ceil(std::max(0.0f, concave.logicalInset.top));
+    const float insetR = std::ceil(std::max(0.0f, concave.logicalInset.right));
+    const float insetB = std::ceil(std::max(0.0f, concave.logicalInset.bottom));
+    const auto bleedLeft = static_cast<float>(sbi.left);
+    const auto bleedRight = static_cast<float>(sbi.right);
+    const auto bleedUp = static_cast<float>(sbi.up);
+    const auto bleedDown = static_cast<float>(sbi.down);
     // For bottom/right bars the inner edge is the origin side, so the concave spike
     // pushes the body inward by its bulge. Top/left bars grow away from the origin
     // and need no body shift. Gutter (auto-hide) placements derive from the surface
     // size, which already includes the bulge, so they shift automatically.
-    const float concaveBulge = barConcaveShape(cfg).innerBulge;
+    const float concaveBulge = concave.innerBulge;
 
     if (isVertical) {
       // Vertical bar: edge gap is left/right, ends inset is top/bottom.
-      const float y = std::min(marginEnds, bleedUp);
+      const float y = std::min(marginEnds, bleedUp) + insetT;
       float x = isRight ? (bleedLeft + concaveBulge) : std::min(marginEdge, bleedLeft);
       if (const int gutter = barAutoHideEdgeGutter(cfg); gutter > 0) {
         // The gutter equals marginEdge and sits between the screen edge and the bar.
@@ -492,12 +782,12 @@ namespace {
           .x = x,
           .y = y,
           .width = barThickness,
-          .height = surfaceHeight - y - std::min(marginEnds, bleedDown),
+          .height = surfaceHeight - y - std::min(marginEnds, bleedDown) - insetB,
       };
     }
 
     // Horizontal bar: edge gap is top/bottom, ends inset is left/right.
-    const float x = std::min(marginEnds, bleedLeft);
+    const float x = std::min(marginEnds, bleedLeft) + insetL;
     float y = isBottom ? (bleedUp + concaveBulge) : std::min(marginEdge, bleedUp);
     if (const int gutter = barAutoHideEdgeGutter(cfg); gutter > 0) {
       if (isBottom) {
@@ -511,7 +801,7 @@ namespace {
     return {
         .x = x,
         .y = y,
-        .width = surfaceWidth - x - std::min(marginEnds, bleedRight),
+        .width = surfaceWidth - x - std::min(marginEnds, bleedRight) - insetR,
         .height = barThickness,
     };
   }
@@ -527,30 +817,6 @@ namespace {
         static_cast<int>(barVisual.x), static_cast<int>(barVisual.y), static_cast<int>(barVisual.width),
         static_cast<int>(barVisual.height)
     };
-  }
-
-  [[nodiscard]] std::optional<InputRect>
-  attachedPanelResizeTestRect(const BarConfig& cfg, const ShellConfig::ShadowConfig& shadow, int surfW, int surfH) {
-    const auto base = computeBarSurfaceSpec(cfg, shadow);
-    if (surfW <= 0 || surfH <= 0) {
-      return std::nullopt;
-    }
-
-    if (cfg.position == "left" || cfg.position == "right") {
-      const int baseW = static_cast<int>(base.surfaceWidth);
-      const int extraW = surfW - baseW;
-      if (extraW <= 0) {
-        return std::nullopt;
-      }
-      return InputRect{cfg.position == "right" ? 0 : baseW, 0, extraW, surfH};
-    }
-
-    const int baseH = static_cast<int>(base.surfaceHeight);
-    const int extraH = surfH - baseH;
-    if (extraH <= 0) {
-      return std::nullopt;
-    }
-    return InputRect{0, cfg.position == "bottom" ? 0 : baseH, surfW, extraH};
   }
 
   std::pair<float, float> computeAutoHideHiddenDelta(
@@ -661,7 +927,8 @@ namespace {
     // Capsule cross-size is a fraction of the bar thickness (capsule_thickness), the same for every capsule
     // regardless of per-widget content scale. The max() guard keeps a thin bar from yielding a 0px capsule.
     const float capsuleCross = std::max(1.0f, std::round(slotCross * instance.barConfig.capsuleThickness));
-    auto finalizeCapsules = [isVertical, capsuleCross, &renderer](std::vector<BarCapsuleRun>& runs) {
+    auto finalizeCapsules = [isVertical, capsuleCross, widgetHoverPadding = instance.barConfig.widgetCapsulePadding,
+                             &renderer](std::vector<BarCapsuleRun>& runs) {
       for (auto& run : runs) {
         Node* shell = run.shell;
         Box* bg = run.bg;
@@ -693,6 +960,7 @@ namespace {
           bg->setVisible(false);
           bg->setPosition(0.0f, 0.0f);
           bg->setSize(iw, ih);
+          placeCapsuleHoverBoxes(run, isVertical, iw, ih, 0.0f, 0.0f, std::min(iw, ih) * 0.5f, widgetHoverPadding);
           continue;
         }
         const float pad = run.spec.padding * scale;
@@ -706,18 +974,18 @@ namespace {
         const float shellCross = capsuleCross;
         const float shellW = isVertical ? shellCross : shellMain;
         const float shellH = isVertical ? shellMain : shellCross;
-        const float contentX = std::round((shellW - iw) * 0.5f);
-        const float contentY = std::round((shellH - ih) * 0.5f);
+        const float contentX = (shellW - iw) * 0.5f;
+        const float contentY = (shellH - ih) * 0.5f;
         shell->setSize(shellW, shellH);
         bg->setVisible(true);
         bg->setPosition(0.0f, 0.0f);
         bg->setSize(shellW, shellH);
         content->setPosition(contentX, contentY);
         const Widget* radiusSource = !run.widgets.empty() ? run.widgets.front() : nullptr;
-        bg->setRadius(
-            radiusSource != nullptr ? radiusSource->resolvedBarCapsuleRadius(shellW, shellH)
-                                    : std::max(0.0f, std::min(shellW, shellH) * 0.5f)
-        );
+        const float capsuleRadius = radiusSource != nullptr ? radiusSource->resolvedBarCapsuleRadius(shellW, shellH)
+                                                            : std::max(0.0f, std::min(shellW, shellH) * 0.5f);
+        bg->setRadius(capsuleRadius);
+        placeCapsuleHoverBoxes(run, isVertical, shellW, shellH, contentX, contentY, capsuleRadius, widgetHoverPadding);
       }
     };
     finalizeCapsules(instance.startCapsuleRuns);
@@ -839,6 +1107,61 @@ namespace {
     applyBarWidgetHitTargets(instance.startSection, instance.startSlot, isVertical);
     applyBarWidgetHitTargets(instance.centerSection, instance.centerSlot, isVertical);
     applyBarWidgetHitTargets(instance.endSection, instance.endSlot, isVertical);
+    extendCapsuleHitTargets(instance.startCapsuleRuns, isVertical);
+    extendCapsuleHitTargets(instance.centerCapsuleRuns, isVertical);
+    extendCapsuleHitTargets(instance.endCapsuleRuns, isVertical);
+
+    // Ghost pills for capsule-less widgets: positioned on the bar-level underlay with the
+    // metrics an enabled capsule would have (capsuleCross across the bar, capsule padding
+    // along it). Runs after sections are positioned so absolute coordinates are final; the
+    // widget's hit target is widened to match the pill.
+    if (instance.hoverUnderlay != nullptr) {
+      float underlayX = 0.0f;
+      float underlayY = 0.0f;
+      Node::absolutePosition(instance.hoverUnderlay, underlayX, underlayY);
+      auto placeGhostPills = [&](std::vector<std::unique_ptr<Widget>>& widgets) {
+        for (auto& widget : widgets) {
+          Box* box = widget->barHoverBox();
+          Node* root = widget->outerNode();
+          if (box == nullptr || root == nullptr || widget->barCapsuleShell() != nullptr) {
+            continue;
+          }
+          if (!root->visible() || !root->participatesInLayout()) {
+            box->setSize(0.0f, 0.0f);
+            continue;
+          }
+          float rootX = 0.0f;
+          float rootY = 0.0f;
+          Node::absolutePosition(root, rootX, rootY);
+          rootX -= underlayX;
+          rootY -= underlayY;
+          const float mainExtent = isVertical ? root->height() : root->width();
+          const float pad = mainExtent > 0.5f ? widget->barCapsuleSpec().padding * widget->contentScale() : 0.0f;
+          const float hoverW = isVertical ? capsuleCross : root->width() + 2.0f * pad;
+          const float hoverH = isVertical ? root->height() + 2.0f * pad : capsuleCross;
+          box->setPosition(
+              isVertical ? rootX + (root->width() - capsuleCross) * 0.5f : rootX - pad,
+              isVertical ? rootY - pad : rootY + (root->height() - capsuleCross) * 0.5f
+          );
+          box->setSize(hoverW, hoverH);
+          box->setRadius(widget->resolvedBarCapsuleRadius(hoverW, hoverH));
+          if (auto* area = dynamic_cast<InputArea*>(root)) {
+            auto outset = area->hitTestOutset();
+            if (isVertical) {
+              outset.top += pad;
+              outset.bottom += pad;
+            } else {
+              outset.left += pad;
+              outset.right += pad;
+            }
+            area->setHitTestOutset(outset);
+          }
+        }
+      };
+      placeGhostPills(instance.startWidgets);
+      placeGhostPills(instance.centerWidgets);
+      placeGhostPills(instance.endWidgets);
+    }
     if (screenEdgeClick) {
       if (!instance.startSection->children().empty()) {
         auto node = instance.startSection->children().front().get();
@@ -881,50 +1204,34 @@ namespace {
 
 Bar::Bar() = default;
 
-bool Bar::initialize(
-    CompositorPlatform& platform, ConfigService* config, TimeService* timeService, NotificationManager* notifications,
-    TrayService* tray, PipeWireService* audio, EasyEffectsService* easyEffects, UPowerService* upower,
-    SystemMonitorService* sysmon, PowerProfilesService* powerProfiles, INetworkService* network,
-    IdleInhibitor* idleInhibitor, MprisService* mpris, PipeWireSpectrum* audioSpectrum, HttpClient* httpClient,
-    WeatherService* weatherService, RenderContext* renderContext, GammaService* nightLight,
-    noctalia::theme::ThemeService* themeService, BluetoothService* bluetooth, BrightnessService* brightness,
-    LockKeysService* lockKeys, ClipboardService* clipboard, FileWatcher* fileWatcher, ScreenshotService* screenshots,
-    scripting::ScriptApiContext* scriptApi
-) {
-  m_platform = &platform;
-  m_config = config;
-  m_notifications = notifications;
-  m_tray = tray;
-  m_audio = audio;
-  m_easyEffects = easyEffects;
-  m_upower = upower;
-  m_sysmon = sysmon;
-  m_powerProfiles = powerProfiles;
-  m_network = network;
-  m_idleInhibitor = idleInhibitor;
-  m_mpris = mpris;
-  m_audioSpectrum = audioSpectrum;
-  m_httpClient = httpClient;
-  m_weatherService = weatherService;
-  m_renderContext = renderContext;
-  m_nightLight = nightLight;
-  m_themeService = themeService;
-  m_bluetooth = bluetooth;
-  m_brightness = brightness;
-  m_lockKeys = lockKeys;
-  m_clipboard = clipboard;
-  m_fileWatcher = fileWatcher;
-  m_screenshots = screenshots;
-  m_scriptApi = scriptApi;
+bool Bar::initialize(const BarServices& services) {
+  m_platform = &services.platform;
+  m_config = &services.config;
+  m_notifications = services.notifications;
+  m_tray = services.tray;
+  m_audio = services.audio;
+  m_easyEffects = services.easyEffects;
+  m_upower = services.upower;
+  m_sysmon = services.sysmon;
+  m_powerProfiles = services.powerProfiles;
+  m_network = services.network;
+  m_idleInhibitor = services.idleInhibitor;
+  m_mpris = services.mpris;
+  m_audioSpectrum = services.audioSpectrum;
+  m_httpClient = services.httpClient;
+  m_weatherService = services.weather;
+  m_renderContext = services.renderContext;
+  m_nightLight = services.nightLight;
+  m_themeService = services.theme;
+  m_bluetooth = services.bluetooth;
+  m_brightness = services.brightness;
+  m_lockKeys = services.lockKeys;
+  m_clipboard = services.clipboard;
+  m_fileWatcher = services.fileWatcher;
+  m_screenshots = services.screenshots;
+  m_scriptApi = services.scriptApi;
 
-  m_widgetFactory = std::make_unique<WidgetFactory>(
-      *m_platform, *m_config, m_notifications, m_tray, m_audio, easyEffects, m_upower, m_sysmon, m_powerProfiles,
-      m_network, m_idleInhibitor, m_mpris, m_audioSpectrum, m_httpClient, m_weatherService, m_nightLight,
-      m_themeService, m_bluetooth, m_brightness, m_lockKeys, m_clipboard, m_fileWatcher, m_screenshots, m_renderContext,
-      m_scriptApi
-  );
-
-  (void)timeService;
+  m_widgetFactory = std::make_unique<WidgetFactory>(services);
 
   m_lastBars = m_config->config().bars;
   m_lastWidgets = m_config->config().widgets;
@@ -944,8 +1251,37 @@ bool Bar::initialize(
       "bar"
   );
 
-  syncInstances();
   return true;
+}
+
+BarServices Bar::services() const {
+  return {
+      .platform = *m_platform,
+      .config = *m_config,
+      .notifications = m_notifications,
+      .tray = m_tray,
+      .audio = m_audio,
+      .easyEffects = m_easyEffects,
+      .upower = m_upower,
+      .sysmon = m_sysmon,
+      .powerProfiles = m_powerProfiles,
+      .network = m_network,
+      .idleInhibitor = m_idleInhibitor,
+      .mpris = m_mpris,
+      .audioSpectrum = m_audioSpectrum,
+      .httpClient = m_httpClient,
+      .weather = m_weatherService,
+      .renderContext = m_renderContext,
+      .nightLight = m_nightLight,
+      .theme = m_themeService,
+      .bluetooth = m_bluetooth,
+      .brightness = m_brightness,
+      .lockKeys = m_lockKeys,
+      .clipboard = m_clipboard,
+      .fileWatcher = m_fileWatcher,
+      .screenshots = m_screenshots,
+      .scriptApi = m_scriptApi,
+  };
 }
 
 void Bar::onSecondTick() {
@@ -966,12 +1302,7 @@ void Bar::reload() {
   m_lastWidgets = m_config->config().widgets;
   m_lastShadow = m_config->config().shell.shadow;
   m_lastPlugins = m_config->config().plugins;
-  m_widgetFactory = std::make_unique<WidgetFactory>(
-      *m_platform, *m_config, m_notifications, m_tray, m_audio, m_easyEffects, m_upower, m_sysmon, m_powerProfiles,
-      m_network, m_idleInhibitor, m_mpris, m_audioSpectrum, m_httpClient, m_weatherService, m_nightLight,
-      m_themeService, m_bluetooth, m_brightness, m_lockKeys, m_clipboard, m_fileWatcher, m_screenshots, m_renderContext,
-      m_scriptApi
-  );
+  m_widgetFactory = std::make_unique<WidgetFactory>(services());
 
   if (recreateForOrder) {
     kLog.info("bar order changed; recreating layer-shell surfaces");
@@ -1089,6 +1420,144 @@ void Bar::closeAllInstances() {
 
 void Bar::onOutputChange() { syncInstances(); }
 
+void Bar::onWorkspaceChanged() {
+  if (m_platform == nullptr || m_overlayDisplaySuppressed) {
+    return;
+  }
+
+  bool anyChanged = false;
+  for (const auto& output : m_platform->outputs()) {
+    const std::string activeId = activeWorkspaceId(m_platform->workspaces(output.output));
+    if (activeId.empty()) {
+      continue;
+    }
+
+    auto& last = m_lastActiveWorkspaceByOutput[output.name];
+    if (!last.empty() && last != activeId) {
+      m_pendingWorkspaceRevealOutputs.insert(output.name);
+      anyChanged = true;
+    }
+    last = activeId;
+  }
+
+  if (anyChanged) {
+    m_workspaceRevealDebounce.start(kWorkspaceRevealDebounce, [this]() { applyPendingWorkspaceReveal(); });
+  }
+  scheduleSmartAutoHideReevaluation();
+}
+
+void Bar::scheduleSmartAutoHideReevaluation() {
+  if (m_smartAutoHideReevalQueued) {
+    return;
+  }
+  m_smartAutoHideReevalQueued = true;
+  DeferredCall::callLater([this]() {
+    m_smartAutoHideReevalQueued = false;
+    reevaluateSmartAutoHide();
+  });
+}
+
+void Bar::reevaluateSmartAutoHide() {
+  if (m_platform == nullptr || m_overlayDisplaySuppressed) {
+    return;
+  }
+
+  for (const auto& instanceUp : m_instances) {
+    BarInstance* instance = instanceUp.get();
+    if (instance == nullptr
+        || !instance->barConfig.enabled
+        || !instance->barConfig.smartAutoHide
+        || instance->surface == nullptr) {
+      continue;
+    }
+
+    const bool wantsPinned = smartAutoHideWantsPinnedVisible(*m_platform, instance->output);
+    const bool pinnedChanged = wantsPinned != instance->smartAutoHidePinnedVisible;
+    instance->smartAutoHidePinnedVisible = wantsPinned;
+
+    const bool suppressAutoHide =
+        (m_autoHideSuppressionCallback != nullptr) ? m_autoHideSuppressionCallback(*instance) : false;
+
+    bool needsRedraw = pinnedChanged;
+    if (wantsPinned) {
+      if (instance->hideOpacity < 1.0f || pinnedChanged) {
+        revealAutoHideBar(*instance);
+        syncBarAutoHideInputRegion(*instance);
+        syncBarSurfaceChrome(*instance);
+        needsRedraw = true;
+      }
+    } else if (!instance->pointerInside && instance->attachedPopupCount == 0 && !suppressAutoHide) {
+      if ((instance->hideOpacity > 0.0f || pinnedChanged) && !isWorkspacePeekActive()) {
+        startHideFadeOut(*instance);
+        needsRedraw = true;
+      }
+    }
+
+    if (needsRedraw && instance->surface != nullptr) {
+      instance->surface->requestRedraw();
+    }
+  }
+}
+
+bool Bar::isWorkspacePeekActive() const noexcept {
+  return m_workspaceRevealDebounce.active() || m_workspacePeekHideTimer.active();
+}
+
+void Bar::applyPendingWorkspaceReveal() {
+  if (m_platform == nullptr) {
+    return;
+  }
+
+  const auto pendingOutputs = std::move(m_pendingWorkspaceRevealOutputs);
+  m_pendingWorkspaceRevealOutputs.clear();
+
+  std::vector<BarInstance*> peeked;
+  peeked.reserve(m_instances.size());
+  for (const std::uint32_t outputName : pendingOutputs) {
+    for (const auto& instanceUp : m_instances) {
+      auto* instance = instanceUp.get();
+      if (instance == nullptr
+          || instance->outputName != outputName
+          || !instance->barConfig.enabled
+          || !instance->barConfig.isAutoHideEnabled()
+          || !instance->barConfig.showOnWorkspaceSwitch
+          || instance->surface == nullptr) {
+        continue;
+      }
+
+      revealAutoHideBar(*instance);
+      if (instance->pointerInside) {
+        continue;
+      }
+      const bool suppressAutoHide =
+          (m_autoHideSuppressionCallback != nullptr) ? m_autoHideSuppressionCallback(*instance) : false;
+      if (!suppressAutoHide) {
+        peeked.push_back(instance);
+      }
+    }
+  }
+
+  if (peeked.empty()) {
+    return;
+  }
+
+  m_workspacePeekHideTimer.start(kWorkspacePeekHold, [this, peeked = std::move(peeked)]() {
+    for (BarInstance* instance : peeked) {
+      if (instance == nullptr || !instance->barConfig.isAutoHideEnabled() || instance->pointerInside) {
+        continue;
+      }
+      if (instance->barConfig.smartAutoHide && instance->smartAutoHidePinnedVisible) {
+        continue;
+      }
+      const bool suppressAutoHide =
+          (m_autoHideSuppressionCallback != nullptr) ? m_autoHideSuppressionCallback(*instance) : false;
+      if (!suppressAutoHide) {
+        startHideFadeOut(*instance);
+      }
+    }
+  });
+}
+
 void Bar::refresh() {
   for (auto& inst : m_instances) {
     if (inst->surface != nullptr) {
@@ -1123,7 +1592,7 @@ void Bar::setAutoHideSuppressionCallback(std::function<bool(const BarInstance&)>
 void Bar::reevaluateAutoHide() {
   for (const auto& instance : m_instances) {
     if (instance == nullptr
-        || !instance->barConfig.autoHide
+        || !barPointerHideAllowed(*instance)
         || instance->pointerInside
         || instance->attachedPopupCount > 0) {
       continue;
@@ -1137,8 +1606,32 @@ void Bar::reevaluateAutoHide() {
   }
 }
 
-void Bar::setOpenWidgetSettingsCallback(std::function<void(std::string, std::string)> callback) {
-  m_openWidgetSettingsCallback = std::move(callback);
+void Bar::reevaluateAutoHideAfterPopup() {
+  for (const auto& instance : m_instances) {
+    if (instance == nullptr || instance->surface == nullptr) {
+      continue;
+    }
+    wl_surface* const surface = instance->surface->wlSurface();
+    instance->pointerInside = m_platform != nullptr
+        && surface != nullptr
+        && m_platform->hasPointerPosition()
+        && m_platform->lastPointerSurface() == surface;
+    if (instance->pointerInside) {
+      instance->lastPointerSx = static_cast<float>(m_platform->lastPointerX());
+      instance->lastPointerSy = static_cast<float>(m_platform->lastPointerY());
+      instance->inputDispatcher.pointerEnter(
+          instance->lastPointerSx, instance->lastPointerSy, m_platform->lastInputSerial()
+      );
+      m_hoveredInstance = instance.get();
+    } else {
+      instance->inputDispatcher.pointerLeave();
+      if (m_hoveredInstance == instance.get()) {
+        m_hoveredInstance = nullptr;
+      }
+    }
+    instance->surface->requestRedraw();
+  }
+  reevaluateAutoHide();
 }
 
 bool Bar::isRunning() const noexcept {
@@ -1146,14 +1639,14 @@ bool Bar::isRunning() const noexcept {
 }
 
 bool Bar::instanceEffectivelyVisible(const BarInstance& instance) const noexcept {
-  if (instance.barConfig.autoHide) {
+  if (barSupportsSlideBehavior(instance.barConfig)) {
     return instance.hideOpacity > 0.5f;
   }
-  return instance.slideRoot == nullptr || instance.slideRoot->opacity() > 0.5f;
+  return instance.slideRoot == nullptr || instance.hideOpacity > 0.5f;
 }
 
 bool Bar::instanceAcceptsPointerInput(const BarInstance& instance) const noexcept {
-  return instance.barConfig.autoHide || !instance.ipcLayoutReleased;
+  return barSupportsSlideBehavior(instance.barConfig) || !instance.ipcLayoutReleased;
 }
 
 bool Bar::isVisible() const noexcept {
@@ -1172,7 +1665,7 @@ void Bar::setInstanceIpcVisible(BarInstance& instance, bool visible) {
   if (instance.surface == nullptr) {
     return;
   }
-  if (instance.barConfig.autoHide) {
+  if (barSupportsSlideBehavior(instance.barConfig)) {
     if (visible) {
       revealAutoHideBar(instance);
     } else {
@@ -1183,12 +1676,30 @@ void Bar::setInstanceIpcVisible(BarInstance& instance, bool visible) {
   if (instance.slideRoot == nullptr) {
     return;
   }
-  // Non-autohide IPC: instant show/hide (no opacity fade — avoids sluggish hide and blur bleed-through).
   instance.animations.cancelForOwner(instance.slideRoot);
-  instance.slideRoot->setOpacity(visible ? 1.0f : 0.0f);
+  instance.slideRoot->setOpacity(1.0f);
   if (!visible) {
     clearInstancePointerState(instance);
   }
+  const float current = instance.hideOpacity;
+  const float target = visible ? 1.0f : 0.0f;
+  instance.animations.animate(
+      current, target, Style::animNormal, visible ? Easing::EaseOutCubic : Easing::EaseInQuad,
+      [inst = &instance, this](float v) {
+        inst->hideOpacity = v;
+        syncBarSlideLayerTransform(*inst);
+        syncBarSurfaceChrome(*inst);
+      },
+      [inst = &instance, this]() {
+        syncBarSlideLayerTransform(*inst);
+        syncBarAutoHideInputRegion(*inst);
+        syncBarSurfaceChrome(*inst);
+        if (inst->surface != nullptr) {
+          inst->surface->requestRedraw();
+        }
+      },
+      instance.slideRoot
+  );
   syncBarAutoHideInputRegion(instance);
   syncBarSurfaceChrome(instance);
   instance.surface->requestRedraw();
@@ -1202,14 +1713,21 @@ void Bar::applyIpcVisibility(bool visible) {
     setInstanceIpcVisible(*instance, visible);
     syncBarSurfaceChrome(*instance);
   }
+  syncIdleInhibitorAnchors();
+}
+
+void Bar::syncIdleInhibitorAnchors() {
+  if (m_idleInhibitor != nullptr) {
+    m_idleInhibitor->resyncAnchorSurfaces();
+  }
 }
 
 bool Bar::barContentVisuallyShown(const BarInstance& instance) const noexcept {
   constexpr float kShownThreshold = 0.02f;
-  if (instance.barConfig.autoHide) {
+  if (barSupportsSlideBehavior(instance.barConfig)) {
     return instance.hideOpacity > kShownThreshold;
   }
-  return instance.slideRoot == nullptr || instance.slideRoot->opacity() > kShownThreshold;
+  return instance.slideRoot == nullptr || instance.hideOpacity > kShownThreshold;
 }
 
 bool Bar::shouldReserveExclusiveZone(const BarInstance& instance) const noexcept {
@@ -1276,13 +1794,11 @@ std::vector<InputRect> Bar::surfaceRectsForOutput(wl_output* output) const {
   if (wlOutput == nullptr) {
     return rects;
   }
-  // logicalWidth/Height become valid only after xdg_output.done; before that
-  // we cannot accurately place a bottom/right anchored bar.
-  if (wlOutput->logicalWidth <= 0 || wlOutput->logicalHeight <= 0) {
+  if (!wlOutput->hasUsableGeometry()) {
     return rects;
   }
-  const std::int32_t outputW = wlOutput->logicalWidth;
-  const std::int32_t outputH = wlOutput->logicalHeight;
+  const std::int32_t outputW = wlOutput->effectiveLogicalWidth();
+  const std::int32_t outputH = wlOutput->effectiveLogicalHeight();
 
   for (const auto& instance : m_instances) {
     if (instance == nullptr || instance->output != output || instance->surface == nullptr) {
@@ -1303,8 +1819,8 @@ std::vector<InputRect> Bar::surfaceRectsForOutput(wl_output* output) const {
     const std::int32_t mLeft = surface->marginLeft();
     // surface->width()/height() may be 0 before configure; fall back to BarConfig
     // thickness so we still publish a sensible exclusion for fresh surfaces.
-    const std::int32_t surfW = static_cast<std::int32_t>(surface->width());
-    const std::int32_t surfH = static_cast<std::int32_t>(surface->height());
+    const auto surfW = static_cast<std::int32_t>(surface->width());
+    const auto surfH = static_cast<std::int32_t>(surface->height());
 
     std::int32_t rectW = surfW;
     std::int32_t rectH = surfH;
@@ -1350,17 +1866,56 @@ std::vector<wl_surface*> Bar::allBarSurfaces() const {
   return surfaces;
 }
 
+std::vector<wl_surface*> Bar::caffeineAnchorSurfaces() const {
+  std::vector<wl_surface*> surfaces;
+  surfaces.reserve(m_instances.size());
+  for (const auto& instance : m_instances) {
+    if (instance == nullptr || instance->surface == nullptr || !instanceAcceptsPointerInput(*instance)) {
+      continue;
+    }
+    if (!barContentVisuallyShown(*instance)) {
+      continue;
+    }
+    if (wl_surface* s = instance->surface->wlSurface(); s != nullptr) {
+      surfaces.push_back(s);
+    }
+  }
+  return surfaces;
+}
+
 bool Bar::canAttachPanelToBar(wl_output* output, std::string_view barName) const noexcept {
   const BarInstance* instance = instanceForBar(output, barName);
   if (instance == nullptr || instance->surface == nullptr || !instance->barConfig.enabled) {
     return false;
   }
-  return instance->barConfig.autoHide || instanceEffectivelyVisible(*instance);
+  return barSupportsSlideBehavior(instance->barConfig) || instanceEffectivelyVisible(*instance);
+}
+
+std::optional<std::string> Bar::layerForBar(wl_output* output, std::string_view barName) const noexcept {
+  const BarInstance* instance = instanceForBar(output, barName);
+  if (instance == nullptr || instance->surface == nullptr || !instance->barConfig.enabled) {
+    return std::nullopt;
+  }
+  return instance->barConfig.layer;
+}
+
+LayerShellLayer Bar::highestLayerForOutput(wl_output* output) const noexcept {
+  LayerShellLayer highest = LayerShellLayer::Top;
+  for (const auto& instance : m_instances) {
+    if (instance->output != output || !instance->barConfig.enabled) {
+      continue;
+    }
+    const LayerShellLayer layer = layerShellLayerFromConfig(instance->barConfig.layer);
+    if (static_cast<std::uint32_t>(layer) > static_cast<std::uint32_t>(highest)) {
+      highest = layer;
+    }
+  }
+  return highest;
 }
 
 bool Bar::isAttachedPanelBarSettled(wl_output* output, std::string_view barName) const noexcept {
   const BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr || !instance->barConfig.autoHide) {
+  if (instance == nullptr || !barSupportsSlideBehavior(instance->barConfig)) {
     return true;
   }
   constexpr float kSettledThreshold = 0.999f;
@@ -1408,15 +1963,29 @@ void Bar::endAttachedPopup(wl_surface* surface) {
   if (instance->attachedPopupCount > 0) {
     --instance->attachedPopupCount;
   }
-  if (m_platform != nullptr) {
-    instance->pointerInside = (m_platform->lastPointerSurface() == surface);
+  if (instance->attachedPopupCount > 0) {
+    return;
+  }
+  instance->pointerInside =
+      m_platform != nullptr && m_platform->hasPointerPosition() && m_platform->lastPointerSurface() == surface;
+  if (instance->pointerInside) {
+    instance->lastPointerSx = static_cast<float>(m_platform->lastPointerX());
+    instance->lastPointerSy = static_cast<float>(m_platform->lastPointerY());
+    instance->inputDispatcher.pointerEnter(
+        instance->lastPointerSx, instance->lastPointerSy, m_platform->lastInputSerial()
+    );
+  } else {
+    instance->inputDispatcher.pointerLeave();
+  }
+  if (instance->surface != nullptr) {
+    instance->surface->requestRedraw();
   }
   if (!instance->pointerInside && m_hoveredInstance == instance) {
     m_hoveredInstance = nullptr;
   } else if (instance->pointerInside) {
     m_hoveredInstance = instance;
   }
-  if (instance->attachedPopupCount > 0 || !instance->barConfig.autoHide || instance->pointerInside) {
+  if (!barPointerHideAllowed(*instance) || instance->pointerInside) {
     return;
   }
   const bool suppressAutoHide =
@@ -1437,7 +2006,7 @@ void Bar::show() {
 
 void Bar::hide() {
   for (const auto& instance : m_instances) {
-    if (instance != nullptr && !instance->barConfig.autoHide) {
+    if (instance != nullptr && !barSupportsSlideBehavior(instance->barConfig)) {
       // bar-hide IPC always frees layout on non-autohide bars (v4 isVisible=false), regardless of reserve_space.
       instance->ipcLayoutReleased = true;
     }
@@ -1471,7 +2040,7 @@ void Bar::toggle() {
 
   if (anyEffectivelyVisible) {
     for (const auto& instance : m_instances) {
-      if (instance != nullptr && !instance->barConfig.autoHide) {
+      if (instance != nullptr && !barSupportsSlideBehavior(instance->barConfig)) {
         instance->ipcLayoutReleased = true;
       }
     }
@@ -1491,11 +2060,34 @@ void Bar::syncInstances() {
   const auto& outputs = m_platform->outputs();
   const auto& bars = m_config->config().bars;
 
+  std::erase_if(m_lastActiveWorkspaceByOutput, [&outputs](const auto& pair) {
+    return std::ranges::find(outputs, pair.first, &WaylandOutput::name) == outputs.end();
+  });
+
+  for (const auto& output : outputs) {
+    if (!output.done || !output.hasUsableGeometry()) {
+      continue;
+    }
+    auto& last = m_lastActiveWorkspaceByOutput[output.name];
+    if (last.empty()) {
+      last = activeWorkspaceId(m_platform->workspaces(output.output));
+    }
+  }
+
   // Remove instances for outputs that no longer exist
-  std::erase_if(m_instances, [&outputs](const auto& inst) {
-    bool found = std::ranges::contains(outputs, inst->outputName, &WaylandOutput::name);
+  std::erase_if(m_instances, [&outputs, this](const auto& inst) {
+    const auto it = std::ranges::find(outputs, inst->outputName, &WaylandOutput::name);
+    const bool found = it != outputs.end() && it->done && it->hasUsableGeometry();
     if (!found) {
       kLog.info("removing instance for output {}", inst->outputName);
+    }
+    if (!found) {
+      if (inst->surface != nullptr) {
+        m_surfaceMap.erase(inst->surface->wlSurface());
+      }
+      if (m_hoveredInstance == inst.get()) {
+        m_hoveredInstance = nullptr;
+      }
     }
     return !found;
   });
@@ -1503,7 +2095,7 @@ void Bar::syncInstances() {
   // Create instances for each bar definition × each output
   for (std::size_t barIdx = 0; barIdx < bars.size(); ++barIdx) {
     for (const auto& output : outputs) {
-      if (!output.done) {
+      if (!output.done || !output.hasUsableGeometry()) {
         continue;
       }
 
@@ -1519,6 +2111,9 @@ void Bar::syncInstances() {
       }
     }
   }
+
+  syncIdleInhibitorAnchors();
+  reevaluateSmartAutoHide();
 }
 
 void Bar::createInstance(const WaylandOutput& output, std::size_t barIndex, const BarConfig& barConfig) {
@@ -1581,12 +2176,46 @@ void Bar::createInstance(const WaylandOutput& output, std::size_t barIndex, cons
 }
 
 void Bar::destroyInstance(std::uint32_t outputName) {
-  std::erase_if(m_instances, [outputName](const auto& inst) { return inst->outputName == outputName; });
+  std::erase_if(m_instances, [outputName, this](const auto& inst) {
+    if (inst->surface != nullptr) {
+      m_surfaceMap.erase(inst->surface->wlSurface());
+    }
+    if (m_hoveredInstance == inst.get()) {
+      m_hoveredInstance = nullptr;
+    }
+    return inst->outputName == outputName;
+  });
 }
 
 void Bar::populateWidgets(BarInstance& instance) {
+  instance.deadZoneBindings.resolve(
+      noctalia::bar::WidgetActionBindings::Inputs{
+          .widgetDefaults = noctalia::bar::deadZoneGestureDefaults(),
+          .widgetActions = &instance.barConfig.deadZone.actions,
+          .widgetContext = "bar." + instance.barConfig.name + ".dead_zone",
+          .widgetName = instance.barConfig.name,
+          .widgetType = "dead zone",
+      }
+  );
+  {
+    std::string summary;
+    for (const auto gesture : noctalia::bar::allGestures()) {
+      const auto* action = instance.deadZoneBindings.find(gesture);
+      if (action == nullptr) {
+        continue;
+      }
+      if (!summary.empty()) {
+        summary += ", ";
+      }
+      summary += std::format("{}={}", gestureConfigKey(gesture), action->commandLine());
+    }
+    // Runs once per bar per reload, mirroring the per-widget line: the first thing to check when a
+    // dead zone binding does not fire.
+    kLog.debug("bar.{}.dead_zone: {}", instance.barConfig.name, summary.empty() ? "no bindings" : summary);
+  }
+
   const auto& widgetConfigs = m_config->config().widgets;
-  const FontWeight labelFontWeight = static_cast<FontWeight>(instance.barConfig.fontWeight);
+  const auto labelFontWeight = static_cast<FontWeight>(instance.barConfig.fontWeight);
   const std::string barFontFamily = (instance.barConfig.fontFamily && !instance.barConfig.fontFamily->empty())
       ? *instance.barConfig.fontFamily
       : m_config->config().shell.fontFamily;
@@ -1609,7 +2238,28 @@ void Bar::populateWidgets(BarInstance& instance) {
     widget->setConfigName(name);
     if (wcPtr != nullptr) {
       widget->setAnchor(wcPtr->getBool("anchor", false));
+      const std::string_view widgetType = !wcPtr->type.empty() ? wcPtr->type : std::string_view(name);
+      // Spacers are layout gaps by default; enable Interactive to use them as hot zones.
+      const bool interactiveDefault = widgetType != "spacer";
+      widget->setNonInteractive(!wcPtr->getBool("interactive", interactiveDefault));
+      if (!wcPtr->getBool("enabled", true)) {
+        return;
+      }
+    } else if (name == "spacer") {
+      widget->setNonInteractive(true);
     }
+    widget->setActionContext(
+        IpcInvocationContext{
+            .widgetName = name,
+            .widgetType = wcPtr != nullptr ? wcPtr->type : name,
+            .barName = instance.barConfig.name,
+            .output = instance.output,
+        }
+    );
+    widget->resolveGestureBindings(
+        wcPtr != nullptr ? wcPtr->type : name, wcPtr, &instance.barConfig.actions,
+        std::format("bar.{}", instance.barConfig.name), &m_actionDispatcher
+    );
     widget->setBarCapsuleSpec(
         groupSpec != nullptr ? *groupSpec : resolveWidgetBarCapsuleSpec(instance.barConfig, wcPtr)
     );
@@ -1620,16 +2270,16 @@ void Bar::populateWidgets(BarInstance& instance) {
     if (wcPtr != nullptr && wcPtr->hasSetting("color")) {
       widget->setWidgetForeground(wcPtr->getOptionalColorSpec("color", "widget." + name + ".color"));
     } else if (groupForeground != nullptr && groupForeground->has_value()) {
-      widget->setWidgetForeground(**groupForeground);
+      widget->setWidgetForeground(*groupForeground);
     } else if (instance.barConfig.widgetColor.has_value()) {
-      widget->setWidgetForeground(*instance.barConfig.widgetColor);
+      widget->setWidgetForeground(instance.barConfig.widgetColor);
     }
     if (wcPtr != nullptr && wcPtr->hasSetting("icon_color")) {
       widget->setWidgetIconColor(wcPtr->getOptionalColorSpec("icon_color", "widget." + name + ".icon_color"));
     } else if (groupForeground != nullptr && groupForeground->has_value()) {
-      widget->setWidgetIconColor(**groupForeground);
+      widget->setWidgetIconColor(*groupForeground);
     } else if (instance.barConfig.widgetIconColor.has_value()) {
-      widget->setWidgetIconColor(*instance.barConfig.widgetIconColor);
+      widget->setWidgetIconColor(instance.barConfig.widgetIconColor);
     }
     dest.push_back(std::move(widget));
   };
@@ -1640,6 +2290,10 @@ void Bar::populateWidgets(BarInstance& instance) {
       if (isCapsuleGroupToken(name)) {
         const BarCapsuleGroupStyle* group = findBarCapsuleGroupStyle(instance.barConfig, capsuleGroupTokenId(name));
         if (group == nullptr) {
+          kLog.warn("bar.{}: lane entry \"{}\" has no matching capsule_group", instance.barConfig.name, name);
+          continue;
+        }
+        if (!group->enabled) {
           continue;
         }
         const WidgetBarCapsuleSpec groupSpec = capsuleSpecFromGroup(instance.barConfig, *group);
@@ -1674,7 +2328,35 @@ void Bar::populateWidgets(BarInstance& instance) {
 
 void Bar::attachWidgetsToSections(BarInstance& instance) {
   const bool isVertical = instance.barConfig.position == "left" || instance.barConfig.position == "right";
-  const float widgetSpacing = static_cast<float>(instance.barConfig.widgetSpacing);
+  const auto widgetSpacing = static_cast<float>(instance.barConfig.widgetSpacing);
+  const bool hoverHighlight = instance.barConfig.hoverHighlight;
+
+  instance.widgetByRoot.clear();
+  instance.hoverHighlightWidget = nullptr;
+  if (instance.hoverUnderlay != nullptr) {
+    while (!instance.hoverUnderlay->children().empty()) {
+      instance.hoverUnderlay->removeChild(instance.hoverUnderlay->children().back().get());
+    }
+  }
+
+  // Hover overlay: sits above the capsule fill (same zIndex, later sibling) and below the
+  // content; fill/visibility are driven by the hover animation.
+  auto addHoverBox = [hoverHighlight](Widget& widget, Node& shell) -> Box* {
+    if (!hoverHighlight || !widget.wantsBarHoverHighlight()) {
+      return nullptr;
+    }
+    Box* boxPtr = nullptr;
+    shell.addChild(
+        ui::box({
+            .out = &boxPtr,
+            .fill = withOpacity(widget.widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface)), 0.0f),
+            .visible = false,
+            .configure = [](Box& box) { box.setZIndex(-1); },
+        })
+    );
+    widget.setBarHoverBox(boxPtr);
+    return boxPtr;
+  };
 
   auto attach = [&](std::vector<std::unique_ptr<Widget>>& widgets, std::vector<BarCapsuleRun>& capsuleRuns,
                     Flex* section) {
@@ -1707,7 +2389,8 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
       }
       widget->setPanelToggleCallback([this, inst = &instance](
                                          std::string_view panelId, std::string_view context,
-                                         std::optional<float> anchorSurfaceX, std::optional<float> anchorSurfaceY
+                                         std::optional<float> anchorSurfaceX, std::optional<float> anchorSurfaceY,
+                                         Widget::PanelActivation activation
                                      ) {
         float anchorX = inst->lastPointerSx;
         float anchorY = inst->lastPointerSy;
@@ -1718,33 +2401,45 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
           anchorY = *anchorSurfaceY;
         }
         if (m_platform != nullptr && inst->output != nullptr) {
-          if (const auto* out = m_platform->findOutputByWl(inst->output);
-              out != nullptr && out->logicalWidth > 0 && out->logicalHeight > 0) {
+          if (const auto* out = m_platform->findOutputByWl(inst->output); out != nullptr && out->hasUsableGeometry()) {
             const auto [surfaceX, surfaceY] = surfaceOriginForOutputLocal(*inst, *out);
             anchorX += surfaceX;
             anchorY += surfaceY;
           }
         }
-        PanelManager::instance().togglePanel(
-            std::string(panelId),
-            PanelOpenRequest{
-                .output = inst->output,
-                .anchorX = anchorX,
-                .anchorY = anchorY,
-                .hasExplicitAnchor = anchorSurfaceX.has_value() || anchorSurfaceY.has_value(),
-                .hasAnchorPosition = true,
-                .context = context,
-                .sourceBarName = inst->barConfig.name
-            }
-        );
+        PanelOpenRequest request{
+            .output = inst->output,
+            .anchorX = anchorX,
+            .anchorY = anchorY,
+            .hasExplicitAnchor = anchorSurfaceX.has_value() || anchorSurfaceY.has_value(),
+            .hasAnchorPosition = true,
+            .context = context,
+            .sourceBarName = inst->barConfig.name
+        };
+        if (activation == Widget::PanelActivation::Open) {
+          PanelManager::instance().openPanel(std::string(panelId), request);
+        } else {
+          PanelManager::instance().togglePanel(std::string(panelId), request);
+        }
       });
       widget->create();
+      if (widget->outerNode() != nullptr) {
+        instance.widgetByRoot[widget->outerNode()] = widget.get();
+      }
     }
 
     capsuleRuns.clear();
 
     auto addPlainWidget = [&](Widget& widget) {
       widget.setBarCapsuleScene(nullptr, nullptr);
+      // No capsule: the hover pill lives on the bar-level underlay (unclipped, no layout
+      // footprint) and is positioned after sections are laid out.
+      if (hoverHighlight
+          && instance.hoverUnderlay != nullptr
+          && !widget.isBarClickThrough()
+          && !widget.noGapAroundMe()) {
+        addHoverBox(widget, *instance.hoverUnderlay);
+      }
       auto* added = section->addChild(widget.releaseRoot());
       if (widget.noGapAroundMe()) {
         section->setChildGapExcluded(added, true);
@@ -1753,7 +2448,7 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
 
     auto addSingleCapsule = [&](Widget& widget) {
       const auto& cap = widget.barCapsuleSpec();
-      auto shell = std::make_unique<Node>();
+      auto shell = ui::node({});
       Node* shellPtr = shell.get();
       shellPtr->setClipChildren(true);
       const float scale = widget.contentScale();
@@ -1771,17 +2466,22 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
           },
       });
       shellPtr->addChild(std::move(capsuleBg));
+      Box* hoverPtr = addHoverBox(widget, *shellPtr);
       shellPtr->addChild(widget.releaseRoot());
       widget.setBarCapsuleScene(shellPtr, bgPtr);
+      if (auto* area = dynamic_cast<InputArea*>(widget.root())) {
+        area->setTooltipAnchorNode(shellPtr);
+      }
       capsuleRuns.push_back(
           BarCapsuleRun{
               .shell = shellPtr,
               .bg = bgPtr,
               .container = nullptr,
-              .content = widget.root(),
+              .content = widget.outerNode(),
               .spec = cap,
               .contentScale = widget.contentScale(),
               .widgets = {&widget},
+              .hoverBoxes = hoverPtr != nullptr ? std::vector<Box*>{hoverPtr} : std::vector<Box*>{},
           }
       );
       auto* added = section->addChild(std::move(shell));
@@ -1839,7 +2539,7 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
         continue;
       }
 
-      auto shell = std::make_unique<Node>();
+      auto shell = ui::node({});
       Node* shellPtr = shell.get();
       shellPtr->setClipChildren(true);
       const float scale = widget->contentScale();
@@ -1858,6 +2558,14 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
       });
       shellPtr->addChild(std::move(capsuleBg));
 
+      std::vector<Box*> hoverBoxes;
+      if (hoverHighlight) {
+        hoverBoxes.reserve(runEnd - index);
+        for (std::size_t memberIndex = index; memberIndex < runEnd; ++memberIndex) {
+          hoverBoxes.push_back(addHoverBox(*widgets[memberIndex], *shellPtr));
+        }
+      }
+
       auto inner = ui::flex(
           isVertical ? FlexDirection::Vertical : FlexDirection::Horizontal,
           {
@@ -1875,12 +2583,16 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
       run.content = innerPtr;
       run.spec = cap;
       run.contentScale = widget->contentScale();
+      run.hoverBoxes = std::move(hoverBoxes);
 
       for (std::size_t memberIndex = index; memberIndex < runEnd; ++memberIndex) {
         auto& member = widgets[memberIndex];
         member->setBarCapsuleScene(shellPtr, bgPtr);
         run.widgets.push_back(member.get());
         auto* added = innerPtr->addChild(member->releaseRoot());
+        if (auto* area = dynamic_cast<InputArea*>(member->root())) {
+          area->setTooltipAnchorNode(shellPtr);
+        }
         if (member->noGapAroundMe()) {
           innerPtr->setChildGapExcluded(added, true);
         }
@@ -1895,6 +2607,50 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
   attach(instance.startWidgets, instance.startCapsuleRuns, instance.startSection);
   attach(instance.centerWidgets, instance.centerCapsuleRuns, instance.centerSection);
   attach(instance.endWidgets, instance.endCapsuleRuns, instance.endSection);
+}
+
+void Bar::updateWidgetHoverHighlight(BarInstance& instance, InputArea* hoveredArea) {
+  Widget* target = nullptr;
+  for (const Node* node = hoveredArea; node != nullptr; node = node->parent()) {
+    if (auto it = instance.widgetByRoot.find(node); it != instance.widgetByRoot.end()) {
+      target = it->second;
+      break;
+    }
+  }
+  if (target != nullptr && target->barHoverBox() == nullptr) {
+    target = nullptr;
+  }
+  if (target == instance.hoverHighlightWidget) {
+    return;
+  }
+  if (instance.hoverHighlightWidget != nullptr) {
+    animateWidgetHoverHighlight(instance, *instance.hoverHighlightWidget, false);
+  }
+  instance.hoverHighlightWidget = target;
+  if (target != nullptr) {
+    animateWidgetHoverHighlight(instance, *target, true);
+  }
+}
+
+void Bar::animateWidgetHoverHighlight(BarInstance& instance, Widget& widget, bool hovered) {
+  Box* box = widget.barHoverBox();
+  if (box == nullptr) {
+    return;
+  }
+  const ColorSpec fill = widget.widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface));
+  instance.animations.cancelForOwner(box);
+  instance.animations.animate(
+      widget.barHoverProgress(), hovered ? 1.0f : 0.0f, Style::animFast, Easing::EaseOutCubic,
+      [&widget, box, fill](float progress) {
+        widget.setBarHoverProgress(progress);
+        box->setVisible(progress > 0.001f);
+        box->setFill(withOpacity(fill, kWidgetHoverFillAlpha * progress));
+      },
+      {}, box
+  );
+  if (instance.surface != nullptr) {
+    instance.surface->requestRedraw();
+  }
 }
 
 void Bar::rebuildInstanceContents(BarInstance& instance, const BarConfig& newConfig) {
@@ -1929,7 +2685,7 @@ void Bar::rebuildInstanceContents(BarInstance& instance, const BarConfig& newCon
 
   // Refresh section-level layout knobs that may have changed (gap; direction
   // doesn't change because position is part of the surface-fields gate).
-  const float widgetSpacing = static_cast<float>(instance.barConfig.widgetSpacing);
+  const auto widgetSpacing = static_cast<float>(instance.barConfig.widgetSpacing);
   if (instance.startSection != nullptr) {
     instance.startSection->setGap(widgetSpacing);
   }
@@ -1992,19 +2748,11 @@ void Bar::syncBarAutoHideInputRegion(BarInstance& instance) const {
     instance.surface->setInputRegion({});
     return;
   }
-  if (instance.attachedPanelResizeTestOpen) {
-    std::vector<InputRect> regions{
-        barContentInputRegion(instance.barConfig, m_config->config().shell.shadow, surfW, surfH)
-    };
-    if (auto panelRect = attachedPanelResizeTestRect(instance.barConfig, m_config->config().shell.shadow, surfW, surfH);
-        panelRect.has_value()) {
-      regions.push_back(*panelRect);
-    }
-    instance.surface->setInputRegion(regions);
-    return;
-  }
-  if (instance.barConfig.autoHide) {
-    const bool fullSurface = instance.pointerInside || instance.attachedPopupCount > 0 || instance.hideOpacity > 0.5f;
+  if (barConfigUsesSlideSurface(instance.barConfig)) {
+    const bool fullSurface = instance.pointerInside
+        || instance.attachedPopupCount > 0
+        || instance.hideOpacity > 0.5f
+        || (instance.barConfig.smartAutoHide && instance.smartAutoHidePinnedVisible);
     instance.surface->setInputRegion(barAutoHideSurfaceInputRegion(instance.barConfig, surfW, surfH, fullSurface));
     return;
   }
@@ -2017,7 +2765,7 @@ void Bar::revealAutoHideBar(BarInstance& instance) {
   if (instance.autoHideDisablePending) {
     return;
   }
-  if (!instance.barConfig.autoHide || instance.surface == nullptr || instance.slideRoot == nullptr) {
+  if (!barSupportsSlideBehavior(instance.barConfig) || instance.surface == nullptr || instance.slideRoot == nullptr) {
     return;
   }
 
@@ -2061,7 +2809,10 @@ void Bar::syncBarSlideLayerTransform(BarInstance& instance) const {
   if (instance.slideRoot == nullptr) {
     return;
   }
-  if (instance.barConfig.autoHide) {
+  if (instance.barConfig.autoHide
+      || instance.barConfig.smartAutoHide
+      || instance.ipcLayoutReleased
+      || instance.hideOpacity < 0.999f) {
     const float t = 1.0f - instance.hideOpacity;
     instance.slideRoot->setPosition(instance.slideHiddenDx * t, instance.slideHiddenDy * t);
   } else {
@@ -2090,8 +2841,8 @@ void Bar::applyBarCompositorBlur(BarInstance& instance) const {
   const int ph = static_cast<int>(std::lround(std::max(0.0f, instance.bg->height())));
   const auto concave = barConcaveShape(instance.barConfig);
   // The bg node is the visual rect; tessellateShape expects the body rect and
-  // expands it outward by logicalInset itself. With all-convex corners this is the
-  // plain rounded rect.
+  // expands it outward by logicalInset itself. With all-convex corners and no
+  // inset it takes its own fast path down to a plain rounded rect.
   const int insetL = static_cast<int>(std::lround(concave.logicalInset.left));
   const int insetT = static_cast<int>(std::lround(concave.logicalInset.top));
   const int insetR = static_cast<int>(std::lround(concave.logicalInset.right));
@@ -2104,7 +2855,7 @@ void Bar::applyBarCompositorBlur(BarInstance& instance) const {
 }
 
 void Bar::startHideFadeOut(BarInstance& instance) {
-  if (instance.autoHideDisablePending) {
+  if (instance.autoHideDisablePending || instance.smartAutoHidePinnedVisible) {
     return;
   }
   const float current = instance.hideOpacity;
@@ -2140,15 +2891,15 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
 
   const auto w = static_cast<float>(width);
   const auto h = static_cast<float>(height);
-  const float padding = static_cast<float>(instance.barConfig.padding);
-  const float widgetSpacing = static_cast<float>(instance.barConfig.widgetSpacing);
+  const auto padding = static_cast<float>(instance.barConfig.padding);
+  const auto widgetSpacing = static_cast<float>(instance.barConfig.widgetSpacing);
   const auto& shadowConfig = m_config->config().shell.shadow;
   const auto shadowOffset = shadowDirectionOffset(shadowConfig.direction);
   const float shadowSize = shell::surface_shadow::enabled(instance.barConfig.shadow, shadowConfig)
       ? static_cast<float>(shell::surface_shadow::kBlurRadius)
       : 0.0f;
-  const float shadowOffsetX = static_cast<float>(shadowOffset.x);
-  const float shadowOffsetY = static_cast<float>(shadowOffset.y);
+  const auto shadowOffsetX = static_cast<float>(shadowOffset.x);
+  const auto shadowOffsetY = static_cast<float>(shadowOffset.y);
   const bool isBottom = instance.barConfig.position == "bottom";
   const bool isRight = instance.barConfig.position == "right";
   const bool isVertical = (instance.barConfig.position == "left" || instance.barConfig.position == "right");
@@ -2162,11 +2913,11 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
   const float barAreaH = barVisual.height;
 
   if (instance.sceneRoot == nullptr) {
-    instance.sceneRoot = std::make_unique<Node>();
+    instance.sceneRoot = ui::node({});
     instance.sceneRoot->setAnimationManager(&instance.animations);
     instance.sceneRoot->setSize(w, h);
 
-    auto slide = std::make_unique<Node>();
+    auto slide = ui::node({});
     slide->setParticipatesInLayout(false);
     instance.slideRoot = instance.sceneRoot->addChild(std::move(slide));
 
@@ -2181,13 +2932,13 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
           })
       ));
 
-      auto leftClip = std::make_unique<Node>();
+      auto leftClip = ui::node({});
       leftClip->setClipChildren(true);
       leftClip->setZIndex(-1);
       instance.shadowLeftClip = instance.slideRoot->addChild(std::move(leftClip));
       instance.shadowLeft = static_cast<Box*>(instance.shadowLeftClip->addChild(ui::box()));
 
-      auto rightClip = std::make_unique<Node>();
+      auto rightClip = ui::node({});
       rightClip->setClipChildren(true);
       rightClip->setZIndex(-1);
       instance.shadowRightClip = instance.slideRoot->addChild(std::move(rightClip));
@@ -2195,32 +2946,17 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
     }
     // Note: shadow is inserted before bar sections so it renders below them (z=-1 is set below).
 
-    instance.attachedPanelResizeTestRect = static_cast<Box*>(instance.slideRoot->addChild(
-        ui::box({
-            .visible = false,
-            .participatesInLayout = false,
-            .configure = [](Box& panel) {
-              panel.setHitTestVisible(false);
-              panel.setStyle(
-                  RoundedRectStyle{
-                      .fill = rgba(0.10f, 0.68f, 1.0f, 0.72f),
-                      .border = rgba(1.0f, 1.0f, 1.0f, 0.92f),
-                      .fillMode = FillMode::Solid,
-                      .radius = 0.0f,
-                      .softness = 0.0f,
-                      .borderWidth = 2.0f,
-                  }
-              );
-            },
-        })
-    ));
+    auto hoverUnderlay = ui::node({});
+    hoverUnderlay->setHitTestVisible(false);
+    hoverUnderlay->setSize(static_cast<float>(w), static_cast<float>(h));
+    instance.hoverUnderlay = instance.slideRoot->addChild(std::move(hoverUnderlay));
 
-    auto contentClip = std::make_unique<Node>();
+    auto contentClip = ui::node({});
     contentClip->setClipChildren(true);
     instance.contentClip = instance.slideRoot->addChild(std::move(contentClip));
 
     auto makeSlot = [&instance]() {
-      auto slot = std::make_unique<Node>();
+      auto slot = ui::node({});
       slot->setClipChildren(true);
       return instance.contentClip->addChild(std::move(slot));
     };
@@ -2250,24 +2986,25 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
     instance.inputDispatcher.setCursorShapeCallback([this](std::uint32_t serial, std::uint32_t shape) {
       m_platform->setCursorShape(serial, shape);
     });
-    instance.inputDispatcher.setHoverChangeCallback([inst = &instance](InputArea* /*old*/, InputArea* next) {
+    instance.inputDispatcher.setHoverChangeCallback([this, inst = &instance](InputArea* /*old*/, InputArea* next) {
+      if (next != nullptr) {
+        next->setTooltipPlacement(tooltipPlacementAwayFromEdge(inst->barConfig.position));
+      }
       TooltipManager::instance().onHoverChange(next, inst->surface->layerSurface(), inst->output);
+      updateWidgetHoverHighlight(*inst, next);
     });
 
-    if (instance.barConfig.autoHide) {
+    if (instance.barConfig.smartAutoHide && m_platform != nullptr) {
+      instance.smartAutoHidePinnedVisible = smartAutoHideWantsPinnedVisible(*m_platform, instance.output);
+    }
+    if (barConfigUsesSlideSurface(instance.barConfig)) {
       instance.slideRoot->setOpacity(1.0f);
-      instance.hideOpacity = 0.0f;
+      const bool startHidden =
+          instance.barConfig.smartAutoHide ? !instance.smartAutoHidePinnedVisible : instance.barConfig.autoHide;
+      instance.hideOpacity = startHidden ? 0.0f : 1.0f;
     } else {
-      instance.slideRoot->setOpacity(0.0f);
+      instance.slideRoot->setOpacity(1.0f);
       instance.hideOpacity = 1.0f;
-      instance.animations.animate(
-          0.0f, 1.0f, Style::animSlow, Easing::EaseOutCubic,
-          [slide = instance.slideRoot, inst = &instance, this](float v) {
-            slide->setOpacity(v);
-            syncBarSurfaceChrome(*inst);
-          },
-          {}, instance.slideRoot
-      );
     }
 
     instance.surface->setSceneRoot(instance.sceneRoot.get());
@@ -2277,6 +3014,9 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
   instance.sceneRoot->setSize(w, h);
   if (instance.slideRoot != nullptr) {
     instance.slideRoot->setSize(w, h);
+  }
+  if (instance.hoverUnderlay != nullptr) {
+    instance.hoverUnderlay->setSize(w, h);
   }
 
   // Background covers only the bar visual area (not the shadow extension).
@@ -2316,47 +3056,31 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
 
   applyBarShadowStyle(instance, shadowConfig, w, h);
 
-  if (instance.attachedPanelResizeTestRect != nullptr) {
-    const auto rect = attachedPanelResizeTestRect(
-        instance.barConfig, shadowConfig, static_cast<int>(std::lround(w)), static_cast<int>(std::lround(h))
-    );
-    instance.attachedPanelResizeTestRect->setVisible(instance.attachedPanelResizeTestOpen && rect.has_value());
-    if (rect.has_value()) {
-      instance.attachedPanelResizeTestRect->setPosition(static_cast<float>(rect->x), static_cast<float>(rect->y));
-      instance.attachedPanelResizeTestRect->setSize(static_cast<float>(rect->width), static_cast<float>(rect->height));
-    }
-  }
-
   layoutBarSections(instance, *renderer, barAreaW, barAreaH, padding, isVertical);
 
-  if (instance.barConfig.autoHide) {
-    float contentLeft = barAreaX;
-    float contentTop = barAreaY;
-    float contentRight = barAreaX + barAreaW;
-    float contentBottom = barAreaY + barAreaH;
-    if (instance.shadow != nullptr) {
-      const float sx = barAreaX + shadowOffsetX;
-      const float sy = barAreaY + shadowOffsetY;
-      contentLeft = std::min(contentLeft, sx);
-      contentTop = std::min(contentTop, sy);
-      contentRight = std::max(contentRight, sx + barAreaW);
-      contentBottom = std::max(contentBottom, sy + barAreaH);
-    }
-    // Concave spikes extend past the body on the inner edge; include them so the bar
-    // slides fully off-screen when hidden.
-    contentLeft -= concave.logicalInset.left;
-    contentTop -= concave.logicalInset.top;
-    contentRight += concave.logicalInset.right;
-    contentBottom += concave.logicalInset.bottom;
-    const auto hiddenDelta = computeAutoHideHiddenDelta(
-        isVertical, isBottom, isRight, w, h, contentLeft, contentTop, contentRight, contentBottom
-    );
-    instance.slideHiddenDx = hiddenDelta.first;
-    instance.slideHiddenDy = hiddenDelta.second;
-  } else {
-    instance.slideHiddenDx = 0.0f;
-    instance.slideHiddenDy = 0.0f;
+  float contentLeft = barAreaX;
+  float contentTop = barAreaY;
+  float contentRight = barAreaX + barAreaW;
+  float contentBottom = barAreaY + barAreaH;
+  if (instance.shadow != nullptr) {
+    const float sx = barAreaX + shadowOffsetX;
+    const float sy = barAreaY + shadowOffsetY;
+    contentLeft = std::min(contentLeft, sx);
+    contentTop = std::min(contentTop, sy);
+    contentRight = std::max(contentRight, sx + barAreaW);
+    contentBottom = std::max(contentBottom, sy + barAreaH);
   }
+  // Concave spikes extend past the body on the inner edge; include them so the bar
+  // slides fully off-screen when hidden.
+  contentLeft -= concave.logicalInset.left;
+  contentTop -= concave.logicalInset.top;
+  contentRight += concave.logicalInset.right;
+  contentBottom += concave.logicalInset.bottom;
+  const auto hiddenDelta = computeAutoHideHiddenDelta(
+      isVertical, isBottom, isRight, w, h, contentLeft, contentTop, contentRight, contentBottom
+  );
+  instance.slideHiddenDx = hiddenDelta.first;
+  instance.slideHiddenDy = hiddenDelta.second;
   syncBarSlideLayerTransform(instance);
 
   syncBarAutoHideInputRegion(instance);
@@ -2371,7 +3095,7 @@ void Bar::updateWidgets(BarInstance& instance) {
 
   const auto w = static_cast<float>(instance.surface->width());
   const auto h = static_cast<float>(instance.surface->height());
-  const float padding = static_cast<float>(instance.barConfig.padding);
+  const auto padding = static_cast<float>(instance.barConfig.padding);
   const bool isVertical = (instance.barConfig.position == "left" || instance.barConfig.position == "right");
   const auto& shadowConfig = m_config->config().shell.shadow;
   const float innerSurfaceExtension = barInnerSurfaceExtension(instance.barConfig, shadowConfig, w, h);
@@ -2414,7 +3138,7 @@ void Bar::prepareFrame(BarInstance& instance, bool needsUpdate, bool needsLayout
 
   const auto w = static_cast<float>(instance.surface->width());
   const auto h = static_cast<float>(instance.surface->height());
-  const float padding = static_cast<float>(instance.barConfig.padding);
+  const auto padding = static_cast<float>(instance.barConfig.padding);
   const bool isVertical = (instance.barConfig.position == "left" || instance.barConfig.position == "right");
   const auto& shadowConfig = m_config->config().shell.shadow;
   const float innerSurfaceExtension = barInnerSurfaceExtension(instance.barConfig, shadowConfig, w, h);
@@ -2473,22 +3197,6 @@ bool Bar::onPointerEvent(const PointerEvent& event) {
     }
   }
 
-  if (targetInstance != nullptr
-      && event.type == PointerEvent::Type::Button
-      && event.button == BTN_MIDDLE
-      && event.state == 1
-      && m_config != nullptr
-      && m_config->config().shell.middleClickOpensWidgetSettings) {
-    auto* widget = widgetAtPoint(*targetInstance, static_cast<float>(event.sx), static_cast<float>(event.sy));
-    if (widget != nullptr
-        && !widget->reservesMiddleClick()
-        && !widget->configName().empty()
-        && m_openWidgetSettingsCallback) {
-      m_openWidgetSettingsCallback(targetInstance->barConfig.name, std::string(widget->configName()));
-      return true;
-    }
-  }
-
   if (targetInstance != nullptr && targetInstance->attachedPopupCount > 0) {
     switch (event.type) {
     case PointerEvent::Type::Enter:
@@ -2504,31 +3212,12 @@ bool Bar::onPointerEvent(const PointerEvent& event) {
     case PointerEvent::Type::Motion:
     case PointerEvent::Type::Button:
     case PointerEvent::Type::Axis:
-      if (event.type == PointerEvent::Type::Button && event.button == BTN_RIGHT && event.state == 1) {
-        auto& panelManager = PanelManager::instance();
-        if (panelManager.isOpenPanel("control-center")) {
-          panelManager.closePanel();
-        } else {
-          float anchorX = static_cast<float>(event.sx);
-          float anchorY = static_cast<float>(event.sy);
-          if (m_platform != nullptr && targetInstance->output != nullptr) {
-            if (const auto* out = m_platform->findOutputByWl(targetInstance->output);
-                out != nullptr && out->logicalWidth > 0 && out->logicalHeight > 0) {
-              const auto [surfaceX, surfaceY] = surfaceOriginForOutputLocal(*targetInstance, *out);
-              anchorX += surfaceX;
-              anchorY += surfaceY;
-            }
-          }
-          panelManager.openPanel(
-              "control-center",
-              PanelOpenRequest{
-                  .output = targetInstance->output,
-                  .anchorX = anchorX,
-                  .anchorY = anchorY,
-                  .hasAnchorPosition = true,
-                  .context = "home",
-                  .sourceBarName = targetInstance->barConfig.name
-              }
+      if (event.type == PointerEvent::Type::Button && event.button == BTN_RIGHT && event.pressed) {
+        const auto sx = static_cast<float>(event.sx);
+        const auto sy = static_cast<float>(event.sy);
+        if (!handleBarDeadZoneButton(*targetInstance, sx, sy, event.button, m_platform, m_actionDispatcher)) {
+          openPanelAtBarPointer(
+              *targetInstance, sx, sy, m_platform, targetInstance->barConfig.name, "control-center", "home", true
           );
         }
         return true;
@@ -2555,7 +3244,7 @@ bool Bar::onPointerEvent(const PointerEvent& event) {
     if (m_hoveredInstance != entered) {
       break;
     }
-    if (m_hoveredInstance->barConfig.autoHide && m_hoveredInstance->sceneRoot != nullptr) {
+    if (barSupportsSlideBehavior(m_hoveredInstance->barConfig) && m_hoveredInstance->sceneRoot != nullptr) {
       revealAutoHideBar(*m_hoveredInstance);
     }
     break;
@@ -2566,7 +3255,7 @@ bool Bar::onPointerEvent(const PointerEvent& event) {
       m_hoveredInstance->inputDispatcher.pointerLeave();
       const bool suppressAutoHide =
           (m_autoHideSuppressionCallback != nullptr) ? m_autoHideSuppressionCallback(*m_hoveredInstance) : false;
-      if (m_hoveredInstance->barConfig.autoHide && !suppressAutoHide) {
+      if (barPointerHideAllowed(*m_hoveredInstance) && !suppressAutoHide) {
         startHideFadeOut(*m_hoveredInstance);
       }
       m_hoveredInstance = nullptr;
@@ -2592,44 +3281,12 @@ bool Bar::onPointerEvent(const PointerEvent& event) {
       break;
     m_hoveredInstance->lastPointerSx = static_cast<float>(event.sx);
     m_hoveredInstance->lastPointerSy = static_cast<float>(event.sy);
-    bool pressed = (event.state == 1); // WL_POINTER_BUTTON_STATE_PRESSED
-    consumed = m_hoveredInstance->inputDispatcher.pointerButton(
-        static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, pressed
-    );
-    if (pressed && event.button == BTN_RIGHT && !consumed) {
-      const float sx = static_cast<float>(event.sx);
-      const float sy = static_cast<float>(event.sy);
-      const bool insideAnySection = pointInsideNode(m_hoveredInstance->startSection, sx, sy)
-          || pointInsideNode(m_hoveredInstance->centerSection, sx, sy)
-          || pointInsideNode(m_hoveredInstance->endSection, sx, sy);
-      const bool insideAnyWidget = widgetAtPoint(*m_hoveredInstance, sx, sy) != nullptr;
-      if (!insideAnySection && !insideAnyWidget) {
-        auto& panelManager = PanelManager::instance();
-        if (panelManager.isOpenPanel("control-center")) {
-          panelManager.closePanel();
-        } else {
-          float anchorX = sx;
-          float anchorY = sy;
-          if (m_platform != nullptr && m_hoveredInstance->output != nullptr) {
-            if (const auto* out = m_platform->findOutputByWl(m_hoveredInstance->output);
-                out != nullptr && out->logicalWidth > 0 && out->logicalHeight > 0) {
-              const auto [surfaceX, surfaceY] = surfaceOriginForOutputLocal(*m_hoveredInstance, *out);
-              anchorX += surfaceX;
-              anchorY += surfaceY;
-            }
-          }
-          panelManager.openPanel(
-              "control-center",
-              PanelOpenRequest{
-                  .output = m_hoveredInstance->output,
-                  .anchorX = anchorX,
-                  .anchorY = anchorY,
-                  .hasAnchorPosition = true,
-                  .context = "home",
-                  .sourceBarName = m_hoveredInstance->barConfig.name
-              }
-          );
-        }
+    const auto sx = static_cast<float>(event.sx);
+    const auto sy = static_cast<float>(event.sy);
+    bool pressed = event.pressed;
+    consumed = m_hoveredInstance->inputDispatcher.pointerButton(sx, sy, event.button, pressed);
+    if (pressed && !consumed) {
+      if (handleBarDeadZoneButton(*m_hoveredInstance, sx, sy, event.button, m_platform, m_actionDispatcher)) {
         consumed = true;
       }
     }
@@ -2640,10 +3297,15 @@ bool Bar::onPointerEvent(const PointerEvent& event) {
       break;
     m_hoveredInstance->lastPointerSx = static_cast<float>(event.sx);
     m_hoveredInstance->lastPointerSy = static_cast<float>(event.sy);
-    m_hoveredInstance->inputDispatcher.pointerAxis(
-        static_cast<float>(event.sx), static_cast<float>(event.sy), event.axis, event.axisSource, event.axisValue,
-        event.axisDiscrete, event.axisValue120, event.axisLines
+    const auto sx = static_cast<float>(event.sx);
+    const auto sy = static_cast<float>(event.sy);
+    const bool axisConsumed = m_hoveredInstance->inputDispatcher.pointerAxis(
+        sx, sy, event.axis, event.axisSource, event.axisValue, event.axisDiscrete, event.axisValue120, event.axisLines,
+        event.axisGestureSerial
     );
+    if (!axisConsumed) {
+      handleBarDeadZoneAxis(*m_hoveredInstance, sx, sy, event, m_platform, m_actionDispatcher);
+    }
     break;
   }
   }
@@ -2689,7 +3351,7 @@ BarInstance* Bar::instanceForBar(wl_output* output, std::string_view barName) co
 }
 
 std::optional<std::string> Bar::collectBarIpcInstances(
-    std::optional<std::string_view> barName, std::optional<std::string_view> monitorSelector,
+    std::optional<std::string> barName, std::optional<std::string> monitorSelector,
     std::vector<BarInstance*>& instancesOut
 ) {
   instancesOut.clear();
@@ -2701,14 +3363,19 @@ std::optional<std::string> Bar::collectBarIpcInstances(
   if (barName.has_value()) {
     const bool knownBar = std::ranges::contains(m_config->config().bars, *barName, &BarConfig::name);
     if (!knownBar) {
-      std::vector<std::string> knownBars;
-      knownBars.reserve(m_config->config().bars.size());
-      for (const auto& bar : m_config->config().bars) {
-        knownBars.push_back(bar.name);
+      if (!monitorSelector.has_value()) {
+        monitorSelector = std::move(barName);
+        barName = std::nullopt;
+      } else {
+        std::vector<std::string> knownBars;
+        knownBars.reserve(m_config->config().bars.size());
+        for (const auto& bar : m_config->config().bars) {
+          knownBars.push_back(bar.name);
+        }
+        const std::string suffix =
+            knownBars.empty() ? std::string() : std::string("; known: ") + StringUtils::join(knownBars, ", ");
+        return "error: unknown bar \"" + std::string(*barName) + "\"" + suffix + "\n";
       }
-      const std::string suffix =
-          knownBars.empty() ? std::string() : std::string("; known: ") + StringUtils::join(knownBars, ", ");
-      return "error: unknown bar \"" + std::string(*barName) + "\"" + suffix + "\n";
     }
   }
 
@@ -2797,40 +3464,29 @@ std::optional<std::string> Bar::collectBarIpcInstances(
 namespace {
 
   [[nodiscard]] std::optional<std::string> parseBarVisibilityIpcArgs(
-      std::string_view command, std::string_view args, std::optional<std::string_view>& barName,
-      std::optional<std::string_view>& monitorSelector
+      std::string_view command, std::string_view args, std::optional<std::string>& barName,
+      std::optional<std::string>& monitorSelector
   ) {
-    const auto parts = StringUtils::splitWhitespace(StringUtils::trim(args));
+    const auto parts = noctalia::ipc::splitWords(args);
     if (parts.size() > 2) {
       return "error: usage: " + std::string(command) + " [bar-name] [monitor-selector]\n";
     }
     barName = std::nullopt;
     monitorSelector = std::nullopt;
-    if (!parts.empty()) {
+    if (!parts.empty() && !parts[0].empty()) {
       barName = parts[0];
     }
-    if (parts.size() >= 2) {
+    if (parts.size() >= 2 && !parts[1].empty()) {
       monitorSelector = parts[1];
     }
     return std::nullopt;
   }
 
-  [[nodiscard]] std::optional<std::uint32_t> parseAttachedPanelResizeTestSize(std::string_view value) {
-    std::uint32_t parsed = 0;
-    const char* begin = value.data();
-    const char* end = begin + value.size();
-    const auto [ptr, ec] = std::from_chars(begin, end, parsed);
-    if (ec != std::errc{} || ptr != end || parsed == 0 || parsed > kAttachedPanelResizeTestMaxExtent) {
-      return std::nullopt;
-    }
-    return parsed;
-  }
-
 } // namespace
 
 std::string Bar::showBarIpc(std::string_view args) {
-  std::optional<std::string_view> barName;
-  std::optional<std::string_view> monitorSelector;
+  std::optional<std::string> barName;
+  std::optional<std::string> monitorSelector;
   if (const auto parseError = parseBarVisibilityIpcArgs("bar-show", args, barName, monitorSelector)) {
     return *parseError;
   }
@@ -2849,8 +3505,8 @@ std::string Bar::showBarIpc(std::string_view args) {
 }
 
 std::string Bar::hideBarIpc(std::string_view args) {
-  std::optional<std::string_view> barName;
-  std::optional<std::string_view> monitorSelector;
+  std::optional<std::string> barName;
+  std::optional<std::string> monitorSelector;
   if (const auto parseError = parseBarVisibilityIpcArgs("bar-hide", args, barName, monitorSelector)) {
     return *parseError;
   }
@@ -2861,7 +3517,7 @@ std::string Bar::hideBarIpc(std::string_view args) {
   }
 
   for (BarInstance* instance : targets) {
-    if (!instance->barConfig.autoHide) {
+    if (!barSupportsSlideBehavior(instance->barConfig)) {
       instance->ipcLayoutReleased = true;
     }
     setInstanceIpcVisible(*instance, false);
@@ -2871,8 +3527,8 @@ std::string Bar::hideBarIpc(std::string_view args) {
 }
 
 std::string Bar::toggleBarIpc(std::string_view args) {
-  std::optional<std::string_view> barName;
-  std::optional<std::string_view> monitorSelector;
+  std::optional<std::string> barName;
+  std::optional<std::string> monitorSelector;
   if (const auto parseError = parseBarVisibilityIpcArgs("bar-toggle", args, barName, monitorSelector)) {
     return *parseError;
   }
@@ -2888,7 +3544,7 @@ std::string Bar::toggleBarIpc(std::string_view args) {
 
   if (anyEffectivelyVisible) {
     for (BarInstance* instance : targets) {
-      if (!instance->barConfig.autoHide) {
+      if (!barSupportsSlideBehavior(instance->barConfig)) {
         instance->ipcLayoutReleased = true;
       }
       setInstanceIpcVisible(*instance, false);
@@ -2905,17 +3561,38 @@ std::string Bar::toggleBarIpc(std::string_view args) {
   return "ok\n";
 }
 
+std::string Bar::toggleBarReserveSpaceIpc(std::string_view args) {
+  std::optional<std::string> barName;
+  std::optional<std::string> monitorSelector;
+  if (const auto parseError = parseBarVisibilityIpcArgs("bar-reserve-toggle", args, barName, monitorSelector)) {
+    return *parseError;
+  }
+
+  std::vector<BarInstance*> targets;
+  if (const auto collectError = collectBarIpcInstances(barName, monitorSelector, targets)) {
+    return *collectError;
+  }
+
+  for (BarInstance* instance : targets) {
+    if (instance != nullptr) {
+      instance->barConfig.reserveSpace = !instance->barConfig.reserveSpace;
+      syncBarExclusiveZone(*instance);
+    }
+  }
+  return "ok\n";
+}
+
 std::string Bar::setBarAutoHideIpc(std::string_view args) {
   if (m_config == nullptr) {
     return "error: config service not initialized\n";
   }
 
-  const auto parts = StringUtils::splitWhitespace(StringUtils::trim(args));
+  const auto parts = noctalia::ipc::splitWords(args);
   if (parts.empty() || parts.size() > 3) {
     return "error: usage: bar-auto-hide-set <on|off|true|false|1|0> [bar-name] [monitor-selector]\n";
   }
 
-  const std::string value = parts[0];
+  const std::string& value = parts[0];
   bool enabled = false;
   if (value == "on" || value == "true" || value == "1") {
     enabled = true;
@@ -2925,12 +3602,12 @@ std::string Bar::setBarAutoHideIpc(std::string_view args) {
     return "error: invalid value (use on/off, true/false, 1/0)\n";
   }
 
-  std::optional<std::string_view> barName;
-  std::optional<std::string_view> monitorSelector;
-  if (parts.size() >= 2) {
+  std::optional<std::string> barName;
+  std::optional<std::string> monitorSelector;
+  if (parts.size() >= 2 && !parts[1].empty()) {
     barName = parts[1];
   }
-  if (parts.size() >= 3) {
+  if (parts.size() >= 3 && !parts[2].empty()) {
     monitorSelector = parts[2];
   }
 
@@ -3019,102 +3696,23 @@ std::string Bar::setBarAutoHideIpc(std::string_view args) {
   return "ok\n";
 }
 
-std::uint32_t Bar::attachedPanelResizeTestMaxExtent(const BarInstance& instance) const {
-  if (m_config == nullptr) {
-    return 0;
-  }
-
-  const auto base = computeBarSurfaceSpec(instance.barConfig, m_config->config().shell.shadow);
-  const bool isVertical = (instance.barConfig.position == "left" || instance.barConfig.position == "right");
-  const std::uint32_t baseAxis = isVertical ? base.surfaceWidth : base.surfaceHeight;
-  std::uint32_t outputAxis = 0;
-  if (m_platform != nullptr) {
-    const auto& outputs = m_platform->outputs();
-    const auto it = std::ranges::find_if(outputs, [&instance](const WaylandOutput& output) {
-      return output.output == instance.output;
-    });
-    if (it != outputs.end()) {
-      const auto logicalAxis = isVertical ? it->logicalWidth : it->logicalHeight;
-      if (logicalAxis > 0) {
-        outputAxis = static_cast<std::uint32_t>(logicalAxis);
-      }
-    }
-  }
-  if (outputAxis <= baseAxis) {
-    return kAttachedPanelResizeTestMaxExtent;
-  }
-  return std::min(kAttachedPanelResizeTestMaxExtent, outputAxis - baseAxis);
-}
-
-void Bar::setAttachedPanelResizeTestOpen(BarInstance& instance, bool open, std::uint32_t extent) {
-  if (m_config == nullptr || instance.surface == nullptr) {
-    return;
-  }
-
-  instance.animations.cancelForOwner(&instance.attachedPanelResizeTestOpen);
-  instance.attachedPanelResizeTestOpen = open;
-  instance.attachedPanelResizeTestExtent = open ? extent : 0;
-
-  const auto base = computeBarSurfaceSpec(instance.barConfig, m_config->config().shell.shadow);
-  const bool isVertical = (instance.barConfig.position == "left" || instance.barConfig.position == "right");
-  std::uint32_t targetWidth = base.surfaceWidth;
-  std::uint32_t targetHeight = base.surfaceHeight;
-  if (open) {
-    if (isVertical) {
-      targetWidth += extent;
-    } else {
-      targetHeight += extent;
-    }
-  }
-
-  instance.surface->requestSize(targetWidth, targetHeight);
-  syncBarAutoHideInputRegion(instance);
-  syncBarSurfaceChrome(instance);
-  instance.surface->requestLayout();
-  instance.surface->requestRedraw();
-}
-
-std::string Bar::attachedPanelResizeTestIpc(std::string_view args) {
-  if (m_config == nullptr) {
-    return "error: config service not initialized\n";
-  }
-
-  auto parts = StringUtils::splitWhitespace(StringUtils::trim(args));
-  if (parts.empty()) {
-    return "error: usage: bar-attached-resize-test <open|close|cycle> [bar-name] [monitor-selector] [size=<px>]\n";
-  }
-
-  std::uint32_t extent = kAttachedPanelResizeTestDefaultExtent;
-  bool explicitSize = false;
-  if (parts.back().starts_with("size=")) {
-    explicitSize = true;
-    const std::string_view rawSize(parts.back().data() + 5, parts.back().size() - 5);
-    const auto parsed = parseAttachedPanelResizeTestSize(rawSize);
-    if (!parsed.has_value()) {
-      return "error: size must be an integer from 1 to 4096 pixels\n";
-    }
-    extent = *parsed;
-    parts.pop_back();
-  }
-
+std::string Bar::setBarLayerIpc(std::string_view args) {
+  const auto parts = noctalia::ipc::splitWords(args);
   if (parts.empty() || parts.size() > 3) {
-    return "error: usage: bar-attached-resize-test <open|close|cycle> [bar-name] [monitor-selector] [size=<px>]\n";
+    return "error: usage: bar-layer-set <top|overlay> [bar-name] [monitor-selector]\n";
   }
 
-  const std::string action = parts[0];
-  if (action != "open" && action != "close" && action != "cycle") {
-    return "error: action must be one of: open, close, cycle\n";
-  }
-  if (action == "close" && explicitSize) {
-    return "error: size=<px> is only valid with open or cycle\n";
+  const std::string& layer = parts[0];
+  if (layer != "top" && layer != "overlay") {
+    return "error: invalid layer (use top or overlay)\n";
   }
 
-  std::optional<std::string_view> barName;
-  std::optional<std::string_view> monitorSelector;
-  if (parts.size() >= 2) {
+  std::optional<std::string> barName;
+  std::optional<std::string> monitorSelector;
+  if (parts.size() >= 2 && !parts[1].empty()) {
     barName = parts[1];
   }
-  if (parts.size() >= 3) {
+  if (parts.size() >= 3 && !parts[2].empty()) {
     monitorSelector = parts[2];
   }
 
@@ -3123,83 +3721,98 @@ std::string Bar::attachedPanelResizeTestIpc(std::string_view args) {
     return *collectError;
   }
 
-  if (action != "close") {
-    std::uint32_t maxExtent = kAttachedPanelResizeTestMaxExtent;
-    for (const BarInstance* instance : targets) {
-      if (instance == nullptr) {
-        continue;
-      }
-      maxExtent = std::min(maxExtent, attachedPanelResizeTestMaxExtent(*instance));
-    }
-    if (extent > maxExtent) {
-      return "error: size="
-          + std::to_string(extent)
-          + " exceeds available inner-axis space for at least one target (max "
-          + std::to_string(maxExtent)
-          + ")\n";
-    }
-  }
-
-  if (action == "close") {
-    for (BarInstance* instance : targets) {
-      if (instance != nullptr) {
-        setAttachedPanelResizeTestOpen(*instance, false, 0);
-      }
-    }
-    return "ok: attached panel resize test closed on " + std::to_string(targets.size()) + " bar instance(s)\n";
-  }
-
+  const LayerShellLayer shellLayer = layerShellLayerFromConfig(layer);
   for (BarInstance* instance : targets) {
-    if (instance == nullptr) {
+    if (instance == nullptr || instance->surface == nullptr) {
       continue;
     }
-    setAttachedPanelResizeTestOpen(*instance, true, extent);
-    if (action == "cycle") {
-      instance->animations.animateTimer(
-          0.0f, 1.0f, kAttachedPanelResizeTestCycleHoldMs, Easing::Linear, [](float) {},
-          [this, instance] { setAttachedPanelResizeTestOpen(*instance, false, 0); },
-          &instance->attachedPanelResizeTestOpen
-      );
-      if (instance->surface != nullptr) {
-        instance->surface->requestRedraw();
+    instance->surface->setLayer(shellLayer);
+    instance->barConfig.layer = layer;
+  }
+
+  return "ok\n";
+}
+
+TaskbarWidget* Bar::findTaskbarWidget(const IpcInvocationContext& context) const {
+  const auto findIn = [&context](const std::vector<std::unique_ptr<Widget>>& widgets) -> TaskbarWidget* {
+    for (const auto& widget : widgets) {
+      if (widget->configName() != context.widgetName) {
+        continue;
+      }
+      if (auto* taskbar = dynamic_cast<TaskbarWidget*>(widget.get()); taskbar != nullptr) {
+        return taskbar;
+      }
+    }
+    return nullptr;
+  };
+
+  for (const auto& instance : m_instances) {
+    if (instance->barConfig.name != context.barName || instance->output != context.output) {
+      continue;
+    }
+    for (const auto* section : {&instance->startWidgets, &instance->centerWidgets, &instance->endWidgets}) {
+      if (auto* taskbar = findIn(*section); taskbar != nullptr) {
+        return taskbar;
       }
     }
   }
-
-  return "ok: attached panel resize test "
-      + action
-      + " on "
-      + std::to_string(targets.size())
-      + " bar instance(s), size="
-      + std::to_string(extent)
-      + "\n";
+  return nullptr;
 }
 
 void Bar::registerIpc(IpcService& ipc) {
+  // Widget gesture actions dispatch through the same registry.
+  m_actionDispatcher.setIpcService(&ipc);
+
+  ipc.registerCycleHandler(
+      "taskbar-cycle",
+      [this, &ipc](const std::string& args) -> std::string {
+        const auto parts = noctalia::ipc::splitWords(args);
+        if (parts.size() != 1 || (parts[0] != "next" && parts[0] != "prev")) {
+          return "error: taskbar-cycle requires <next|prev>\n";
+        }
+        // Order comes from the taskbar's own model (pins, grouping, per-monitor filter), so the
+        // target is a widget instance rather than a global window list.
+        const auto& context = ipc.invocationContext();
+        if (!context.has_value() || context->widgetName.empty()) {
+          return "error: taskbar-cycle must be invoked from a taskbar widget gesture\n";
+        }
+        auto* taskbar = findTaskbarWidget(*context);
+        if (taskbar == nullptr) {
+          return "error: no taskbar widget named '" + context->widgetName + "' on bar '" + context->barName + "'\n";
+        }
+        taskbar->cycleAdjacent(parts[0] == "next" ? 1 : -1);
+        return "ok\n";
+      },
+      "taskbar-cycle <next|prev>", "Step to the adjacent task or workspace group in the invoking taskbar"
+  );
+
   ipc.registerHandler(
       "bar-show", [this](const std::string& args) -> std::string { return showBarIpc(args); },
-      "bar-show [bar-name] [monitor-selector]", "Show one or all bars"
+      "[bar-name] [monitor-selector]", "Show one or all bars"
   );
 
   ipc.registerHandler(
       "bar-hide", [this](const std::string& args) -> std::string { return hideBarIpc(args); },
-      "bar-hide [bar-name] [monitor-selector]", "Hide one or all bars and release their layout gaps"
+      "[bar-name] [monitor-selector]", "Hide one or all bars and release their layout gaps"
   );
 
   ipc.registerHandler(
       "bar-toggle", [this](const std::string& args) -> std::string { return toggleBarIpc(args); },
-      "bar-toggle [bar-name] [monitor-selector]", "Toggle visibility for one or all bars"
+      "[bar-name] [monitor-selector]", "Toggle visibility for one or all bars"
+  );
+
+  ipc.registerHandler(
+      "bar-reserve-toggle", [this](const std::string& args) -> std::string { return toggleBarReserveSpaceIpc(args); },
+      "[bar-name] [monitor-selector]", "Toggle reserve space for one or all bars"
   );
 
   ipc.registerHandler(
       "bar-auto-hide-set", [this](const std::string& args) -> std::string { return setBarAutoHideIpc(args); },
-      "bar-auto-hide-set <on|off|true|false|1|0> [bar-name] [monitor-selector]", "Set auto-hide state for a bar"
+      "<on|off|true|false|1|0> [bar-name] [monitor-selector]", "Set auto-hide state for a bar"
   );
 
   ipc.registerHandler(
-      "bar-attached-resize-test",
-      [this](const std::string& args) -> std::string { return attachedPanelResizeTestIpc(args); },
-      "bar-attached-resize-test <open|close|cycle> [bar-name] [monitor-selector] [size=<px>]",
-      "Exercise live bar-surface resize for attached-panel validation", IpcService::HandlerVisibility::Hidden
+      "bar-layer-set", [this](const std::string& args) -> std::string { return setBarLayerIpc(args); },
+      "<top|overlay> [bar-name] [monitor-selector]", "Set one or all bar layers"
   );
 }

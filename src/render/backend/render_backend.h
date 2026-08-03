@@ -2,6 +2,7 @@
 
 #include "render/core/color.h"
 #include "render/core/mat3.h"
+#include "render/core/render_styles.h"
 #include "render/core/texture_handle.h"
 
 #include <cstdint>
@@ -12,16 +13,7 @@ class GlSharedContext;
 class RenderTarget;
 class TextureManager;
 struct wl_surface;
-enum class WallpaperSourceKind : std::uint8_t;
-enum class WallpaperTransition : std::uint8_t;
-struct AudioSpectrumStyle;
-struct EffectStyle;
-struct FancyAudioVisualizerStyle;
-struct GraphStyle;
-struct RoundedRectStyle;
-struct ScreenCornerStyle;
-struct SpinnerStyle;
-struct TransitionParams;
+struct WallpaperDrawParams;
 
 class RenderFramebuffer {
 public:
@@ -31,6 +23,7 @@ public:
   [[nodiscard]] virtual TextureId colorTexture() const noexcept = 0;
   [[nodiscard]] virtual std::uint32_t width() const noexcept = 0;
   [[nodiscard]] virtual std::uint32_t height() const noexcept = 0;
+  virtual void abandon() noexcept = 0;
 };
 
 enum class RenderGraphicsResetStatus {
@@ -71,6 +64,7 @@ struct RenderImageDraw {
   float textureWidth = 0.0f;
   float textureHeight = 0.0f;
   Mat3 transform = Mat3::identity();
+  ImageScrim scrim{};
 };
 
 struct RenderGlyphDraw {
@@ -113,12 +107,19 @@ public:
   virtual void initialize(GlSharedContext& shared) = 0;
   virtual void cleanup() = 0;
 
-  virtual void makeCurrent(RenderTarget& target) = 0;
-  virtual void makeCurrentNoSurface() = 0;
-  virtual void beginFrame(RenderTarget& target) = 0;
+  // Returns false if the surface could not be made current (e.g. invalidated
+  // during compositor teardown); callers must skip the frame, not treat it as fatal.
+  virtual bool makeCurrent(RenderTarget& target) = 0;
+  // Returns false if the surfaceless context could not be made current (e.g. lost on resume);
+  // best-effort callers may ignore it, GPU paths must skip the work, not treat it as fatal.
+  virtual bool makeCurrentNoSurface() = 0;
+  // Returns false if the frame could not begin; callers must skip drawing and endFrame.
+  virtual bool beginFrame(RenderTarget& target) = 0;
   virtual void endFrame(RenderTarget& target) = 0;
   [[nodiscard]] virtual RenderGraphicsResetStatus graphicsResetStatus() = 0;
   virtual void invalidateGpuResources() = 0;
+  // Tear down a lost context without attempting to preserve its invalid GL objects.
+  virtual void abandonAfterGraphicsReset() noexcept = 0;
 
   [[nodiscard]] virtual std::unique_ptr<RenderSurfaceTarget> createSurfaceTarget(wl_surface* surface) = 0;
   [[nodiscard]] virtual std::unique_ptr<RenderFramebuffer>
@@ -141,6 +142,10 @@ public:
       float surfaceWidth, float surfaceHeight, float width, float height, const SpinnerStyle& style,
       const Mat3& transform
   ) = 0;
+  virtual void drawCountdownRing(
+      float surfaceWidth, float surfaceHeight, float width, float height, const CountdownRingStyle& style,
+      const Mat3& transform
+  ) = 0;
   virtual void drawScreenCorner(
       float surfaceWidth, float surfaceHeight, float pixelScaleX, float pixelScaleY, float width, float height,
       const ScreenCornerStyle& style, const Mat3& transform
@@ -161,13 +166,7 @@ public:
       TextureId dataTexture, int textureWidth, float surfaceWidth, float surfaceHeight, float width, float height,
       const GraphStyle& style, const Mat3& transform
   ) = 0;
-  virtual void drawWallpaper(
-      WallpaperTransition transition, WallpaperSourceKind sourceKind1, TextureId texture1, const Color& sourceColor1,
-      WallpaperSourceKind sourceKind2, TextureId texture2, const Color& sourceColor2, float surfaceWidth,
-      float surfaceHeight, float width, float height, float imageWidth1, float imageHeight1, float imageWidth2,
-      float imageHeight2, float progress, float fillMode, const TransitionParams& params, const Color& fillColor,
-      const Mat3& transform
-  ) = 0;
+  virtual void drawWallpaper(const WallpaperDrawParams& params) = 0;
   virtual void drawFullscreenTexture(TextureId texture, bool flipY) = 0;
   virtual void drawFullscreenTint(Color color) = 0;
   virtual void drawFramebufferBlur(

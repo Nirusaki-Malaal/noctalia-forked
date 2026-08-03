@@ -1,8 +1,10 @@
 #pragma once
 
 #include "config/config_types.h"
+#include "core/timer_manager.h"
 #include "notification.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -27,6 +29,10 @@ struct NotificationHistoryEntry {
 
 constexpr int32_t kDefaultNotificationTimeout = 6000;
 
+// Upper bound on action pairs (key + label) kept per notification. Enforced once at ingress
+// in addOrReplace(); render sites clamp defensively against the same value.
+constexpr std::size_t kMaxNotificationActions = 6;
+
 // Freedesktop expire_timeout: 0 = persistent, -1 = server default, positive = milliseconds.
 // Normalize once at Notify ingress so manager timers and toast countdowns stay aligned.
 [[nodiscard]] inline int32_t normalizeNotifyExpireTimeout(int32_t expireTimeout) noexcept {
@@ -38,6 +44,23 @@ constexpr int32_t kDefaultNotificationTimeout = 6000;
   }
   return expireTimeout;
 }
+
+struct NotificationRequest {
+  uint32_t replacesId = 0;
+  std::string appName;
+  std::string summary;
+  std::string body;
+  Urgency urgency = Urgency::Normal;
+  int32_t timeout = kDefaultNotificationTimeout;
+  NotificationOrigin origin = NotificationOrigin::External;
+  bool transient = false;
+  std::vector<std::string> actions;
+  std::optional<std::string> icon = std::nullopt;
+  std::optional<NotificationImageData> imageData = std::nullopt;
+  std::optional<std::string> category = std::nullopt;
+  std::optional<std::string> desktopEntry = std::nullopt;
+  std::optional<uint32_t> forcedId = std::nullopt;
+};
 
 class NotificationManager {
 public:
@@ -53,13 +76,10 @@ public:
   void removeEventCallback(int token);
 
   // Adds a new notification or updates an existing one.
-  uint32_t addOrReplace(
-      uint32_t replacesId, std::string appName, std::string summary, std::string body, Urgency urgency, int32_t timeout,
-      NotificationOrigin origin = NotificationOrigin::External, bool transient = false,
-      std::vector<std::string> actions = {}, std::optional<std::string> icon = std::nullopt,
-      std::optional<NotificationImageData> imageData = std::nullopt, std::optional<std::string> category = std::nullopt,
-      std::optional<std::string> desktopEntry = std::nullopt
-  );
+  uint32_t addOrReplace(NotificationRequest request);
+
+  // Adopts a notification id assigned by an external server (e.g. KDE Plasma).
+  uint32_t adoptExternal(uint32_t id, NotificationRequest request);
 
   // Adds an internal notification to the same store as external notifications.
   uint32_t addInternal(
@@ -104,6 +124,7 @@ public:
   void clearHistory();
   void setFilters(std::vector<NotificationFilterConfig> filters);
   [[nodiscard]] const std::vector<NotificationFilterConfig>& filters() const noexcept;
+  void setHistoryRetentionHours(int hours);
   void setDoNotDisturb(bool enabled);
   [[nodiscard]] bool doNotDisturb() const noexcept;
   [[nodiscard]] bool toggleDoNotDisturb();
@@ -121,6 +142,7 @@ public:
   void flushPersistedHistory();
 
 private:
+  void cleanupOldHistoryEntries();
   void upsertHistory(const Notification& notification, bool active, std::optional<CloseReason> closeReason);
   void rebuildHistoryIndex();
   void schedulePersistHistory();
@@ -133,14 +155,18 @@ private:
     bool showToast = true;
     bool saveHistory = true;
     bool playSound = true;
+    bool disallowPermanent = false;
+    std::optional<std::int32_t> overrideDuration;
   };
   [[nodiscard]] ExternalNotificationDispatch evaluateExternalDispatch(
-      Urgency urgency, std::string_view appName, const std::optional<std::string>& category,
-      const std::optional<std::string>& desktopEntry, bool transient
+      NotificationOrigin origin, Urgency urgency, std::string_view appName, const std::optional<std::string>& category,
+      const std::optional<std::string>& desktopEntry, std::string_view summary, std::string_view body, bool transient
   ) const;
   uint32_t suppressExternal(std::string_view appName, Urgency urgency);
 
+  int m_historyRetentionHours = 0;
   bool m_persistScheduled = false;
+  Timer m_historyRetentionTimer;
 
   std::deque<Notification> m_notifications;
   std::unordered_map<uint32_t, size_t> m_idToIndex;

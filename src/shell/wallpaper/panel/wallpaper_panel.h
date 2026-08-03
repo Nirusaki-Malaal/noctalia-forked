@@ -7,6 +7,7 @@
 #include "shell/wallpaper/panel/wallpaper_scanner.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -19,14 +20,18 @@ class Button;
 class ConfigService;
 class Flex;
 class Input;
-class InputArea;
 class Label;
 class Segmented;
 class Select;
+class Spinner;
 class Toggle;
 class VirtualGridView;
 class WallpaperGridAdapter;
 class WaylandConnection;
+
+namespace noctalia::theme {
+  class ThemeService;
+}
 
 class WallpaperPanel : public Panel {
 public:
@@ -35,9 +40,13 @@ public:
     NameDesc,
     DateAsc,
     DateDesc,
+    Random,
   };
 
-  WallpaperPanel(WaylandConnection* wayland, ConfigService* config, ThumbnailService* thumbnails);
+  WallpaperPanel(
+      WaylandConnection* wayland, ConfigService* config, ThumbnailService* thumbnails, WallpaperScanner* scanner,
+      noctalia::theme::ThemeService* themeService = nullptr
+  );
   ~WallpaperPanel() override;
 
   void create() override;
@@ -48,7 +57,6 @@ public:
   [[nodiscard]] float preferredWidth() const override { return scaled(980.0f); }
   [[nodiscard]] float preferredHeight() const override { return scaled(700.0f); }
   [[nodiscard]] PanelPlacement panelPlacement() const noexcept override;
-  [[nodiscard]] LayerShellLayer layer() const override { return LayerShellLayer::Overlay; }
   [[nodiscard]] LayerShellKeyboard keyboardMode() const override { return LayerShellKeyboard::Exclusive; }
   [[nodiscard]] InputArea* initialFocusArea() const override;
 
@@ -65,6 +73,8 @@ private:
   void populateMonitorChoices();
   void refreshVisibleEntries();
   void refreshScan();
+  void onScanComplete();
+  void syncLoadingState();
   void applyFilter();
   void syncBrowseChrome();
   void syncBackButton();
@@ -87,6 +97,7 @@ private:
       const std::filesystem::path& activeDir, const std::filesystem::path& rootDir
   ) const;
   void sortVisibleEntries();
+  void reseedRandomSort();
   void syncSortButtonGlyph();
   void cycleSortMode();
   void setSortMode(SortMode mode);
@@ -111,8 +122,8 @@ private:
   WaylandConnection* m_wayland = nullptr;
   ConfigService* m_config = nullptr;
   ThumbnailService* m_thumbnails = nullptr;
-
-  WallpaperScanner m_scanner;
+  WallpaperScanner* m_scanner = nullptr;
+  noctalia::theme::ThemeService* m_themeService = nullptr;
 
   // UI nodes (owned by the root flex tree).
   Flex* m_rootLayout = nullptr;
@@ -132,6 +143,8 @@ private:
   Button* m_colorButton = nullptr;
   Button* m_closeButton = nullptr;
   VirtualGridView* m_grid = nullptr;
+  Flex* m_loadingBox = nullptr;
+  Spinner* m_spinner = nullptr;
   std::unique_ptr<WallpaperGridAdapter> m_adapter;
 
   std::vector<MonitorChoice> m_monitorChoices;
@@ -150,9 +163,13 @@ private:
   Timer m_filterDebounceTimer;
 
   bool m_flatten = false;
+  bool m_scanPending = false;
   SortMode m_sortMode = SortMode::NameAsc;
+  std::uint64_t m_randomSeed = 0;
   std::size_t m_pinnedFavoriteCount = 0;
   bool m_syncingFavoriteControls = false;
+  bool m_syncingGridSelectionVisual = false;
+  bool m_gridKeyboardActive = false;
   std::vector<std::string> m_favoritePaletteDetailValues;
   std::vector<PaletteSource> m_paletteSourceOrder;
   static constexpr std::size_t kNoVisibleSelection = std::numeric_limits<std::size_t>::max();

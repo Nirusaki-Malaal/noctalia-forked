@@ -5,7 +5,6 @@
 
 #include <cairo-ft.h>
 #include <cairo.h>
-#include <ft2build.h>
 #include FT_FREETYPE_H
 
 #include <algorithm>
@@ -118,6 +117,12 @@ void CairoGlyphRenderer::invalidateGlyphTextures() {
       m_textureManager->unload(entry.texture);
     }
   }
+  m_cache.clear();
+  m_lru.clear();
+  m_cacheBytes = 0;
+}
+
+void CairoGlyphRenderer::abandonGlyphTextures() noexcept {
   m_cache.clear();
   m_lru.clear();
   m_cacheBytes = 0;

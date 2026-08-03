@@ -1,16 +1,17 @@
 #pragma once
 
 #include "ui/controls/flex.h"
+#include "ui/controls/scrollbar.h"
 #include "ui/palette.h"
 #include "ui/signal.h"
 #include "ui/style.h"
 
+#include <chrono>
+#include <cstdint>
 #include <functional>
 
 class InputArea;
 class RectNode;
-class Renderer;
-class Scrollbar;
 
 struct ScrollViewState {
   float offset = 0.0f;
@@ -19,6 +20,7 @@ struct ScrollViewState {
 class ScrollView : public Flex {
 public:
   ScrollView();
+  void setOrientation(ScrollOrientation orientation);
 
   [[nodiscard]] Flex* content() noexcept { return m_content; }
   [[nodiscard]] const Flex* content() const noexcept { return m_content; }
@@ -26,6 +28,8 @@ public:
   void setScrollOffset(float offset);
   void scrollBy(float delta);
   void setScrollbarVisible(bool visible);
+  // Vertical clearance at both track ends (e.g. the host card's corner radius).
+  void setScrollbarInsetV(float inset);
   void setViewportPaddingH(float padding);
   void setViewportPaddingV(float padding);
   void setFill(const ColorSpec& fill);
@@ -36,13 +40,17 @@ public:
   void clearBorder();
   void setRadius(float radius);
   void setSoftness(float softness);
-  void setCardStyle(float scale = 1.0f, float fillOpacity = 1.0f, bool showBorder = true);
+  // Section card background. The outline follows the [shell].card_borders
+  // toggle unless a caller passes an explicit showBorder.
+  void setCardStyle(float scale = 1.0f, float fillOpacity = 1.0f, bool showBorder = Style::cardBordersEnabled());
   void bindState(ScrollViewState* state);
   void setOnScrollChanged(std::function<void(float)> callback);
 
   [[nodiscard]] float scrollOffset() const noexcept { return m_scrollOffset; }
   [[nodiscard]] float maxScrollOffset() const noexcept { return m_maxScrollOffset; }
   [[nodiscard]] bool scrollable() const noexcept { return m_maxScrollOffset > 0.0f; }
+  [[nodiscard]] ScrollOrientation orientation() const noexcept { return m_orientation; }
+
   [[nodiscard]] float contentViewportWidth() const noexcept;
   [[nodiscard]] float contentViewportHeight() const noexcept;
   [[nodiscard]] float viewportPaddingH() const noexcept { return m_viewportPaddingH; }
@@ -54,6 +62,10 @@ private:
   void doArrange(Renderer& renderer, const LayoutRect& rect) override;
   void applyPalette();
   void applyScrollOffset();
+  void applyScrollOffsetValue(float offset);
+  void stopScrollAnimation();
+  void animateScrollTo(float target, float durationMs = -1.0f);
+  void startFling();
   [[nodiscard]] float clampOffset(float offset) const noexcept;
 
   RectNode* m_background = nullptr;
@@ -70,10 +82,15 @@ private:
   float m_viewportPaddingH = Style::spaceXs;
   float m_viewportPaddingV = Style::spaceSm;
   float m_scrollOffset = 0.0f;
+  float m_targetScrollOffset = 0.0f;
   float m_maxScrollOffset = 0.0f;
   float m_scrollWheelStep = Style::scrollWheelStep;
-  float m_dragStartLocalY = 0.0f;
+  float m_dragStartPosition = 0.0f;
   float m_dragStartOffset = 0.0f;
+  float m_lastDragPosition = 0.0f;
+  float m_dragVelocity = 0.0f;
+  std::chrono::steady_clock::time_point m_lastDragSampleAt;
+  std::uint32_t m_scrollAnimId = 0;
   float m_viewportHeight = 0.0f;
   float m_viewportWidth = 0.0f;
   float m_backgroundBorderWidth = 0.0f;
@@ -81,4 +98,6 @@ private:
   float m_backgroundSoftness = 1.0f;
   bool m_scrollbarShown = false;
   bool m_showScrollbar = true;
+  bool m_dragging = false;
+  ScrollOrientation m_orientation = ScrollOrientation::Vertical;
 };

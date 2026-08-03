@@ -1,10 +1,12 @@
 #include "capture/screencopy_util.h"
 
+#include "capture/screencopy_capture.h"
 #include "wayland/wayland_connection.h"
 
 #include <algorithm>
 #include <cstring>
-#include <wayland-client.h>
+#include <wayland-client-core.h>
+#include <wayland-client-protocol.h>
 
 namespace {
 
@@ -198,18 +200,20 @@ namespace screencopy {
 
   bool captureOutputBlocking(
       ScreencopyCapture& capture, WaylandConnection& wayland, wl_output* output, ScreencopyImage& out,
-      std::string& error
+      std::string& error, bool overlayCursor
   ) {
     error.clear();
     bool finished = false;
-    capture.capture(output, std::nullopt, false, [&](std::optional<ScreencopyImage> image, const std::string& err) {
-      finished = true;
-      if (!err.empty() || !image.has_value()) {
-        error = err.empty() ? "screencopy capture failed" : err;
-        return;
-      }
-      out = std::move(*image);
-    });
+    capture.capture(
+        output, std::nullopt, overlayCursor, [&](std::optional<ScreencopyImage> image, const std::string& err) {
+          finished = true;
+          if (!err.empty() || !image.has_value()) {
+            error = err.empty() ? "screencopy capture failed" : err;
+            return;
+          }
+          out = std::move(*image);
+        }
+    );
 
     if (!error.empty()) {
       return false;

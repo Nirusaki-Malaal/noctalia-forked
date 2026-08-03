@@ -1,9 +1,9 @@
 #include "notification/notification_display_name.h"
 
+#include "notification/notification.h"
 #include "system/app_identity.h"
 #include "system/desktop_entry.h"
 #include "system/internal_app_metadata.h"
-#include "util/string_utils.h"
 
 #include <cctype>
 #include <optional>
@@ -11,11 +11,6 @@
 #include <string_view>
 
 namespace {
-
-  constexpr app_identity::DesktopEntryLookupOptions kLookupOptions{
-      .includeHidden = true,
-      .includeNoDisplay = true,
-  };
 
   std::string normalizeDesktopKey(std::string_view key) {
     std::string normalized(key);
@@ -33,7 +28,7 @@ namespace {
     if (key.empty()) {
       return std::nullopt;
     }
-    const auto entry = app_identity::findDesktopEntry(normalizeDesktopKey(key), desktopEntries(), kLookupOptions);
+    const auto entry = app_identity::findDesktopEntry(normalizeDesktopKey(key), desktopEntries());
     if (!entry.has_value()) {
       return std::nullopt;
     }

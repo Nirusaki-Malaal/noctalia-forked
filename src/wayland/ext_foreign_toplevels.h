@@ -11,7 +11,6 @@
 struct ext_foreign_toplevel_handle_v1;
 struct ext_foreign_toplevel_list_v1;
 struct wl_display;
-struct wl_output;
 
 // ext-foreign-toplevel-list enumerates all mapped toplevels on bind (unlike wlr foreign-toplevel on Hyprland).
 class WaylandExtForeignToplevels {
@@ -26,6 +25,7 @@ public:
   [[nodiscard]] std::vector<std::string> allAppIds() const;
   [[nodiscard]] std::vector<ToplevelInfo>
   windowsForApp(const std::string& idLower, const std::string& wmClassLower) const;
+  [[nodiscard]] std::vector<ToplevelInfo> windowsWithoutAppId() const;
 
   template <typename Fn> void visitExtHandles(Fn&& fn) const {
     for (const auto& [handle, _] : m_handles) {

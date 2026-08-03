@@ -2,9 +2,9 @@
 
 #include "config/config_service.h"
 #include "core/log.h"
-#include "core/process.h"
 #include "ipc/ipc_arg_parse.h"
 #include "ipc/ipc_service.h"
+#include "pipewire/wireplumber_mixer.h"
 #include "util/string_utils.h"
 
 #include <algorithm>
@@ -21,7 +21,6 @@
 #include <pipewire/keys.h>
 #include <pipewire/pipewire.h>
 #include <ranges>
-#include <spa/param/audio/format-utils.h>
 #include <spa/param/param.h>
 #include <spa/param/props.h>
 #include <spa/param/route.h>
@@ -37,8 +36,18 @@
 
 namespace {
 
-  constexpr float kDefaultVolumeStep = 0.05f;
-  constexpr auto kVolumeApplyMinInterval = std::chrono::milliseconds(25);
+  // Volume change thresholds.
+  constexpr auto kVolumeStepDefault = 0.05f;
+  constexpr auto kVolumeChangeEpsilon = 0.0001f;
+
+  // Held-key relative adjustment: accumulate a gesture-local target so async read-back echoes
+  // can't rubber-band the ramp; a gap past the window or a direction change restarts the gesture.
+  constexpr auto kVolumeHoldWindow = std::chrono::milliseconds(800);
+  constexpr auto kVolumeHoldMinIpcInterval = std::chrono::milliseconds(50);
+
+  // Write guard: keep optimistic local volume briefly and ignore echoes within epsilon.
+  constexpr auto kVolumeWriteGuardDuration = std::chrono::milliseconds(400);
+  constexpr auto kVolumeWriteGuardEpsilon = 0.02f;
 
   // Registry events.
   void onRegistryGlobal(
@@ -243,20 +252,6 @@ namespace {
     return changed;
   }
 
-  std::string escapeJsonString(std::string_view text) {
-    std::string escaped;
-    escaped.reserve(text.size());
-
-    for (const char ch : text) {
-      if (ch == '\\' || ch == '"') {
-        escaped.push_back('\\');
-      }
-      escaped.push_back(ch);
-    }
-
-    return escaped;
-  }
-
   std::uint32_t parseUint32Or(const std::string& value, std::uint32_t fallback = 0) {
     if (value.empty()) {
       return fallback;
@@ -419,6 +414,51 @@ namespace {
     } else if (p.hasSoft) {
       nd.volume = p.softVol;
     }
+  }
+
+  [[nodiscard]] float resolvedVolume(const ParsedPropsVolumes& p) {
+    if (p.hasChannel) {
+      return p.channelVol;
+    }
+    if (p.hasScalar) {
+      return p.scalarVol;
+    }
+    if (p.hasSoft) {
+      return p.softVol;
+    }
+    return -1.0f;
+  }
+
+  [[nodiscard]] bool shouldRejectVolumeWrite(const PipeWireService::NodeData& nd, float candidateVol) {
+    if (nd.lastWrittenVolume < 0.0f) {
+      return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= nd.volumeWriteGuardUntil) {
+      return false;
+    }
+    return std::abs(candidateVol - nd.lastWrittenVolume) > kVolumeWriteGuardEpsilon;
+  }
+
+  void confirmVolumeWrite(PipeWireService::NodeData& nd, float candidateVol) {
+    if (nd.lastWrittenVolume < 0.0f) {
+      return;
+    }
+    if (std::abs(candidateVol - nd.lastWrittenVolume) <= kVolumeWriteGuardEpsilon) {
+      nd.volumeWriteGuardUntil = {};
+    }
+  }
+
+  bool mergeIncomingVolumes(PipeWireService::NodeData& nd, const ParsedPropsVolumes& p) {
+    const float candidate = resolvedVolume(p);
+    if (candidate >= 0.0f && shouldRejectVolumeWrite(nd, candidate)) {
+      return false;
+    }
+    mergeParsedVolumesIntoNode(nd, p);
+    if (candidate >= 0.0f) {
+      confirmVolumeWrite(nd, candidate);
+    }
+    return true;
   }
 
   // Device ParamRoute updates are per-direction; applying every route's volume to all nodes on the same
@@ -645,18 +685,25 @@ namespace {
     return isProgramStreamClass(nd.mediaClass) && nd.name.starts_with("qemu-system-");
   }
 
+  [[nodiscard]] bool hasProgramStreamIdentity(const PipeWireService::NodeData& nd) {
+    if (isQemuStreamNode(nd)) {
+      return true;
+    }
+    return !nd.applicationName.empty() || !nd.applicationId.empty() || !nd.applicationBinary.empty();
+  }
+
   [[nodiscard]] bool isProgramOutputNode(const PipeWireService::NodeData& nd) {
-    // Match wpctl "Streams": Stream/Output/Audio without node.link-group. Loopback/filter endpoints
-    // also expose target.object or node.passive and must not appear as application volumes. QEMU
-    // streams are the exception: they set target.object to name the VM target but are still
-    // user-controllable application volumes (as pavucontrol/wpctl show them).
+    // Match the "Streams" pavucontrol shows: Stream/Output/Audio without node.link-group /
+    // node.passive (loopback and filter endpoints). Streams that pin a sink via target.object
+    // (Telegram/OpenAL, etc.) stay visible when they have client/app identity; anonymous
+    // target.object nodes are still treated as filter plumbing.
     if (!isProgramStreamClass(nd.mediaClass) || !nd.streamClassificationReady) {
       return false;
     }
     if (!nd.linkGroup.empty() || nd.nodePassive) {
       return false;
     }
-    if (!nd.targetObject.empty() && !isQemuStreamNode(nd)) {
+    if (!nd.targetObject.empty() && !hasProgramStreamIdentity(nd)) {
       return false;
     }
     return true;
@@ -716,9 +763,6 @@ PipeWireService::PipeWireService() {
 }
 
 PipeWireService::~PipeWireService() {
-  m_volumeThrottleTimer.stop();
-  m_pendingNodeVolumes.clear();
-
   // Destroy node proxies and their listeners
   for (auto& [id, nd] : m_nodes) {
     if (nd->listener != nullptr) {
@@ -834,6 +878,8 @@ const AudioNode* PipeWireService::defaultSource() const noexcept {
   }
   return nullptr;
 }
+
+std::string audioDeviceLabel(const AudioNode& node) { return !node.description.empty() ? node.description : node.name; }
 
 void PipeWireService::onRegistryGlobal(std::uint32_t id, const char* type, std::uint32_t, const spa_dict* props) {
   if (std::strcmp(type, PW_TYPE_INTERFACE_Client) == 0) {
@@ -1196,6 +1242,10 @@ void PipeWireService::onNodeParam(
   }
 
   auto& nd = *it->second;
+  // Device nodes get their volume/mute authoritatively from mixer-api (onMixerVolumeChanged); their
+  // SPA_PARAM_Props volume/mute echoes are ignored. Route availability and mute are still tracked
+  // for device selection and effective mute.
+  const bool isDeviceNode = nd.mediaClass == "Audio/Sink" || nd.mediaClass == "Audio/Source";
   if (paramId == SPA_PARAM_Route) {
     std::int32_t routeIndex = -1;
     std::int32_t routeDevice = -1;
@@ -1234,7 +1284,8 @@ void PipeWireService::onNodeParam(
       }
       upsertRoute(nd.routes, route);
 
-      if (routeAvailable != SPA_PARAM_AVAILABILITY_no
+      if (!isDeviceNode
+          && routeAvailable != SPA_PARAM_AVAILABILITY_no
           && routeProps != nullptr
           && routeVolumeDirectionMatchesNode(nd.mediaClass, routeDirection)) {
         ParsedPropsVolumes basis{};
@@ -1244,11 +1295,16 @@ void PipeWireService::onNodeParam(
         basis.channelCount = nd.channelCount;
         ParsedPropsVolumes fromRoute{};
         parsePropsObjectVolumeFields(routeProps, basis, &fromRoute);
-        mergeParsedVolumesIntoNode(nd, fromRoute);
+        mergeIncomingVolumes(nd, fromRoute);
       }
       recomputeEffectiveMute(nd);
       rebuildState();
     }
+    return;
+  }
+
+  // Props volume/mute is authoritative only for program streams; device nodes use mixer-api.
+  if (isDeviceNode) {
     return;
   }
 
@@ -1271,20 +1327,9 @@ void PipeWireService::onNodeParam(
     }
   }
 
-  float candidateVol = -1.0f;
-  if (parsed.hasChannel) {
-    candidateVol = parsed.channelVol;
-  } else if (parsed.hasScalar) {
-    candidateVol = parsed.scalarVol;
-  } else if (parsed.hasSoft) {
-    candidateVol = parsed.softVol;
-  }
-  const bool isAudioDeviceNode = nd.mediaClass == "Audio/Sink" || nd.mediaClass == "Audio/Source";
-  const bool rejectStaleFullScaleProps =
-      isAudioDeviceNode && candidateVol >= 0.0f && candidateVol >= 0.99f && nd.volume < 0.93f;
-
-  if (!rejectStaleFullScaleProps) {
-    mergeParsedVolumesIntoNode(nd, parsed);
+  float candidateVol = resolvedVolume(parsed);
+  if (candidateVol >= 0.0f) {
+    mergeIncomingVolumes(nd, parsed);
   }
 
   recomputeEffectiveMute(nd);
@@ -1364,18 +1409,6 @@ void PipeWireService::onDeviceParam(
     spa_pod_get_id(&availProp->value, &routeAvailable);
   }
 
-  ParsedPropsVolumes fromRoute{};
-  bool parsedRouteVolume = false;
-  if (routeProps != nullptr && routeAvailable != SPA_PARAM_AVAILABILITY_no) {
-    ParsedPropsVolumes basis{};
-    basis.channelVol = 1.0f;
-    basis.scalarVol = 1.0f;
-    basis.softVol = 1.0f;
-    basis.channelCount = 0;
-    parsePropsObjectVolumeFields(routeProps, basis, &fromRoute);
-    parsedRouteVolume = fromRoute.hasChannel || fromRoute.hasScalar || fromRoute.hasSoft;
-  }
-
   bool muted = false;
   if (routeProps != nullptr) {
     spa_pod_prop* prop = nullptr;
@@ -1399,17 +1432,7 @@ void PipeWireService::onDeviceParam(
   route.muted = muted;
   upsertRoute(it->second.routes, route);
 
-  if (parsedRouteVolume) {
-    for (auto& [nid, node] : m_nodes) {
-      (void)nid;
-      if (node != nullptr
-          && node->deviceId == id
-          && routeVolumeDirectionMatchesNode(node->mediaClass, routeDirection)) {
-        mergeParsedVolumesIntoNode(*node, fromRoute);
-      }
-    }
-  }
-
+  // Device volume is authoritative through mixer-api; only route mute feeds effective mute here.
   for (auto& [nid, node] : m_nodes) {
     if (node != nullptr && node->deviceId == id) {
       recomputeEffectiveMute(*node);
@@ -1434,6 +1457,33 @@ void PipeWireService::parseDefaultNodes(const spa_dict* props) {
 
   if (changed) {
     m_pendingDefaultAudioDevicePropsEnum = true;
+    rebuildState();
+  }
+}
+
+void PipeWireService::onMixerVolumeChanged(std::uint32_t id, float volume, bool muted) {
+  const auto it = m_nodes.find(id);
+  if (it == m_nodes.end()) {
+    return;
+  }
+  auto& nd = *it->second;
+  if (nd.mediaClass != "Audio/Sink" && nd.mediaClass != "Audio/Source") {
+    return;
+  }
+
+  const float clamped = std::clamp(volume, 0.0f, 1.5f);
+  bool changed = false;
+  if (std::abs(nd.volume - clamped) >= kVolumeChangeEpsilon) {
+    nd.volume = clamped;
+    changed = true;
+  }
+  if (nd.swMute != muted) {
+    nd.swMute = muted;
+    changed = true;
+  }
+  const bool before = nd.muted;
+  recomputeEffectiveMute(nd);
+  if (changed || before != nd.muted) {
     rebuildState();
   }
 }
@@ -1473,7 +1523,7 @@ void PipeWireService::refreshNodeIdentity(NodeData& nd) {
     idSuffix.reserve(renameTo.size());
     bool prevDash = false;
     for (const char ch : renameTo) {
-      const unsigned char u = static_cast<unsigned char>(ch);
+      const auto u = static_cast<unsigned char>(ch);
       const bool alphanumeric = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9');
       if (alphanumeric) {
         idSuffix.push_back(static_cast<char>(std::tolower(u)));
@@ -1547,6 +1597,28 @@ void PipeWireService::rebuildState() {
     node.muted = nd->muted;
     node.channelCount = nd->channelCount;
 
+    // Availability from the active output/input route: a device with a matching route that is
+    // explicitly unavailable and no available alternative is hidden. Cards that report "unknown"
+    // (many HDA/HiFi setups) stay visible.
+    const std::uint32_t wantDir = routeDirectionForMediaClass(nd->mediaClass);
+    // SPA_DIRECTION_INPUT == 0, so `wantDir != 0` would wrongly exclude every Audio/Source; guard on the
+    // media class being a device node instead (matches the isDeviceNode check used during route parsing).
+    const bool isDeviceNode = nd->mediaClass == "Audio/Sink" || nd->mediaClass == "Audio/Source";
+    const DeviceRouteData* activeRoute = isDeviceNode ? activeRouteForDirection(nd->routes, wantDir) : nullptr;
+    const DeviceData* device = nullptr;
+    if (nd->deviceId != 0) {
+      if (const auto devIt = m_devices.find(nd->deviceId); devIt != m_devices.end()) {
+        device = &devIt->second;
+        if (activeRoute == nullptr && isDeviceNode) {
+          activeRoute = activeRouteForDirection(device->routes, wantDir);
+        }
+      }
+    }
+    const auto matchesDir = [&](const DeviceRouteData& r) { return r.direction == wantDir; };
+    const bool hasDirRoutes = std::ranges::any_of(nd->routes, matchesDir)
+        || (device != nullptr && std::ranges::any_of(device->routes, matchesDir));
+    node.available = activeRoute != nullptr || !hasDirRoutes;
+
     if (nd->mediaClass == "Audio/Sink") {
       node.isDefault = (nd->name == m_defaultSinkName);
       if (node.isDefault) {
@@ -1602,9 +1674,11 @@ void PipeWireService::rebuildState() {
 
 void PipeWireService::recomputeEffectiveMute(NodeData& nd) {
   const std::uint32_t wantDir = routeDirectionForMediaClass(nd.mediaClass);
-  const DeviceRouteData* nodeRoute = wantDir != 0 ? activeRouteForDirection(nd.routes, wantDir) : nullptr;
+  // SPA_DIRECTION_INPUT == 0, so guard on the media class rather than `wantDir != 0` (which would skip sources).
+  const bool isDeviceNode = nd.mediaClass == "Audio/Sink" || nd.mediaClass == "Audio/Source";
+  const DeviceRouteData* nodeRoute = isDeviceNode ? activeRouteForDirection(nd.routes, wantDir) : nullptr;
   const DeviceRouteData* deviceRoute = nullptr;
-  if (nd.deviceId != 0 && wantDir != 0) {
+  if (nd.deviceId != 0 && isDeviceNode) {
     const auto it = m_devices.find(nd.deviceId);
     if (it != m_devices.end()) {
       deviceRoute = activeRouteForDirection(it->second.routes, wantDir);
@@ -1636,11 +1710,17 @@ void PipeWireService::applyVolumePropsFromDict(NodeData& nd, const spa_dict* pro
   }
 
   if (applyMixerFieldsFromDict) {
+    float candidate = -1.0f;
     if (const auto maybeChannelmixVolume = parseFloat(dictGet(props, "channelmix.volume"));
         maybeChannelmixVolume.has_value()) {
-      nd.volume = std::clamp(*maybeChannelmixVolume, 0.0f, 1.5f);
+      candidate = std::clamp(*maybeChannelmixVolume, 0.0f, 1.5f);
     } else if (const auto maybeVolume = parseFloat(dictGet(props, "volume")); maybeVolume.has_value()) {
-      nd.volume = std::clamp(*maybeVolume, 0.0f, 1.5f);
+      candidate = std::clamp(*maybeVolume, 0.0f, 1.5f);
+    }
+
+    if (candidate >= 0.0f && !shouldRejectVolumeWrite(nd, candidate)) {
+      nd.volume = candidate;
+      confirmVolumeWrite(nd, candidate);
     }
 
     if (const auto maybeChannelmixMuted = parseBool(dictGet(props, "channelmix.mute"));
@@ -1654,53 +1734,12 @@ void PipeWireService::applyVolumePropsFromDict(NodeData& nd, const spa_dict* pro
   recomputeEffectiveMute(nd);
 }
 
-void PipeWireService::scheduleVolumeFlush() {
-  const auto now = std::chrono::steady_clock::now();
-  const auto earliest = m_lastVolumeFlushValid ? (m_lastVolumeFlushAt + kVolumeApplyMinInterval)
-                                               : std::chrono::steady_clock::time_point{};
-
-  if (!m_lastVolumeFlushValid || now >= earliest) {
-    m_volumeThrottleTimer.stop();
-    flushPendingNodeVolumes();
-    m_lastVolumeFlushAt = std::chrono::steady_clock::now();
-    m_lastVolumeFlushValid = true;
-    return;
-  }
-
-  const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(earliest - now);
-  const auto wait = std::max(delay, std::chrono::milliseconds{1});
-  m_volumeThrottleTimer.start(wait, [this]() {
-    flushPendingNodeVolumes();
-    m_lastVolumeFlushAt = std::chrono::steady_clock::now();
-  });
+void PipeWireService::noteVolumeWritten(NodeData& nd, float volume) {
+  nd.lastWrittenVolume = volume;
+  nd.volumeWriteGuardUntil = std::chrono::steady_clock::now() + kVolumeWriteGuardDuration;
 }
 
-void PipeWireService::flushPendingNodeVolumes() {
-  if (m_pendingNodeVolumes.empty()) {
-    return;
-  }
-
-  bool dirty = false;
-  auto pending = std::move(m_pendingNodeVolumes);
-
-  for (const auto& [id, volume] : pending) {
-    if (!applyNodeVolumeImmediate(id, volume)) {
-      continue;
-    }
-    dirty = true;
-    if (id == m_state.defaultSinkId && m_state.defaultSinkId != 0) {
-      emitVolumePreview(false, id, volume);
-    } else if (id == m_state.defaultSourceId && m_state.defaultSourceId != 0) {
-      emitVolumePreview(true, id, volume);
-    }
-  }
-
-  if (dirty) {
-    rebuildState();
-  }
-}
-
-bool PipeWireService::applyNodeVolumeImmediate(std::uint32_t id, float volume) {
+bool PipeWireService::applyNodeVolume(std::uint32_t id, float volume) {
   auto it = m_nodes.find(id);
   if (it == m_nodes.end()) {
     return false;
@@ -1713,20 +1752,25 @@ bool PipeWireService::applyNodeVolumeImmediate(std::uint32_t id, float volume) {
 
   volume = std::clamp(volume, 0.0f, 1.5f);
 
-  // Keep WirePlumber policy in sync without blocking the main loop.
-  // `runAsync` is fire-and-forget, so rapid wheel/slider updates remain responsive.
+  // Device nodes go through WirePlumber's mixer-api so the change lands where pipewire-pulse /
+  // pavucontrol read it. A raw node/route write bypasses that and desyncs pavucontrol; see
+  // project_volume_wireplumber_authority. The mixer queues writes until it is ready, then echoes the
+  // committed value back through onMixerVolumeChanged.
   const bool isDeviceNode = nd.mediaClass == "Audio/Sink" || nd.mediaClass == "Audio/Source";
   if (isDeviceNode) {
-    const bool launched = process::runAsync({"wpctl", "set-volume", std::to_string(id), std::format("{:.4f}", volume)});
-    if (launched) {
-      // For devices, keep policy changes in WirePlumber path (pavu/wpctl-visible).
-      if (std::abs(nd.volume - volume) >= 0.0001f) {
-        nd.volume = volume;
-        return true;
+    if (std::abs(nd.volume - volume) >= kVolumeChangeEpsilon) {
+      if (m_wpMixer != nullptr) {
+        m_wpMixer->setVolume(id, volume);
       }
-      return false;
+      nd.volume = volume;
+      return true;
     }
+    return false;
   }
+
+  // Program streams write SPA props directly; note the write so stale echoes are rejected until the
+  // daemon confirms.
+  noteVolumeWritten(nd, volume);
 
   // Convert linear volume to cubic (PipeWire native)
   float cubic = volume * volume * volume;
@@ -1747,11 +1791,36 @@ bool PipeWireService::applyNodeVolumeImmediate(std::uint32_t id, float volume) {
   pw_node_set_param(nd.proxy, SPA_PARAM_Props, 0, pod);
 
   // Apply optimistic local state while PipeWire publishes props.
-  if (std::abs(nd.volume - volume) >= 0.0001f) {
+  if (std::abs(nd.volume - volume) >= kVolumeChangeEpsilon) {
     nd.volume = volume;
     return true;
   }
   return false;
+}
+
+float PipeWireService::relativeAdjustTarget(
+    int gesture, float baseStep, float direction, float current, float maxVolume
+) {
+  const auto now = std::chrono::steady_clock::now();
+  const bool held = m_relativeAdjust.gesture == gesture && (now - m_relativeAdjust.lastAt) <= kVolumeHoldWindow;
+
+  if (held && (now - m_relativeAdjust.lastAt) < kVolumeHoldMinIpcInterval) {
+    return m_relativeAdjust.target;
+  }
+
+  m_relativeAdjust.gesture = gesture;
+  m_relativeAdjust.lastAt = now;
+
+  if (!held) {
+    // Isolated tap or new gesture: a fixed, granular step from the live volume.
+    m_relativeAdjust.target = std::clamp(current + direction * baseStep, 0.0f, maxVolume);
+    return m_relativeAdjust.target;
+  }
+
+  // Held: advance the gesture-local target by a flat baseStep on every event, relying on
+  // the gesture-local target accumulator to bypass asynchronous read-back echoes.
+  m_relativeAdjust.target = std::clamp(m_relativeAdjust.target + direction * baseStep, 0.0f, maxVolume);
+  return m_relativeAdjust.target;
 }
 
 void PipeWireService::setNodeVolume(std::uint32_t id, float volume) {
@@ -1764,8 +1833,16 @@ void PipeWireService::setNodeVolume(std::uint32_t id, float volume) {
     return;
   }
 
-  m_pendingNodeVolumes[id] = std::clamp(volume, 0.0f, 1.5f);
-  scheduleVolumeFlush();
+  const float clamped = std::clamp(volume, 0.0f, 1.5f);
+
+  const std::string& appBinary = it->second->applicationBinary;
+  if (!appBinary.empty()) {
+    m_userAppVolumes[appBinary] = clamped;
+  }
+
+  if (applyNodeVolume(id, clamped)) {
+    rebuildState();
+  }
 }
 
 void PipeWireService::setNodeMuted(std::uint32_t id, bool muted) {
@@ -1779,24 +1856,24 @@ void PipeWireService::setNodeMuted(std::uint32_t id, bool muted) {
     return;
   }
 
-  // Keep WirePlumber policy in sync, but do not block the UI thread.
+  // Device nodes go through WirePlumber's mixer-api to keep pipewire-pulse / pavucontrol in sync. The
+  // committed mute echoes back through onMixerVolumeChanged; swMute is set optimistically for
+  // immediate UI feedback.
   const bool isDeviceNode = nd.mediaClass == "Audio/Sink" || nd.mediaClass == "Audio/Source";
-  if (isDeviceNode) {
-    const bool launched = process::runAsync({"wpctl", "set-mute", std::to_string(id), muted ? "1" : "0"});
-    if (launched) {
-      const bool before = nd.muted;
-      nd.swMute = muted;
-      recomputeEffectiveMute(nd);
-      if (before != nd.muted) {
-        if (id == m_state.defaultSinkId && m_state.defaultSinkId != 0) {
-          emitVolumePreview(false, id, nd.volume);
-        } else if (id == m_state.defaultSourceId && m_state.defaultSourceId != 0) {
-          emitVolumePreview(true, id, nd.volume);
-        }
-        rebuildState();
+  if (isDeviceNode && m_wpMixer != nullptr) {
+    m_wpMixer->setMuted(id, muted);
+    const bool before = nd.muted;
+    nd.swMute = muted;
+    recomputeEffectiveMute(nd);
+    if (before != nd.muted) {
+      if (id == m_state.defaultSinkId && m_state.defaultSinkId != 0) {
+        emitVolumePreview(false, id, nd.volume);
+      } else if (id == m_state.defaultSourceId && m_state.defaultSourceId != 0) {
+        emitVolumePreview(true, id, nd.volume);
       }
-      return;
+      rebuildState();
     }
+    return;
   }
 
   // Program streams, and device nodes for immediate local/UI consistency.
@@ -1879,34 +1956,23 @@ void PipeWireService::setDefaultNode(std::uint32_t id, const char* key) {
     return;
   }
 
-  // Prefer wpctl so WirePlumber persists the default. Metadata API alone often does not survive reboot.
-  if (process::runSync({"wpctl", "set-default", std::to_string(id)})) {
-    if (std::strcmp(key, "default.audio.sink") == 0) {
-      m_defaultSinkName = it->second->name;
-    } else if (std::strcmp(key, "default.audio.source") == 0) {
-      m_defaultSourceName = it->second->name;
-    }
-    rebuildState();
+  if (m_wpMixer == nullptr) {
+    kLog.warn("unable to set {} - WirePlumber unavailable", key);
     return;
   }
 
-  if (m_defaultMetadata == nullptr) {
-    kLog.warn("unable to set {} - default metadata unavailable", key);
-    return;
-  }
-
-  const std::string payload = R"({"name":")" + escapeJsonString(it->second->name) + "\"}";
-  const int rc = pw_metadata_set_property(m_defaultMetadata, PW_ID_CORE, key, "Spa:String:JSON", payload.c_str());
-  if (rc < 0) {
-    kLog.warn("failed to set {} to \"{}\" ({})", key, it->second->name, spa_strerror(rc));
-    return;
-  }
-
+  // Selects the configured default through default-nodes-api (what `wpctl set-default` does): applied
+  // live and persisted across reboots, with no subprocess. The mixer resolves media.class/node.name.
   if (std::strcmp(key, "default.audio.sink") == 0) {
     m_defaultSinkName = it->second->name;
   } else if (std::strcmp(key, "default.audio.source") == 0) {
     m_defaultSourceName = it->second->name;
+  } else {
+    kLog.warn("unable to set unknown default key {}", key);
+    return;
   }
+
+  m_wpMixer->setDefaultNode(id);
   rebuildState();
 }
 
@@ -1970,7 +2036,7 @@ void PipeWireService::emitChanged() {
 }
 
 void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) {
-  const auto maxVolume = [&config] { return config.config().audio.enableOverdrive ? 1.5f : 1.0f; };
+  const auto maxVolume = [&config] { return maxAudioVolume(config.config().audio); };
   const auto parseVolumeValueError =
       "error: invalid volume value (use percent like 65 or 65%, or normalized like 0.65)\n";
   const auto parseVolumeStepError = "error: invalid volume step (use percent like 5 or 5%, or normalized like 0.05)\n";
@@ -1994,7 +2060,7 @@ void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) 
         setVolume(std::clamp(*amount, 0.0f, maxVolume()));
         return "ok\n";
       },
-      "volume-set <value>", "Set speaker volume"
+      "<value>", "Set speaker volume"
   );
 
   ipc.registerHandler(
@@ -2008,16 +2074,16 @@ void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) 
         if (!sink)
           return "error: no default output\n";
 
-        const auto step = parts.empty() ? std::optional<float>(kDefaultVolumeStep)
+        const auto step = parts.empty() ? std::optional<float>(kVolumeStepDefault)
                                         : noctalia::ipc::parseNormalizedOrPercent(parts[0], maxVolume() * 100.0f);
         if (!step.has_value()) {
           return parseVolumeStepError;
         }
 
-        setVolume(std::clamp(sink->volume + *step, 0.0f, maxVolume()));
+        setVolume(relativeAdjustTarget(1, *step, 1.0f, sink->volume, maxVolume()));
         return "ok\n";
       },
-      "volume-up [step]", "Increase speaker volume"
+      "[step]", "Increase speaker volume"
   );
 
   ipc.registerHandler(
@@ -2031,16 +2097,16 @@ void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) 
         if (!sink)
           return "error: no default output\n";
 
-        const auto step = parts.empty() ? std::optional<float>(kDefaultVolumeStep)
+        const auto step = parts.empty() ? std::optional<float>(kVolumeStepDefault)
                                         : noctalia::ipc::parseNormalizedOrPercent(parts[0], maxVolume() * 100.0f);
         if (!step.has_value()) {
           return parseVolumeStepError;
         }
 
-        setVolume(std::clamp(sink->volume - *step, 0.0f, maxVolume()));
+        setVolume(relativeAdjustTarget(2, *step, -1.0f, sink->volume, maxVolume()));
         return "ok\n";
       },
-      "volume-down [step]", "Decrease speaker volume"
+      "[step]", "Decrease speaker volume"
   );
 
   ipc.registerHandler(
@@ -2052,7 +2118,7 @@ void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) 
         setMuted(!sink->muted);
         return "ok\n";
       },
-      "volume-mute", "Toggle speaker mute"
+      "", "Toggle speaker mute"
   );
 
   ipc.registerHandler(
@@ -2074,7 +2140,7 @@ void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) 
         setMicVolume(std::clamp(*amount, 0.0f, maxVolume()));
         return "ok\n";
       },
-      "mic-volume-set <value>", "Set microphone volume"
+      "<value>", "Set microphone volume"
   );
 
   ipc.registerHandler(
@@ -2088,16 +2154,16 @@ void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) 
         if (!source)
           return "error: no default input\n";
 
-        const auto step = parts.empty() ? std::optional<float>(kDefaultVolumeStep)
+        const auto step = parts.empty() ? std::optional<float>(kVolumeStepDefault)
                                         : noctalia::ipc::parseNormalizedOrPercent(parts[0], maxVolume() * 100.0f);
         if (!step.has_value()) {
           return parseVolumeStepError;
         }
 
-        setMicVolume(std::clamp(source->volume + *step, 0.0f, maxVolume()));
+        setMicVolume(relativeAdjustTarget(3, *step, 1.0f, source->volume, maxVolume()));
         return "ok\n";
       },
-      "mic-volume-up [step]", "Increase microphone volume"
+      "[step]", "Increase microphone volume"
   );
 
   ipc.registerHandler(
@@ -2111,16 +2177,16 @@ void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) 
         if (!source)
           return "error: no default input\n";
 
-        const auto step = parts.empty() ? std::optional<float>(kDefaultVolumeStep)
+        const auto step = parts.empty() ? std::optional<float>(kVolumeStepDefault)
                                         : noctalia::ipc::parseNormalizedOrPercent(parts[0], maxVolume() * 100.0f);
         if (!step.has_value()) {
           return parseVolumeStepError;
         }
 
-        setMicVolume(std::clamp(source->volume - *step, 0.0f, maxVolume()));
+        setMicVolume(relativeAdjustTarget(4, *step, -1.0f, source->volume, maxVolume()));
         return "ok\n";
       },
-      "mic-volume-down [step]", "Decrease microphone volume"
+      "[step]", "Decrease microphone volume"
   );
 
   ipc.registerHandler(
@@ -2132,6 +2198,6 @@ void PipeWireService::registerIpc(IpcService& ipc, const ConfigService& config) 
         setMicMuted(!source->muted);
         return "ok\n";
       },
-      "mic-mute", "Toggle microphone mute"
+      "", "Toggle microphone mute"
   );
 }

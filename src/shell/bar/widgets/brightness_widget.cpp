@@ -1,6 +1,6 @@
 #include "shell/bar/widgets/brightness_widget.h"
 
-#include "render/core/renderer.h"
+#include "i18n/i18n.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
 #include "system/brightness_service.h"
@@ -23,27 +23,11 @@ namespace {
 
 } // namespace
 
-BrightnessWidget::BrightnessWidget(
-    BrightnessService* brightness, wl_output* output, bool showLabel, int scrollStepPercent
-)
-    : m_brightness(brightness), m_output(output), m_showLabel(showLabel),
-      m_scrollStep(static_cast<float>(scrollStepPercent) / 100.0f) {}
+BrightnessWidget::BrightnessWidget(BrightnessService* brightness, wl_output* output, Options options)
+    : m_brightness(brightness), m_output(output), m_showLabel(options.showLabel) {}
 
 void BrightnessWidget::create() {
-  auto area = std::make_unique<InputArea>();
-  area->setOnClick([this](const InputArea::PointerData& /*data*/) { requestPanelToggle("control-center", "monitor"); });
-  area->setOnAxis([this](const InputArea::PointerData& data) {
-    if (m_brightness == nullptr) {
-      return;
-    }
-    const auto* display = m_brightness->findByOutput(m_output);
-    if (display == nullptr) {
-      return;
-    }
-    const float delta = data.scrollDelta(1.0f) > 0 ? -m_scrollStep : m_scrollStep;
-    const float newValue = std::clamp(display->brightness + delta, 0.0f, 1.0f);
-    m_brightness->setBrightness(display->id, newValue);
-  });
+  auto area = ui::inputArea({});
 
   area->addChild(
       ui::glyph({
@@ -58,8 +42,8 @@ void BrightnessWidget::create() {
       ui::label({
           .out = &m_label,
           .fontSize = Style::fontSizeBody * m_contentScale,
-          .fontFamily = labelFontFamily(),
           .fontWeight = labelFontWeight(),
+          .fontFamily = labelFontFamily(),
           .visible = m_showLabel,
       })
   );
@@ -153,9 +137,9 @@ void BrightnessWidget::syncState(Renderer& renderer) {
   if (rootNode != nullptr) {
     int pct = static_cast<int>(std::round(brightness * 100.0f));
     std::vector<TooltipRow> rows;
-    rows.push_back({"Brightness", std::to_string(pct) + "%"});
+    rows.push_back({i18n::tr("bar.widgets.brightness.brightness"), std::to_string(pct) + "%"});
     if (!display->label.empty()) {
-      rows.push_back({"Display", display->label});
+      rows.push_back({i18n::tr("bar.widgets.brightness.display"), display->label});
     }
     static_cast<InputArea*>(rootNode)->setTooltip(std::move(rows));
   }

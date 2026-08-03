@@ -14,7 +14,13 @@ struct wl_output;
 
 class WeatherWidget : public Widget {
 public:
-  WeatherWidget(WeatherService* weather, wl_output* output, float maxWidth, bool showCondition);
+  struct Options {
+    int maxWidth = 160;
+    bool showCondition = true;
+    bool showTemperature = true;
+  };
+
+  WeatherWidget(WeatherService* weather, wl_output* output, Options options);
 
   void create() override;
 
@@ -26,6 +32,7 @@ private:
   WeatherService* m_weather = nullptr;
   float m_maxWidth = 160.0f;
   bool m_showCondition = true;
+  bool m_showTemperature = true;
   InputArea* m_area = nullptr;
   Glyph* m_glyph = nullptr;
   Label* m_label = nullptr;

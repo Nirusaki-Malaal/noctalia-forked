@@ -1,10 +1,41 @@
 #include "render/scene/input_dispatcher.h"
 
+#include "core/input/keybind_matcher.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
 #include "wayland/text_input_service.h"
 
+#include <algorithm>
+#include <optional>
+#include <string>
+#include <vector>
+
 namespace {
+
+  bool nodeVisibleInScene(const Node* node) {
+    for (const Node* current = node; current != nullptr; current = current->parent()) {
+      if (!current->visible()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool isTabFocusTarget(const InputArea* area) {
+    return area != nullptr && area->enabled() && area->focusable() && area->tabStop() && nodeVisibleInScene(area);
+  }
+
+  void collectTabFocusTargets(Node* node, std::vector<InputArea*>& out) {
+    if (node == nullptr || !node->visible() || node->excludeSubtreeFromTabOrder()) {
+      return;
+    }
+    if (auto* area = dynamic_cast<InputArea*>(node); isTabFocusTarget(area)) {
+      out.push_back(area);
+    }
+    for (const auto& child : node->children()) {
+      collectTabFocusTargets(child.get(), out);
+    }
+  }
 
   bool nodeAttachedToRoot(const Node* node, const Node* root) {
     if (node == nullptr || root == nullptr) {
@@ -32,7 +63,7 @@ namespace {
 
 void InputDispatcher::setSceneRoot(Node* root) {
   if (root != m_sceneRoot) {
-    m_capturedArea = nullptr;
+    cancelPointerCapture();
     if (m_hoveredArea != nullptr) {
       auto* old = m_hoveredArea;
       old->dispatchLeave();
@@ -58,6 +89,10 @@ void InputDispatcher::setSceneRoot(Node* root) {
 
 void InputDispatcher::setHoverChangeCallback(HoverChangeCallback callback) {
   m_hoverChangeCallback = std::move(callback);
+}
+
+void InputDispatcher::setFocusChangeCallback(FocusChangeCallback callback) {
+  m_focusChangeCallback = std::move(callback);
 }
 
 void InputDispatcher::setCursorShapeCallback(CursorShapeCallback callback) {
@@ -86,7 +121,7 @@ void InputDispatcher::pointerEnter(float x, float y, std::uint32_t serial) {
 }
 
 void InputDispatcher::pointerLeave() {
-  m_capturedArea = nullptr;
+  cancelPointerCapture();
   m_hasPointerPosition = false;
   if (m_hoveredArea != nullptr) {
     auto* old = m_hoveredArea;
@@ -172,6 +207,11 @@ bool InputDispatcher::pointerButton(float x, float y, std::uint32_t button, bool
     } else {
       m_capturedArea = nullptr;
       updateHover(x, y, m_lastSerial);
+      // Pointer clicks on switches and buttons should not leave keyboard focus behind.
+      // Settings rebuilds restore stashed focus and can land on the wrong control.
+      if (m_focusedArea == target && target->textInputClient() == nullptr && !target->retainsFocusOnPointerRelease()) {
+        setFocus(nullptr);
+      }
     }
     return true;
   }
@@ -196,7 +236,7 @@ void InputDispatcher::syncPointerHover() {
 
 bool InputDispatcher::pointerAxis(
     float x, float y, std::uint32_t axis, std::uint32_t axisSource, double value, std::int32_t discrete,
-    std::int32_t value120, float lines
+    std::int32_t value120, float lines, std::uint32_t axisGestureSerial
 ) {
   pruneDetachedAreas();
   InputArea* target = m_capturedArea != nullptr ? m_capturedArea : findInputAreaAt(x, y);
@@ -214,7 +254,8 @@ bool InputDispatcher::pointerAxis(
     float localX = 0.0f;
     float localY = 0.0f;
     (void)Node::mapFromScene(area, x, y, localX, localY);
-    const bool consumed = area->dispatchAxis(localX, localY, axis, axisSource, value, discrete, value120, lines);
+    const bool consumed =
+        area->dispatchAxis(localX, localY, axis, axisSource, value, discrete, value120, lines, axisGestureSerial);
 
     if (!consumed) {
       continue;
@@ -228,19 +269,189 @@ bool InputDispatcher::pointerAxis(
   return consumedAny;
 }
 
+void InputDispatcher::cancelPointerCapture() {
+  if (m_capturedArea == nullptr || m_cancelingPointerCapture) {
+    return;
+  }
+  m_cancelingPointerCapture = true;
+  m_capturedArea->dispatchCancel();
+  m_capturedArea = nullptr;
+  m_cancelingPointerCapture = false;
+  updateCursor(m_lastSerial);
+}
+
+InputArea* InputDispatcher::firstTabFocusUnder(Node* subtree) const {
+  if (subtree == nullptr) {
+    return nullptr;
+  }
+  std::vector<InputArea*> order;
+  order.reserve(32);
+  collectTabFocusTargets(subtree, order);
+  return order.empty() ? nullptr : order.front();
+}
+
+InputArea* InputDispatcher::lastTabFocusUnder(Node* subtree) const {
+  if (subtree == nullptr) {
+    return nullptr;
+  }
+  std::vector<InputArea*> order;
+  order.reserve(32);
+  collectTabFocusTargets(subtree, order);
+  return order.empty() ? nullptr : order.back();
+}
+
+bool InputDispatcher::cycleTabFocusInSubtree(Node* subtree, bool reverse) {
+  if (subtree == nullptr) {
+    return false;
+  }
+  std::vector<InputArea*> order;
+  order.reserve(32);
+  collectTabFocusTargets(subtree, order);
+  if (order.empty()) {
+    return false;
+  }
+
+  auto it = std::ranges::find(order, m_focusedArea);
+  if (it == order.end()) {
+    setFocus(reverse ? order.back() : order.front());
+    return true;
+  }
+
+  if (reverse) {
+    if (it == order.begin()) {
+      setFocus(order.back());
+    } else {
+      setFocus(*std::prev(it));
+    }
+  } else if (std::next(it) == order.end()) {
+    setFocus(order.front());
+  } else {
+    setFocus(*std::next(it));
+  }
+  return true;
+}
+
 void InputDispatcher::keyEvent(
     std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers, bool pressed, bool preedit
 ) {
   pruneDetachedAreas();
+  if (pressed && !preedit) {
+    if (KeybindMatcher::matches(KeybindAction::TabPrevious, sym, modifiers)) {
+      if (cycleTabFocus(true)) {
+        return;
+      }
+    }
+    if (KeybindMatcher::matches(KeybindAction::TabNext, sym, modifiers)) {
+      if (cycleTabFocus(false)) {
+        return;
+      }
+    }
+  }
   if (m_focusedArea != nullptr) {
     m_focusedArea->dispatchKey(sym, utf32, modifiers, pressed, preedit);
   }
+}
+
+bool InputDispatcher::cycleTabFocus(bool reverse) {
+  if (m_sceneRoot == nullptr) {
+    return false;
+  }
+
+  std::vector<InputArea*> order;
+  order.reserve(32);
+  collectTabFocusTargets(m_sceneRoot, order);
+  if (order.empty()) {
+    return false;
+  }
+
+  auto it = std::ranges::find(order, m_focusedArea);
+  if (it == order.end()) {
+    setFocus(reverse ? order.back() : order.front());
+    return true;
+  }
+
+  if (reverse) {
+    if (it == order.begin()) {
+      setFocus(order.back());
+    } else {
+      setFocus(*std::prev(it));
+    }
+  } else if (std::next(it) == order.end()) {
+    setFocus(order.front());
+  } else {
+    setFocus(*std::next(it));
+  }
+  return true;
+}
+
+void InputDispatcher::stashTabFocus() {
+  m_stashedTabFocusIndex.reset();
+  m_stashedTabFocusKey.reset();
+  if (m_sceneRoot == nullptr || m_focusedArea == nullptr) {
+    return;
+  }
+
+  if (!m_focusedArea->tabFocusKey().empty()) {
+    m_stashedTabFocusKey = std::string(m_focusedArea->tabFocusKey());
+    return;
+  }
+
+  std::vector<InputArea*> order;
+  order.reserve(32);
+  collectTabFocusTargets(m_sceneRoot, order);
+  if (order.empty()) {
+    return;
+  }
+
+  const auto it = std::ranges::find(order, m_focusedArea);
+  if (it == order.end()) {
+    return;
+  }
+  m_stashedTabFocusIndex = static_cast<std::size_t>(std::distance(order.begin(), it));
+}
+
+void InputDispatcher::restoreStashedTabFocus() {
+  if (m_sceneRoot == nullptr) {
+    m_stashedTabFocusIndex.reset();
+    m_stashedTabFocusKey.reset();
+    return;
+  }
+
+  std::vector<InputArea*> order;
+  order.reserve(32);
+  collectTabFocusTargets(m_sceneRoot, order);
+  if (order.empty()) {
+    m_stashedTabFocusIndex.reset();
+    m_stashedTabFocusKey.reset();
+    return;
+  }
+
+  if (m_stashedTabFocusKey.has_value()) {
+    const auto it = std::ranges::find_if(order, [key = *m_stashedTabFocusKey](const InputArea* area) {
+      return area != nullptr && area->tabFocusKey() == key;
+    });
+    if (it != order.end()) {
+      setFocus(*it);
+    }
+    m_stashedTabFocusKey.reset();
+    m_stashedTabFocusIndex.reset();
+    return;
+  }
+
+  if (!m_stashedTabFocusIndex.has_value()) {
+    return;
+  }
+
+  const std::size_t index = std::min(*m_stashedTabFocusIndex, order.size() - 1);
+  setFocus(order[index]);
+  m_stashedTabFocusIndex.reset();
 }
 
 void InputDispatcher::setFocus(InputArea* area) {
   if (area == m_focusedArea) {
     return;
   }
+  InputArea* const old = m_focusedArea;
   if (m_focusedArea != nullptr) {
     clearTextInputFocus(m_focusedArea);
     m_focusedArea->dispatchFocusLoss();
@@ -250,6 +461,9 @@ void InputDispatcher::setFocus(InputArea* area) {
     trackArea(m_focusedArea);
     m_focusedArea->dispatchFocusGain();
     syncTextInputFocus();
+  }
+  if (m_focusChangeCallback) {
+    m_focusChangeCallback(old, m_focusedArea);
   }
 }
 
@@ -319,6 +533,9 @@ void InputDispatcher::updateHover(float x, float y, std::uint32_t serial) {
 bool InputDispatcher::isAttachedToScene(const InputArea* area) const { return nodeAttachedToRoot(area, m_sceneRoot); }
 
 void InputDispatcher::pruneDetachedAreas() {
+  if (!isAttachedToScene(m_capturedArea)) {
+    cancelPointerCapture();
+  }
   if (!isAttachedToScene(m_hoveredArea)) {
     if (m_hoveredArea != nullptr) {
       auto* old = m_hoveredArea;
@@ -329,9 +546,6 @@ void InputDispatcher::pruneDetachedAreas() {
       }
       updateCursor(m_lastSerial);
     }
-  }
-  if (!isAttachedToScene(m_capturedArea)) {
-    m_capturedArea = nullptr;
   }
   if (!isAttachedToScene(m_focusedArea)) {
     if (m_focusedArea != nullptr) {
@@ -344,19 +558,22 @@ void InputDispatcher::pruneDetachedAreas() {
 
 void InputDispatcher::trackArea(InputArea* area) {
   area->setDestroyCallback([this](InputArea* a) {
+    const bool ownedCursor = m_hoveredArea == a || m_capturedArea == a;
+    if (m_capturedArea == a) {
+      m_capturedArea = nullptr;
+    }
     if (m_hoveredArea == a) {
       m_hoveredArea = nullptr;
       if (m_hoverChangeCallback) {
         m_hoverChangeCallback(a, nullptr);
       }
-      updateCursor(m_lastSerial);
     }
     if (m_focusedArea == a) {
       clearTextInputFocus(a);
       m_focusedArea = nullptr;
     }
-    if (m_capturedArea == a) {
-      m_capturedArea = nullptr;
+    if (ownedCursor) {
+      updateCursor(m_lastSerial);
     }
   });
 }
@@ -388,8 +605,9 @@ void InputDispatcher::updateCursor(std::uint32_t serial) {
 
   std::uint32_t shape = 1; // Default arrow
 
-  if (m_hoveredArea != nullptr) {
-    auto areaShape = m_hoveredArea->cursorShape();
+  InputArea* cursorAuthority = m_capturedArea != nullptr ? m_capturedArea : m_hoveredArea;
+  if (cursorAuthority != nullptr) {
+    auto areaShape = cursorAuthority->cursorShape();
     if (areaShape != 0) {
       shape = areaShape;
     }

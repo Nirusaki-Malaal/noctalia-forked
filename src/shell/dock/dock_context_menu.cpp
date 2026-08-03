@@ -1,5 +1,6 @@
 #include "shell/dock/dock_context_menu.h"
 
+#include "compositors/compositor_detect.h"
 #include "compositors/compositor_platform.h"
 #include "config/config_service.h"
 #include "core/deferred_call.h"
@@ -8,11 +9,11 @@
 #include "i18n/i18n.h"
 #include "render/render_context.h"
 #include "render/scene/node.h"
-#include "shell/dock/dock_geometry.h"
 #include "shell/dock/pinned_apps.h"
-#include "shell/surface/shadow.h"
 #include "system/desktop_entry.h"
+#include "ui/builders.h"
 #include "ui/controls/context_menu.h"
+#include "ui/popup_chrome.h"
 #include "ui/style.h"
 #include "wayland/popup_surface.h"
 #include "wayland/wayland_toplevels.h"
@@ -33,6 +34,16 @@ namespace shell::dock {
     constexpr std::int32_t kMenuSeparatorId = -3;
     constexpr std::int32_t kMenuPinToggleId = -4;
     constexpr std::int32_t kMenuWindowBaseId = -1000;
+
+    bool isWindowClosable(const ToplevelInfo& window) {
+      if (window.handle != nullptr) {
+        return true;
+      }
+      if (compositors::isKde()) {
+        return !window.identifier.empty() || (!window.title.empty() && !window.appId.empty());
+      }
+      return false;
+    }
 
     popup_chrome::Attachment popupAttachmentForDockPosition(bool isBottom, bool isTop, bool isRight) {
       if (isBottom) {
@@ -80,27 +91,30 @@ namespace shell::dock {
       }
       break;
     case PointerEvent::Type::Motion:
-      if (onPopup || popup.pointerInside) {
-        if (onPopup) {
-          popup.pointerInside = true;
-        }
+      if (onPopup) {
+        popup.pointerInside = true;
         popup.inputDispatcher.pointerMotion(static_cast<float>(event.sx), static_cast<float>(event.sy), 0);
         consumed = true;
+      } else if (popup.pointerInside && event.surface != nullptr) {
+        // Grab may omit Leave when the pointer moves to another noctalia surface.
+        popup.pointerInside = false;
+        popup.inputDispatcher.pointerLeave();
       }
       break;
     case PointerEvent::Type::Button:
-      if (onPopup || popup.pointerInside) {
-        if (onPopup) {
-          popup.pointerInside = true;
-        }
+      if (onPopup) {
+        popup.pointerInside = true;
         // Keep hover state synced before click dispatch so stationary pointers can
         // still activate rows even if Enter/Motion ordering is flaky.
         popup.inputDispatcher.pointerMotion(static_cast<float>(event.sx), static_cast<float>(event.sy), event.serial);
-        const bool pressed = (event.state == 1);
+        const bool pressed = event.pressed;
         popup.inputDispatcher.pointerButton(
             static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, pressed
         );
         consumed = true;
+      } else if (popup.pointerInside && event.surface != nullptr) {
+        popup.pointerInside = false;
+        popup.inputDispatcher.pointerLeave();
       }
       break;
     case PointerEvent::Type::Axis:
@@ -127,10 +141,8 @@ namespace shell::dock {
   ) {
     auto menu = std::make_unique<DockPopup>();
 
-    // Collect running windows for "Close" / "Close All" entries.
-    for (const auto& w : windows) {
-      menu->handles.push_back(w.handle);
-    }
+    // Collect running windows for activation/close actions.
+    menu->windows = windows;
 
     // IDs 0..N-1 -> desktop actions; negative constants -> windows / close commands.
     std::vector<ContextMenuControlEntry> entries;
@@ -156,7 +168,9 @@ namespace shell::dock {
           ContextMenuControlEntry{
               .id = kMenuWindowBaseId - static_cast<std::int32_t>(i),
               .label = title,
-              .enabled = windows[i].handle != nullptr,
+              .enabled = windows[i].handle != nullptr
+                  || !windows[i].identifier.empty()
+                  || (compositors::isKde() && (!windows[i].title.empty() || !windows[i].appId.empty())),
               .separator = false,
               .hasSubmenu = false,
           }
@@ -165,7 +179,15 @@ namespace shell::dock {
 
     const bool hasWindowEntries = !windows.empty();
     const bool hasActionEntries = !entry.actions.empty();
-    const bool hasCloseEntries = !menu->handles.empty();
+    std::vector<std::size_t> closableWindowIndices;
+    closableWindowIndices.reserve(menu->windows.size());
+    for (std::size_t i = 0; i < menu->windows.size(); ++i) {
+      if (isWindowClosable(menu->windows[i])) {
+        closableWindowIndices.push_back(i);
+      }
+    }
+    const std::size_t closableCount = closableWindowIndices.size();
+    const bool hasCloseEntries = closableCount > 0;
     if (hasWindowEntries && (hasActionEntries || hasCloseEntries)) {
       bodyEntries.push_back(
           ContextMenuControlEntry{
@@ -186,8 +208,7 @@ namespace shell::dock {
       );
     }
 
-    const std::size_t runCount = menu->handles.size();
-    if (runCount > 0) {
+    if (closableCount > 0) {
       if (hasActionEntries) {
         bodyEntries.push_back(
             ContextMenuControlEntry{
@@ -195,7 +216,7 @@ namespace shell::dock {
             }
         );
       }
-      if (runCount == 1) {
+      if (closableCount == 1) {
         bodyEntries.push_back(
             ContextMenuControlEntry{
                 .id = kMenuCloseId,
@@ -231,8 +252,10 @@ namespace shell::dock {
       return nullptr;
     }
 
-    // Compute popup height.
+    // Compute popup geometry; width grows past the base width to fit long window titles.
     const float menuHeight = ContextMenuControl::preferredHeight(entries, entries.size());
+    const float menuWidth =
+        std::clamp(ContextMenuControl::preferredWidth(renderContext, entries), kMenuWidth, Style::menuAutoMaxWidth);
 
     // Determine anchor / gravity + gap based on dock position.
     const DockEdge edge = dockConfig.position;
@@ -244,13 +267,13 @@ namespace shell::dock {
     std::uint32_t gravity = XDG_POSITIONER_GRAVITY_NONE;
     std::int32_t offsetX = 0;
     std::int32_t offsetY = 0;
-    const std::int32_t kGapBottom = std::max(2, static_cast<std::int32_t>(Style::spaceLg));
-    const std::int32_t kGap = std::max(2, static_cast<std::int32_t>(Style::spaceMd));
+    // Clearance past the icon/tooltip; chrome Bottom attachment folds bleed into offset.
+    const std::int32_t kGap = std::max(2, static_cast<std::int32_t>(Style::spaceLg + Style::spaceMd));
 
     if (isBottom) {
       anchor = XDG_POSITIONER_ANCHOR_TOP;
       gravity = XDG_POSITIONER_GRAVITY_TOP;
-      offsetY = -kGapBottom;
+      offsetY = -kGap;
     } else if (isTop) {
       anchor = XDG_POSITIONER_ANCHOR_BOTTOM;
       gravity = XDG_POSITIONER_GRAVITY_BOTTOM;
@@ -265,40 +288,19 @@ namespace shell::dock {
       offsetX = kGap;
     }
 
-    const auto sb = shell::surface_shadow::bleed(dockConfig.shadow, config.config().shell.shadow);
-    const std::int32_t panelThk = shell::dock::dockThickness(dockConfig);
-    const std::int32_t ptrX = static_cast<std::int32_t>(platform.lastPointerX());
-    const std::int32_t ptrY = static_cast<std::int32_t>(platform.lastPointerY());
-    const std::int32_t halfCell = dockConfig.iconSize / 2;
+    const auto ptrX = static_cast<std::int32_t>(platform.lastPointerX());
+    const auto ptrY = static_cast<std::int32_t>(platform.lastPointerY());
+    const std::int32_t halfCell = std::max(1, dockConfig.iconSize / 2);
 
-    // Anchor rect: pointer-centred on main axis x panel face on cross axis.
-    std::int32_t aX, aY, aW, aH;
-    if (isBottom) {
-      // Panel top face is at sb.up.
-      aX = ptrX - halfCell;
-      aY = sb.up;
-      aW = halfCell * 2;
-      aH = panelThk;
-    } else if (isTop) {
-      const std::int32_t panelFace = std::min(dockConfig.marginEdge, sb.up) + panelThk;
-      aX = ptrX - halfCell;
-      aY = 0;
-      aW = halfCell * 2;
-      aH = panelFace;
-    } else if (isRight) {
-      aX = sb.left;
-      aY = ptrY - halfCell;
-      aW = panelThk;
-      aH = halfCell * 2;
-    } else { // left
-      const std::int32_t panelFace = std::min(dockConfig.marginEdge, sb.left) + panelThk;
-      aX = 0;
-      aY = ptrY - halfCell;
-      aW = panelFace;
-      aH = halfCell * 2;
-    }
+    // Pointer-centred cell (tray-style); panel-face anchors miss hover-zoom padding.
+    const std::int32_t aX = ptrX - halfCell;
+    const std::int32_t aY = ptrY - halfCell;
+    const std::int32_t aW = halfCell * 2;
+    const std::int32_t aH = halfCell * 2;
 
-    const auto menuChrome = popup_chrome::computeGeometry(kMenuWidth, menuHeight, config.config().shell.shadow);
+    const auto menuChrome = popup_chrome::computeGeometry(
+        menuWidth, menuHeight, config.config().shell.shadow, Style::popupShadowsEnabled()
+    );
     PopupSurfaceConfig popupCfg{
         .anchorX = aX,
         .anchorY = aY,
@@ -332,7 +334,8 @@ namespace shell::dock {
       menuPtr->surface->requestLayout();
     });
     menu->surface->setPrepareFrameCallback([&platform, &config, &renderContext, menuPtr, entries, entryActions,
-                                            callbacks, isPinned](bool /*needsUpdate*/, bool needsLayout) {
+                                            callbacks, isPinned,
+                                            closableWindowIndices](bool /*needsUpdate*/, bool needsLayout) {
       if (menuPtr->surface == nullptr) {
         return;
       }
@@ -357,11 +360,14 @@ namespace shell::dock {
       const auto fw = static_cast<float>(width);
       const auto fh = static_cast<float>(height);
 
-      menuPtr->sceneRoot = std::make_unique<Node>();
+      menuPtr->sceneRoot = ui::node({});
       menuPtr->sceneRoot->setSize(fw, fh);
-      (void)popup_chrome::addShadow(
-          *menuPtr->sceneRoot, menuPtr->chrome, config.config().shell.shadow, Style::scaledRadiusLg()
-      );
+      if (Style::popupShadowsEnabled()) {
+        (void)popup_chrome::addShadow(
+            *menuPtr->sceneRoot, menuPtr->chrome, config.config().shell.shadow, Style::scaledRadiusLg()
+        );
+      }
+      (void)popup_chrome::addCardBackground(*menuPtr->sceneRoot, menuPtr->chrome, 1.0f);
 
       auto ctrl = std::make_unique<ContextMenuControl>();
       ctrl->setMenuWidth(menuPtr->chrome.contentWidth);
@@ -371,34 +377,36 @@ namespace shell::dock {
         if (menuPtr->surface)
           menuPtr->surface->requestRedraw();
       });
-      ctrl->setOnActivate([menuPtr, entryActions, callbacks, isPinned](const ContextMenuControlEntry& e) {
+      ctrl->setOnActivate([menuPtr, entryActions, callbacks, isPinned,
+                           closableWindowIndices](const ContextMenuControlEntry& e) {
         const std::int32_t id = e.id;
-        auto menuHandles = menuPtr->handles;
-        auto closingHandles = menuPtr->handles;
-        DeferredCall::callLater([id, entryActions, callbacks, isPinned, menuHandles = std::move(menuHandles),
-                                 closingHandles = std::move(closingHandles)]() mutable {
+        auto menuWindows = menuPtr->windows;
+        DeferredCall::callLater([id, entryActions, callbacks, isPinned, menuWindows = std::move(menuWindows),
+                                 closableWindowIndices]() mutable {
           if (id == kMenuPinToggleId) {
             if (callbacks.setEntryPinned) {
               callbacks.setEntryPinned(!isPinned);
             }
           } else if (id <= kMenuWindowBaseId) {
             const auto idx = static_cast<std::size_t>(kMenuWindowBaseId - id);
-            if (idx < menuHandles.size() && menuHandles[idx] != nullptr && callbacks.activateWindow) {
-              callbacks.activateWindow(menuHandles[idx]);
+            if (idx < menuWindows.size() && callbacks.activateWindow) {
+              callbacks.activateWindow(idx);
             }
           } else if (id >= 0) {
             const auto idx = static_cast<std::size_t>(id);
             if (idx < entryActions.size() && callbacks.launchAction) {
               callbacks.launchAction(entryActions[idx]);
             }
-          } else if (id == kMenuCloseId && !closingHandles.empty()) {
+          } else if (id == kMenuCloseId && !closableWindowIndices.empty()) {
             if (callbacks.closeWindow) {
-              callbacks.closeWindow(closingHandles[0]);
+              callbacks.closeWindow(closableWindowIndices[0]);
             }
           } else if (id == kMenuCloseAllId) {
             if (callbacks.closeWindow) {
-              for (auto* handle : closingHandles) {
-                callbacks.closeWindow(handle);
+              for (std::size_t windowIndex : closableWindowIndices) {
+                if (windowIndex < menuWindows.size()) {
+                  callbacks.closeWindow(windowIndex);
+                }
               }
             }
           }

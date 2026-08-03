@@ -5,7 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <json.hpp>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <poll.h>
 #include <string>
@@ -17,6 +17,8 @@
 namespace compositors::triad {
   class TriadRuntime;
 } // namespace compositors::triad
+
+class TriadWorkspaceBackendTestAccess;
 
 class TriadWorkspaceBackend final : public WorkspaceBackend,
                                     public compositors::WorkspaceMetadataBackend,
@@ -61,6 +63,8 @@ public:
   [[nodiscard]] std::optional<std::string> focusedWindowId() const;
 
 private:
+  friend class TriadWorkspaceBackendTestAccess;
+
   struct WorkspaceState {
     std::uint32_t index = 0;
     std::uint64_t tagId = 0;
@@ -117,7 +121,7 @@ private:
   std::unordered_map<std::uint64_t, WindowState> m_windows;
   bool m_overviewKnown = false;
   bool m_overviewOpen = false;
-  std::chrono::steady_clock::time_point m_nextReconnectAt{};
+  std::chrono::steady_clock::time_point m_nextReconnectAt;
   std::chrono::seconds m_reconnectBackoff{2};
   WorkspaceBackend::ChangeCallback m_changeCallback;
   compositors::WorkspaceMetadataBackend::ChangeCallback m_overviewChangeCallback;

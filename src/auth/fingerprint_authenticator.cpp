@@ -56,6 +56,12 @@ namespace {
     const auto it = kResults.find(result);
     return it == kResults.end() ? MatchResult::Invalid : it->second;
   }
+
+  bool isRecoverableVerifyStartError(const sdbus::Error& error) {
+    // Suspend/resume can drop the claim while the proxy survives; only that case is worth
+    // recreating+reclaiming. Other VerifyStart failures are permanent for this lock attempt.
+    return error.getName() == sdbus::Error::Name{"net.reactivated.Fprint.Error.ClaimDevice"};
+  }
 } // namespace
 
 FingerprintAuthenticator::FingerprintAuthenticator(SystemBus& bus) : m_bus(bus) {
@@ -208,12 +214,15 @@ void FingerprintAuthenticator::startVerify(bool isRetry) {
         if (e.has_value()) {
           kLog.info("could not start fingerprint verification: {}", e->what());
           m_verifying = false;
-          // A claim dropped across suspend/resume makes VerifyStart fail; drop the stale proxy and
-          // recreate+reclaim once. The one-shot guard keeps a permanently failing device from looping.
-          if (!m_reclaimAttempted && m_active && !m_sleeping && !m_abort) {
+          // A claim dropped across suspend/resume makes VerifyStart fail with ClaimDevice; drop the
+          // stale proxy and recreate+reclaim once. Destroying the proxy here would use-after-free
+          // the async reply handler, so defer the reset until after it returns.
+          if (!m_reclaimAttempted && m_active && !m_sleeping && !m_abort && isRecoverableVerifyStartError(*e)) {
             m_reclaimAttempted = true;
-            m_device.reset();
-            m_retryTimer.start(kRetryDelay, [this]() { startVerify(false); });
+            m_retryTimer.start(kRetryDelay, [this]() {
+              m_device.reset();
+              startVerify(false);
+            });
             return;
           }
           emitStatus({}, false); // issue loading: drop the status message

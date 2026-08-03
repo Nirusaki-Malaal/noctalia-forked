@@ -3,6 +3,7 @@
 #include "core/log.h"
 #include "render/core/image_decoder.h"
 #include "render/core/renderer.h"
+#include "render/core/texture_manager.h"
 #include "render/scene/node.h"
 #include "ui/builders.h"
 #include "util/file_utils.h"
@@ -18,7 +19,7 @@ namespace {
   constexpr Logger kLog("desktop");
   constexpr float kDefaultStickerSize = 200.0f;
   constexpr int kMaxStickerGifFrames = 512;
-  constexpr std::size_t kMaxStickerGifBytes = 96ull * 1024 * 1024;
+  constexpr std::size_t kMaxStickerGifBytes = 96ULL * 1024 * 1024;
 
   bool endsWithIgnoreCase(const std::string& s, const char* suffix) {
     const std::size_t n = std::strlen(suffix);
@@ -43,7 +44,7 @@ DesktopStickerWidget::DesktopStickerWidget(std::string imagePath, float opacity)
 DesktopStickerWidget::~DesktopStickerWidget() { unloadFrames(); }
 
 void DesktopStickerWidget::create() {
-  auto rootNode = std::make_unique<Node>();
+  auto rootNode = ui::node({});
   rootNode->setOpacity(m_opacity);
 
   auto image = ui::image({
@@ -114,10 +115,9 @@ bool DesktopStickerWidget::tryLoadAnimated(Renderer& renderer) {
     return false;
   }
 
-  std::string err;
-  auto decoded = decodeAnimatedGif(bytes.data(), bytes.size(), kMaxStickerGifFrames, kMaxStickerGifBytes, &err);
+  auto decoded = decodeAnimatedGif(bytes.data(), bytes.size(), kMaxStickerGifFrames, kMaxStickerGifBytes);
   if (!decoded) {
-    kLog.warn("sticker: failed to decode GIF \"{}\": {}", m_imagePath, err);
+    kLog.warn("sticker: failed to decode GIF \"{}\": {}", m_imagePath, decoded.error());
     return false;
   }
   if (decoded->frames.size() <= 1) {

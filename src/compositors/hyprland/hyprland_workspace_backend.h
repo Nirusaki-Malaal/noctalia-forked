@@ -45,6 +45,9 @@ public:
   void notifyCleanup() override;
   void notifyChanged() override;
   void syncFromCompositor();
+  // FIXME: remove once Hyprland emits change_id on socket2
+  // (https://github.com/hyprwm/Hyprland/discussions/15527).
+  void reconcileFromCompositor();
 
   [[nodiscard]] int pollFd() const noexcept override;
   void dispatchPoll(short revents) override;
@@ -70,11 +73,12 @@ private:
   };
 
   void refreshSnapshot();
-  void refreshWorkspaces();
+  [[nodiscard]] bool refreshWorkspaces();
   void refreshMonitors();
   void refreshClients();
   void recomputeWorkspaceFlags();
   void ensureSnapshotFresh() const;
+  void applyWorkspaceIdChange(int oldId, int newId, std::string_view newName);
 
   void handleEvent(std::string_view event, std::string_view data) override;
   void handleFocusedMonitor(std::string_view monitorName, int workspaceId);
@@ -90,6 +94,7 @@ private:
   [[nodiscard]] static bool isSpecial(const WorkspaceState& state);
   [[nodiscard]] static bool workspaceOrderLess(const WorkspaceState* a, const WorkspaceState* b);
   [[nodiscard]] static Workspace toWorkspace(const WorkspaceState& state);
+  [[nodiscard]] std::string workspaceKeyForId(int workspaceId) const;
 
   OutputNameResolver m_outputNameResolver;
   std::vector<WorkspaceState> m_workspaces;

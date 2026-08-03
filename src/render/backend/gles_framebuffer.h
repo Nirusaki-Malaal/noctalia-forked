@@ -2,7 +2,6 @@
 
 #include "render/backend/render_backend.h"
 #include "render/core/texture_handle.h"
-#include "render/core/texture_manager.h"
 
 #include <GLES2/gl2.h>
 #include <cstdint>
@@ -29,6 +28,7 @@ public:
   [[nodiscard]] TextureId colorTexture() const noexcept override { return m_color.id; }
   [[nodiscard]] std::uint32_t width() const noexcept override { return m_width; }
   [[nodiscard]] std::uint32_t height() const noexcept override { return m_height; }
+  void abandon() noexcept override;
 
 private:
   TextureManager* m_textures = nullptr;

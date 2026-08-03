@@ -7,9 +7,7 @@
 
 #include <stdexcept>
 #include <cstring>
-#include <wayland-client.h>
-#include <GLES2/gl2.h>
-
+#include <wayland-client-protocol.h>
 
 BackdropSurface::~BackdropSurface() {
   m_wallpaperRenderer.makeCurrent();
@@ -52,12 +50,12 @@ void BackdropSurface::onScaleChanged() {
 }
 
 void BackdropSurface::render() {
-  if (m_surface == nullptr) {
+  auto* backend = m_wallpaperRenderer.backend();
+  if (m_surface == nullptr || backend == nullptr) {
     return;
   }
 
   m_wallpaperRenderer.makeCurrent();
-
   {
     std::scoped_lock lock(m_videoMutex);
     if (m_newVideoFrame && !m_videoFrame.empty() && m_videoW > 0 && m_videoH > 0) {
@@ -79,7 +77,7 @@ void BackdropSurface::render() {
     }
   }
 
-  m_layer.resize(*m_wallpaperRenderer.backend(), m_bufW, m_bufH);
+  m_layer.resize(*backend, m_bufW, m_bufH);
 
   if (!m_layer.valid()) {
     return;
@@ -183,3 +181,18 @@ void BackdropSurface::onGpuResourcesInvalidated() {
   m_layer.destroy();
   requestRedraw();
 }
+
+void BackdropSurface::prepareForGraphicsReset() noexcept {
+  m_layer.abandon();
+  m_wallpaperRenderer.prepareForGraphicsReset();
+}
+
+void BackdropSurface::restoreAfterGraphicsReset() {
+  if (m_shared == nullptr) {
+    throw std::runtime_error("BackdropSurface requires a GlSharedContext");
+  }
+  m_wallpaperRenderer.restoreAfterGraphicsReset(*m_shared);
+  m_layer.invalidate();
+}
+
+void BackdropSurface::finishGraphicsResetRecovery() noexcept { m_wallpaperRenderer.finishGraphicsResetRecovery(); }

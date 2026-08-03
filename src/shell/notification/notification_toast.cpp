@@ -11,6 +11,7 @@
 #include "net/uri.h"
 #include "notification/notification_display_name.h"
 #include "notification/notification_manager.h"
+#include "render/core/texture_manager.h"
 #include "render/render_context.h"
 #include "render/scene/input_area.h"
 #include "shell/surface/edge_inset.h"
@@ -54,6 +55,7 @@ namespace {
   constexpr float kNotificationIconGlyphSizeCompact = 20.0f;
   constexpr float kNotificationIconReferenceSize = 36.0f;
   constexpr float kTopProgressInset = Style::spaceMd;
+  constexpr auto kExitFallbackGrace = std::chrono::milliseconds(50);
 
   float notificationIconRadius(float iconSize, float localScale = 1.0f) {
     const float baseRadius = Style::radiusMd * (iconSize / kNotificationIconReferenceSize);
@@ -63,11 +65,11 @@ namespace {
   constexpr float kIconTextGap = Style::spaceSm;
   constexpr float kActionGap = Style::spaceXs;
   constexpr float kActionRowGap = Style::spaceSm;
-  constexpr int kMaxActionButtons = 2;
   std::string fallbackActionLabel() { return i18n::tr("notifications.actions.fallback"); }
 
   bool hasInlineReplyAction(const std::vector<std::string>& actions) {
-    for (std::size_t i = 0; i + 1 < actions.size(); i += 2) {
+    const std::size_t limit = std::min(actions.size(), kMaxNotificationActions * 2);
+    for (std::size_t i = 0; i + 1 < limit; i += 2) {
       if (actions[i] == "inline-reply") {
         return true;
       }
@@ -76,7 +78,8 @@ namespace {
   }
 
   std::string inlineReplyPlaceholder(const std::vector<std::string>& actions) {
-    for (std::size_t i = 0; i + 1 < actions.size(); i += 2) {
+    const std::size_t limit = std::min(actions.size(), kMaxNotificationActions * 2);
+    for (std::size_t i = 0; i + 1 < limit; i += 2) {
       if (actions[i] == "inline-reply") {
         return actions[i + 1];
       }
@@ -90,7 +93,7 @@ namespace {
     if (timeout <= 0) {
       return -1;
     }
-    return std::max(1000, static_cast<int>(timeout));
+    return static_cast<int>(timeout);
   }
   constexpr int kProgressHeight = 3;
   constexpr int kContentSlideOffset = 12; // subtle foreground slide during reveal/retract
@@ -105,9 +108,9 @@ namespace {
     if (config == nullptr) {
       return 1.0f;
     }
-    const auto& shell = config->config().shell;
+    const auto& accessibility = config->config().accessibility;
     const auto& notification = config->config().notification;
-    return std::max(0.1f, shell.uiScale * notification.scale);
+    return std::max(0.1f, accessibility.uiScale * notification.scale);
   }
 
   [[nodiscard]] float cardWidth(float scale) { return static_cast<float>(kCardWidth) * scale; }
@@ -251,15 +254,7 @@ namespace {
     }
   }
 
-  std::int32_t outputLogicalHeight(const WaylandOutput& output) {
-    if (output.logicalHeight > 0) {
-      return output.logicalHeight;
-    }
-    if (output.height > 0) {
-      return output.height / std::max(1, output.scale);
-    }
-    return 0;
-  }
+  std::int32_t outputLogicalHeight(const WaylandOutput& output) { return output.effectiveLogicalHeight(); }
 
   float notificationTextMaxWidth(float scale, bool showActions) {
     return std::max(
@@ -286,7 +281,7 @@ namespace {
     return ui::button({
         .text = std::string(label),
         .fontSize = Style::fontSizeCaption * scale,
-        .variant = ButtonVariant::Outline,
+        .variant = ButtonVariant::Default,
     });
   }
 
@@ -302,11 +297,15 @@ namespace {
     }
   }
 
+  bool showToastProgressAccent(Urgency urgency, int displayDurationMs) {
+    return displayDurationMs >= 0 || urgency == Urgency::Critical;
+  }
+
   std::vector<std::unique_ptr<Button>>
   collectNotificationActionButtons(const std::vector<std::string>& actions, float scale) {
     std::vector<std::unique_ptr<Button>> buttons;
-    buttons.reserve(kMaxActionButtons);
-    for (std::size_t i = 0; i + 1 < actions.size() && static_cast<int>(buttons.size()) < kMaxActionButtons; i += 2) {
+    const std::size_t limit = std::min(actions.size(), kMaxNotificationActions * 2);
+    for (std::size_t i = 0; i + 1 < limit; i += 2) {
       const std::string& actionKey = actions[i];
       std::string actionLabel = actions[i + 1];
       if (actionKey.empty() || actionKey == "default") {
@@ -320,56 +319,22 @@ namespace {
     return buttons;
   }
 
-  bool
-  notificationActionsPreferStack(RenderContext& rc, const std::vector<std::unique_ptr<Button>>& buttons, float scale) {
-    if (buttons.size() < 2) {
-      return false;
-    }
-    const float rowWidth = notificationTextMaxWidth(scale, true);
-    float totalWidth = 0.0f;
-    for (std::size_t i = 0; i < buttons.size(); ++i) {
-      if (i > 0) {
-        totalWidth += actionGap(scale);
-      }
-      const LayoutSize measured = buttons[i]->measure(rc, LayoutConstraints{});
-      totalWidth += measured.width;
-    }
-    return totalWidth > rowWidth + 0.5f;
-  }
-
-  void configureNotificationActionsRow(Flex& row, bool stacked, float scale) {
-    if (stacked) {
-      row.setDirection(FlexDirection::Vertical);
-      row.setAlign(FlexAlign::Start);
-      row.setJustify(FlexJustify::End);
-    } else {
-      row.setDirection(FlexDirection::Horizontal);
-      row.setAlign(FlexAlign::Center);
-      row.setJustify(FlexJustify::Start);
-    }
-    row.setGap(actionGap(scale));
-  }
-
   float layoutNotificationActionsRow(
-      RenderContext& rc, Flex& row, std::vector<std::unique_ptr<Button>>& buttons, float scale
+      RenderContext& rc, Flex& container, std::vector<std::unique_ptr<Button>>& buttons, float scale
   ) {
-    const bool stacked = notificationActionsPreferStack(rc, buttons, scale);
-    configureNotificationActionsRow(row, stacked, scale);
-    const float rowWidth = notificationTextMaxWidth(scale, true);
-    for (auto& button : buttons) {
-      if (stacked) {
-        button->setMaxWidth(0.0f);
-      } else if (buttons.size() == 1) {
-        button->setMaxWidth(rowWidth);
-      } else {
-        button->setMaxWidth(0.0f);
-      }
-      row.addChild(std::move(button));
-    }
-    buttons.clear();
-    row.setSize(rowWidth, 0.0f);
-    row.layout(rc);
-    return row.height() + actionRowGap(scale);
+    container.setDirection(FlexDirection::Vertical);
+    container.setAlign(FlexAlign::Stretch);
+    container.setJustify(FlexJustify::Start);
+    container.setGap(actionGap(scale));
+
+    const float maxRowWidth = notificationTextMaxWidth(scale, true);
+
+    auto rows = wrapButtonsIntoRows(rc, buttons, maxRowWidth, actionGap(scale));
+    populateRowContainer(container, std::move(rows), maxRowWidth, actionGap(scale));
+
+    container.setSize(maxRowWidth, 0.0f);
+    container.layout(rc);
+    return container.height() + actionRowGap(scale);
   }
 
   float measureToastCardHeight(
@@ -394,8 +359,8 @@ namespace {
             .orientation = ProgressBarOrientation::HorizontalCentered,
             .width = std::max(0.0f, cardW - topProgressInset(scale) * 2.0f),
             .height = progressHeight(scale),
-            .visible = displayDurationMs >= 0,
-            .participatesInLayout = displayDurationMs >= 0,
+            .visible = showToastProgressAccent(urgency, displayDurationMs),
+            .participatesInLayout = showToastProgressAccent(urgency, displayDurationMs),
             .configure = [scale](ProgressBar& progress) { progress.setPosition(topProgressInset(scale), 0.0f); },
         })
     );
@@ -421,10 +386,10 @@ namespace {
         ui::label({
             .text = StringUtils::trimLeadingBlankLines(summary),
             .fontSize = summaryFontSize(scale),
+            .fontWeight = FontWeight::Bold,
             .color = colorSpecFromRole(ColorRole::OnSurface),
             .maxWidth = topTextMaxWidth,
             .maxLines = std::max(1, summaryLines),
-            .fontWeight = FontWeight::Bold,
         })
     );
 
@@ -443,7 +408,7 @@ namespace {
     auto buttons = shouldShowNotificationActions(config) ? collectNotificationActionButtons(actions, scale)
                                                          : std::vector<std::unique_ptr<Button>>{};
     if (!buttons.empty()) {
-      auto actionsRow = ui::row({
+      auto actionsRow = ui::column({
           .padding = Style::spaceXs * scale,
       });
       layoutNotificationActionsRow(rc, *actionsRow, buttons, scale);
@@ -464,6 +429,7 @@ namespace {
                   .fontSize = metaFontSize(scale),
                   .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
                   .maxWidth = textMaxWidth,
+                  .maxLines = 1,
                   .textAlign = TextAlign::End,
               })
           )
@@ -763,7 +729,7 @@ void NotificationToast::onNotificationEvent(const Notification& n, NotificationE
           m_entries[i].displayDurationMs = newDuration;
           m_entries[i].remainingProgress = 1.0f;
           if (newDuration < 0) {
-            cs.progressBar->setOpacity(0.0f);
+            cs.progressBar->setOpacity(n.urgency == Urgency::Critical ? 1.0f : 0.0f);
             cs.progressBar->setProgress(1.0f);
             cs.countdownAnimId = 0;
           } else {
@@ -925,6 +891,19 @@ void NotificationToast::dismissPopup(std::size_t index) {
     return;
   }
   entry.exiting = true;
+  entry.exitFallbackTimer.start(
+      std::chrono::milliseconds(Style::animNormal) + kExitFallbackGrace,
+      [this, notificationId = entry.notificationId]() {
+        if (findEntry(notificationId) != nullptr) {
+          finishRemoval(notificationId);
+          for (auto& inst : m_instances) {
+            if (inst->surface != nullptr) {
+              inst->surface->renderNow();
+            }
+          }
+        }
+      }
+  );
 
   bool hadVisibleCard = false;
   for (auto& inst : m_instances) {
@@ -945,7 +924,7 @@ void NotificationToast::finishRemoval(uint32_t notificationId) {
   if (it == m_entries.end()) {
     return;
   }
-  const std::size_t index = static_cast<std::size_t>(std::distance(m_entries.begin(), it));
+  const auto index = static_cast<std::size_t>(std::distance(m_entries.begin(), it));
 
   // Remove card nodes from all instances
   for (auto& inst : m_instances) {
@@ -1021,7 +1000,8 @@ void NotificationToast::addCardToInstance(Instance& inst, std::size_t entryIndex
   // whose surface can't fit the card, so the nominal driver may never have a card at all.
   if (entry.displayDurationMs < 0) {
     // Persistent — no countdown, no auto-dismiss
-    cs.progressBar->setOpacity(0.0f);
+    cs.progressBar->setOpacity(entry.urgency == Urgency::Critical ? 1.0f : 0.0f);
+    cs.progressBar->setProgress(1.0f);
     cs.countdownAnimId = 0;
   } else {
     const float startProgress = std::clamp(entry.remainingProgress, 0.0f, 1.0f);
@@ -1129,7 +1109,7 @@ void NotificationToast::finishExitingEntryIfOrphaned(uint32_t notificationId) {
     return;
   }
 
-  const std::size_t index = static_cast<std::size_t>(std::distance(m_entries.begin(), it));
+  const auto index = static_cast<std::size_t>(std::distance(m_entries.begin(), it));
   for (const auto& inst : m_instances) {
     if (index < inst->cards.size() && inst->cards[index].cardNode != nullptr) {
       return;
@@ -1601,7 +1581,7 @@ float NotificationToast::cardSurfaceY(const Instance& inst, std::size_t entryInd
   const float scale = notificationUiScale(m_config);
   const float layoutGap = kGap * scale;
   const bool bottom = isBottomStacking();
-  const float surfaceHeight = static_cast<float>(inst.surface->height());
+  const auto surfaceHeight = static_cast<float>(inst.surface->height());
   const float layoutBottom = layoutBottomForSurfaceHeight(surfaceHeight);
   const float placementBottom = maxPlacementBottom();
 
@@ -1660,7 +1640,7 @@ float NotificationToast::maxPlacementBottom() const {
   }
   if (!haveSurfaceHeight && m_wayland != nullptr) {
     for (const auto& output : m_wayland->outputs()) {
-      if (output.output == nullptr) {
+      if (!output.done || output.output == nullptr || !output.hasUsableGeometry()) {
         continue;
       }
       if (!shouldRenderOnOutput(output)) {
@@ -1943,12 +1923,25 @@ void NotificationToast::ensureSurfaces() {
   // currently connected (e.g. an external display was undocked), fall back to every available
   // output so notifications never silently disappear. Targeting is restored automatically when a
   // configured monitor reconnects via onOutputChange().
-  const bool anyConfiguredPresent = selectedMonitors.empty()
-      || std::any_of(m_wayland->outputs().begin(), m_wayland->outputs().end(),
-                     [this](const WaylandOutput& o) { return o.output != nullptr && shouldRenderOnOutput(o); });
+  const bool anyConfiguredPresent =
+      selectedMonitors.empty()
+      || std::any_of(m_wayland->outputs().begin(), m_wayland->outputs().end(), [this](const WaylandOutput& o) {
+           return o.done && o.output != nullptr && o.hasUsableGeometry() && shouldRenderOnOutput(o);
+         });
+
+  std::erase_if(m_instances, [this, anyConfiguredPresent](const auto& inst) {
+    if (inst == nullptr || inst->output == nullptr) {
+      return true;
+    }
+    const auto* output = m_wayland->findOutputByWl(inst->output);
+    if (output == nullptr || !output->done || !output->hasUsableGeometry()) {
+      return true;
+    }
+    return anyConfiguredPresent && !shouldRenderOnOutput(*output);
+  });
 
   for (const auto& output : m_wayland->outputs()) {
-    if (output.output == nullptr) {
+    if (!output.done || output.output == nullptr || !output.hasUsableGeometry()) {
       continue;
     }
     if (anyConfiguredPresent && !shouldRenderOnOutput(output)) {
@@ -1992,6 +1985,7 @@ void NotificationToast::ensureSurfaces() {
         .keyboard = LayerShellKeyboard::None,
         .defaultWidth = surfaceWidth,
         .defaultHeight = surfaceHeightForOutput(output.output),
+        .prewarmBlur = true,
     };
 
     inst->surface = std::make_unique<LayerSurface>(*m_wayland, std::move(surfaceConfig));
@@ -2187,7 +2181,7 @@ InputArea* NotificationToast::buildCard(
   const float topTextMaxWidth = std::max(0.0f, textMaxWidth - closeButtonSize(scale) - Style::spaceSm * scale);
   const bool showAppName = shouldShowNotificationAppName(m_config, entry.appName);
 
-  auto viewport = std::make_unique<InputArea>();
+  auto viewport = ui::inputArea({});
   viewport->setAcceptedButtons(InputArea::buttonMask({BTN_LEFT, BTN_RIGHT}));
   viewport->setOnClick([this, id = entry.notificationId,
                         hasDefaultAction = !entry.actions.empty()
@@ -2215,6 +2209,7 @@ InputArea* NotificationToast::buildCard(
   *outCardForeground = foreground.get();
 
   const float bgAlpha = m_config != nullptr ? m_config->config().notification.backgroundOpacity : 0.97f;
+  const float borderWidth = (m_config == nullptr || m_config->config().notification.border) ? Style::borderWidth : 0.0f;
   foreground->addChild(
       ui::progressBar({
           .out = outProgress,
@@ -2224,14 +2219,14 @@ InputArea* NotificationToast::buildCard(
           .orientation = ProgressBarOrientation::HorizontalCentered,
           .width = std::max(0.0f, cardW - topProgressInset(scale) * 2.0f),
           .height = progressHeight(scale),
-          .visible = entry.displayDurationMs >= 0,
-          .participatesInLayout = entry.displayDurationMs >= 0,
+          .visible = showToastProgressAccent(entry.urgency, entry.displayDurationMs),
+          .participatesInLayout = showToastProgressAccent(entry.urgency, entry.displayDurationMs),
           .configure = [scale](ProgressBar& progress) { progress.setPosition(topProgressInset(scale), 0.0f); },
       })
   );
 
   auto contentRow = ui::row({
-      .align = FlexAlign::Center,
+      .align = FlexAlign::Start,
       .gap = iconTextGap(scale),
       .padding = cardInnerPad(scale),
       .width = cardW,
@@ -2269,22 +2264,7 @@ InputArea* NotificationToast::buildCard(
     }
   }
   if (!iconAssigned) {
-    const std::string iconPath = resolveNotificationIconPath(entry);
-    if (!iconPath.empty()) {
-      auto appIcon = ui::image({
-          .fit = ImageFit::Cover,
-          .radius = notificationIconRadius(iconSize, scale),
-          .width = iconSize,
-          .height = iconSize,
-          .configure = [](Image& image) { image.setPosition(0.0f, 0.0f); },
-      });
-      if (appIcon->setSourceFile(*m_renderContext, iconPath, static_cast<int>(std::round(iconSize)))) {
-        iconSlot->addChild(std::move(appIcon));
-        iconAssigned = true;
-      } else {
-        kLog.warn("notification toast: failed to load icon image for #{} from '{}'", entry.notificationId, iconPath);
-      }
-    } else if (entry.imageData.has_value()) {
+    if (entry.imageData.has_value()) {
       const auto& image = *entry.imageData;
       if (image.width > 0 && image.height > 0 && !image.data.empty()) {
         auto appIcon = ui::image({
@@ -2322,6 +2302,25 @@ InputArea* NotificationToast::buildCard(
         );
       }
     }
+
+    if (!iconAssigned) {
+      const std::string iconPath = resolveNotificationIconPath(entry);
+      if (!iconPath.empty()) {
+        auto appIcon = ui::image({
+            .fit = ImageFit::Cover,
+            .radius = notificationIconRadius(iconSize, scale),
+            .width = iconSize,
+            .height = iconSize,
+            .configure = [](Image& image) { image.setPosition(0.0f, 0.0f); },
+        });
+        if (appIcon->setSourceFile(*m_renderContext, iconPath, static_cast<int>(std::round(iconSize)))) {
+          iconSlot->addChild(std::move(appIcon));
+          iconAssigned = true;
+        } else {
+          kLog.warn("notification toast: failed to load icon image for #{} from '{}'", entry.notificationId, iconPath);
+        }
+      }
+    }
   }
 
   if (!iconAssigned) {
@@ -2352,10 +2351,10 @@ InputArea* NotificationToast::buildCard(
       ui::label({
           .text = displaySummary,
           .fontSize = summaryFontSize(scale),
+          .fontWeight = FontWeight::Bold,
           .color = colorSpecFromRole(ColorRole::OnSurface),
           .maxWidth = topTextMaxWidth,
           .maxLines = kMaxSummaryLines,
-          .fontWeight = FontWeight::Bold,
       })
   );
   std::unique_ptr<Flex> actionsRow;
@@ -2370,8 +2369,8 @@ InputArea* NotificationToast::buildCard(
     // Build action buttons row (always visible initially)
     {
       std::vector<std::unique_ptr<Button>> buttons;
-      for (std::size_t i = 0; i + 1 < entry.actions.size() && static_cast<int>(buttons.size()) < kMaxActionButtons;
-           i += 2) {
+      const std::size_t limit = std::min(entry.actions.size(), kMaxNotificationActions * 2);
+      for (std::size_t i = 0; i + 1 < limit; i += 2) {
         const std::string actionKey = entry.actions[i];
         std::string actionLabel = entry.actions[i + 1];
         if (actionKey.empty() || actionKey == "default") {
@@ -2403,7 +2402,7 @@ InputArea* NotificationToast::buildCard(
       }
 
       if (!buttons.empty()) {
-        actionsRow = ui::row({
+        actionsRow = ui::column({
             .padding = Style::spaceXs * scale,
         });
         layoutNotificationActionsRow(*m_renderContext, *actionsRow, buttons, scale);
@@ -2535,6 +2534,7 @@ InputArea* NotificationToast::buildCard(
             .fontSize = metaFontSize(scale),
             .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
             .maxWidth = textMaxWidth,
+            .maxLines = 1,
             .textAlign = TextAlign::End,
         })
     );
@@ -2554,11 +2554,11 @@ InputArea* NotificationToast::buildCard(
       ui::box({
           .width = cardW,
           .height = cardHeight,
-          .configure = [scale, bgAlpha](Box& box) {
+          .configure = [scale, bgAlpha, borderWidth](Box& box) {
             box.setCardStyle();
             box.setRadius(Style::scaledRadiusXl(scale));
             box.setFill(colorSpecFromRole(ColorRole::Surface, bgAlpha));
-            box.setBorder(colorSpecFromRole(ColorRole::Outline, 0.8f), Style::borderWidth);
+            box.setBorder(colorSpecFromRole(ColorRole::Outline), borderWidth);
           },
       })
   );
@@ -2756,7 +2756,7 @@ bool NotificationToast::onKeyboardEvent(const KeyboardEvent& event) {
 // --- Pointer events ---
 
 bool NotificationToast::onPointerEvent(const PointerEvent& event) {
-  if (event.type == PointerEvent::Type::Button && event.state == 1) {
+  if (event.type == PointerEvent::Type::Button && event.pressed) {
     for (auto& inst : m_instances) {
       if (inst->surface == nullptr) {
         continue;
@@ -2806,7 +2806,7 @@ bool NotificationToast::onPointerEvent(const PointerEvent& event) {
       if (inst->pointerInside) {
         inst->lastPointerX = static_cast<float>(event.sx);
         inst->lastPointerY = static_cast<float>(event.sy);
-        const bool pressed = (event.state == 1);
+        const bool pressed = event.pressed;
         inst->inputDispatcher.pointerMotion(static_cast<float>(event.sx), static_cast<float>(event.sy), event.serial);
         inst->inputDispatcher.pointerButton(
             static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, pressed

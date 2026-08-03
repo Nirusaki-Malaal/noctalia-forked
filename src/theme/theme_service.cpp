@@ -13,6 +13,7 @@
 #include "theme/fixed_palette.h"
 #include "theme/image_loader.h"
 #include "theme/palette_generator.h"
+#include "theme/palette_transform.h"
 #include "theme/scheme.h"
 #include "ui/app_icon_colorization.h"
 #include "util/checksum.h"
@@ -24,7 +25,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <json.hpp>
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -425,33 +426,32 @@ namespace noctalia::theme {
       return m_wallpaperCacheGenerated;
     }
 
-    std::string err;
     profiling::StopWatch loadWatch;
-    auto image = loadAndResize(wallpaperPath, *scheme, &err);
+    auto image = loadAndResize(wallpaperPath, *scheme);
     if (profiling::enabled()) {
       kLog.info("theme: wallpaper load+resize: {:.1f} ms", loadWatch.elapsedMs());
     }
-    if (!image.has_value()) {
-      kLog.warn("failed to load wallpaper '{}': {}", wallpaperPath, err);
+    if (!image) {
+      kLog.warn("failed to load wallpaper '{}': {}", wallpaperPath, image.error());
       return std::nullopt;
     }
     profiling::StopWatch genWatch;
-    auto generated = generate(image->rgb, *scheme, &err);
+    auto generated = generate(image->rgb, *scheme);
     if (profiling::enabled()) {
       kLog.info("theme: wallpaper palette generate: {:.1f} ms", genWatch.elapsedMs());
     }
-    if (generated.dark.empty()) {
-      kLog.warn("failed to generate palette from wallpaper: {}", err);
+    if (!generated) {
+      kLog.warn("failed to generate palette from wallpaper: {}", generated.error());
       return std::nullopt;
     }
 
     if (mtimeNs != 0) {
-      m_wallpaperCacheGenerated = generated;
+      m_wallpaperCacheGenerated = *generated;
       m_wallpaperCachePath = wallpaperPath;
       m_wallpaperCacheScheme = cfg.wallpaperScheme;
       m_wallpaperCacheMtimeNs = mtimeNs;
     }
-    return generated;
+    return *generated;
   }
 
   void ThemeService::resolveAndSet(bool animate) {
@@ -501,6 +501,24 @@ namespace noctalia::theme {
     }
     if (!resolved.has_value()) {
       resolved = resolveBuiltin(cfg, mode);
+    }
+
+    // Every source funnels through here, so the transform covers wallpaper-generated,
+    // builtin, community and custom palettes alike. It runs after the wallpaper cache,
+    // which keeps storing the untransformed palette — toggling this cannot serve a stale one.
+    if (cfg.pureBlackDark) {
+      applyPureBlackDark(resolved->generated);
+    }
+    if (m_config.config().accessibility.highContrast) {
+      applyHighContrast(resolved->generated);
+    }
+
+    if (cfg.pureBlackDark || m_config.config().accessibility.highContrast) {
+      if (resolved->mode != "light") {
+        resolved->palette = mapGeneratedPaletteMode(resolved->generated.dark);
+      } else {
+        resolved->palette = mapGeneratedPaletteMode(resolved->generated.light);
+      }
     }
 
     queueResolvedCallback(resolved->generated, resolved->mode);
@@ -616,7 +634,7 @@ namespace noctalia::theme {
 
     const std::string wallpaperPath = m_config.getPaletteWallpaperPath();
     const auto generated = resolveWallpaperGenerated(cfg, wallpaperPath);
-    if (!generated.has_value()) {
+    if (!generated) {
       return fail("failed to generate palette from wallpaper");
     }
 
@@ -646,7 +664,7 @@ namespace noctalia::theme {
           toggleLightDark();
           return "ok\n";
         },
-        "theme-mode-toggle", "Toggle theme mode between dark and light"
+        "", "Toggle theme mode between dark and light"
     );
     ipc.registerHandler(
         "theme-mode-get",
@@ -655,7 +673,8 @@ namespace noctalia::theme {
           out.push_back('\n');
           return out;
         },
-        "theme-mode-get", "Print the current resolved theme mode"
+        "", "Print the current resolved theme mode",
+        IpcService::HandlerOptions{.actionEditorVisibility = IpcService::ActionEditorVisibility::Hidden}
     );
     ipc.registerHandler(
         "theme-mode-set",
@@ -668,13 +687,13 @@ namespace noctalia::theme {
           m_config.setThemeMode(*mode);
           return "ok\n";
         },
-        "theme-mode-set <dark|light|auto>", "Set theme mode and persist to settings.toml"
+        "<dark|light|auto>", "Set theme mode and persist to settings.toml"
     );
     ipc.registerHandler(
         "color-scheme-get",
-        [this](const std::string&) -> std::string { return formatColorSchemeLine(m_config.config().theme); },
-        "color-scheme-get",
-        "Print active color scheme: <source> <name> (source is builtin, wallpaper, community, or custom)"
+        [this](const std::string&) -> std::string { return formatColorSchemeLine(m_config.config().theme); }, "",
+        "Print active color scheme: <source> <name> (source is builtin, wallpaper, community, or custom)",
+        IpcService::HandlerOptions{.actionEditorVisibility = IpcService::ActionEditorVisibility::Hidden}
     );
     ipc.registerHandler(
         "color-scheme-set",
@@ -690,7 +709,7 @@ namespace noctalia::theme {
           }
           return "ok\n";
         },
-        "color-scheme-set <source> <name>",
+        "<source> <name>",
         "Set palette source and selection in settings.toml (builtin name, wallpaper generator scheme, community id, or "
         "custom scheme folder name)"
     );

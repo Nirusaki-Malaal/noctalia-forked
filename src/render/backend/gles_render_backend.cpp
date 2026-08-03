@@ -7,7 +7,6 @@
 #include "render/render_target.h"
 
 #include <GLES2/gl2.h>
-#include <GLES2/gl2ext.h>
 #include <chrono>
 #include <format>
 #include <stdexcept>
@@ -74,6 +73,13 @@ void main() {
 
   const char* safeCString(const char* value) { return value != nullptr ? value : "unknown"; }
 
+  std::string eglErrorDetail(EGLint error) {
+    if (error == EGL_SUCCESS) {
+      return "no EGL error reported";
+    }
+    return std::format("EGL error 0x{:04x}", static_cast<unsigned>(error));
+  }
+
   bool hasGlExtension(std::string_view name) {
     const char* extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
     if (extensions == nullptr || name.empty()) {
@@ -138,10 +144,7 @@ void main() {
             eglCreateWindowSurface(m_display, m_config, reinterpret_cast<EGLNativeWindowType>(m_window), nullptr);
         if (m_surface == EGL_NO_SURFACE && !m_createFailureLogged) {
           const EGLint error = eglGetError();
-          kLog.warn(
-              "eglCreateWindowSurface failed (EGL error 0x{:04x}); will retry before rendering",
-              static_cast<unsigned>(error)
-          );
+          kLog.warn("eglCreateWindowSurface failed ({}); will retry before rendering", eglErrorDetail(error));
           m_createFailureLogged = true;
         } else if (m_surface != EGL_NO_SURFACE) {
           m_createFailureLogged = false;
@@ -156,15 +159,11 @@ void main() {
           if (currentContext != EGL_NO_CONTEXT
               && eglMakeCurrent(m_display, EGL_NO_SURFACE, EGL_NO_SURFACE, currentContext) != EGL_TRUE) {
             const EGLint error = eglGetError();
-            kLog.warn(
-                "eglMakeCurrent(EGL_NO_SURFACE) before surface destroy failed (EGL error 0x{:04x})",
-                static_cast<unsigned>(error)
-            );
+            kLog.warn("eglMakeCurrent(EGL_NO_SURFACE) before surface destroy failed ({})", eglErrorDetail(error));
             if (eglMakeCurrent(m_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) != EGL_TRUE) {
               const EGLint releaseError = eglGetError();
               kLog.warn(
-                  "eglMakeCurrent(EGL_NO_CONTEXT) before surface destroy failed (EGL error 0x{:04x})",
-                  static_cast<unsigned>(releaseError)
+                  "eglMakeCurrent(EGL_NO_CONTEXT) before surface destroy failed ({})", eglErrorDetail(releaseError)
               );
             }
           }
@@ -229,7 +228,9 @@ void GlesRenderBackend::initialize(GlSharedContext& shared) {
   }
 
   // Make context current (surfaceless) so GL resources can be created eagerly.
-  makeCurrentNoSurface();
+  if (!makeCurrentNoSurface()) {
+    throw std::runtime_error("new render context could not be made current");
+  }
 
   if (!g_backendInfoLogged) {
     kLog.info(
@@ -246,27 +247,49 @@ void GlesRenderBackend::initialize(GlSharedContext& shared) {
   }
 
   resolveGraphicsResetStatusProc();
+  m_viewportValid = false;
+  m_blendMode.reset();
+  m_scissorEnabled = false;
+  m_scissorValid = false;
 }
 
-void GlesRenderBackend::makeCurrentNoSurface() {
+bool GlesRenderBackend::makeCurrentNoSurface() {
   if (m_display == EGL_NO_DISPLAY || m_context == EGL_NO_CONTEXT) {
-    return;
+    return false;
+  }
+
+  // Texture work requested while rendering can use the context's current draw
+  // surface. Rebinding it surfacelessly here would detach that surface before
+  // the frame's trailing eglSwapBuffers.
+  if (eglGetCurrentDisplay() == m_display && eglGetCurrentContext() == m_context) {
+    return true;
   }
 
   if (eglMakeCurrent(m_display, EGL_NO_SURFACE, EGL_NO_SURFACE, m_context) != EGL_TRUE) {
-    throw std::runtime_error(
-        std::format("eglMakeCurrent(EGL_NO_SURFACE) failed (EGL error 0x{:04x})", static_cast<unsigned>(eglGetError()))
-    );
+    // Genuine context loss (e.g. NVIDIA video-memory purge on resume) makes this fail. Skip the
+    // GPU work rather than throwing across the C ABI; graphicsResetStatus() drives the rebuild.
+    kLog.warn("eglMakeCurrent(EGL_NO_SURFACE) failed ({}); skipping GPU work", eglErrorDetail(eglGetError()));
+    return false;
   }
+  return true;
 }
 
-void GlesRenderBackend::makeCurrent(RenderTarget& target) {
+bool GlesRenderBackend::makeCurrent(RenderTarget& target) {
   auto& surface = glesSurfaceTarget(target);
+  if (eglGetCurrentDisplay() == m_display
+      && eglGetCurrentContext() == m_context
+      && eglGetCurrentSurface(EGL_DRAW) == surface.eglSurface()
+      && eglGetCurrentSurface(EGL_READ) == surface.eglSurface()) {
+    return true;
+  }
+
   const auto start = std::chrono::steady_clock::now();
   if (eglMakeCurrent(m_display, surface.eglSurface(), surface.eglSurface(), m_context) != EGL_TRUE) {
-    throw std::runtime_error(
-        std::format("eglMakeCurrent failed (EGL error 0x{:04x})", static_cast<unsigned>(eglGetError()))
-    );
+    // Same teardown hazard as endFrame's swap: the surface can be invalidated by
+    // the compositor and eglMakeCurrent returns EGL_FALSE. Skip the frame rather
+    // than killing the shell; genuine context loss is caught via graphicsResetStatus().
+    kLog.warn("eglMakeCurrent failed ({}); skipping frame", eglErrorDetail(eglGetError()));
+    return false;
   }
   float ms = elapsedSince(start);
   logSlowRenderOperation(ms, "eglMakeCurrent took {:.1f}ms", ms);
@@ -278,24 +301,32 @@ void GlesRenderBackend::makeCurrent(RenderTarget& target) {
   eglSwapInterval(m_display, 0);
   ms = elapsedSince(intervalStart);
   logSlowRenderOperation(ms, "eglSwapInterval(0) took {:.1f}ms", ms);
+  return true;
 }
 
-void GlesRenderBackend::beginFrame(RenderTarget& target) {
-  makeCurrent(target);
+bool GlesRenderBackend::beginFrame(RenderTarget& target) {
+  if (!makeCurrent(target)) {
+    return false;
+  }
 
   setViewport(target.bufferWidth(), target.bufferHeight());
   setBlendMode(RenderBlendMode::PremultipliedAlpha);
   disableScissor();
   clear(rgba(0.0f, 0.0f, 0.0f, 0.0f));
+  return true;
 }
 
 void GlesRenderBackend::endFrame(RenderTarget& target) {
   auto& surface = glesSurfaceTarget(target);
   const auto swapStart = std::chrono::steady_clock::now();
   if (eglSwapBuffers(m_display, surface.eglSurface()) != EGL_TRUE) {
-    throw std::runtime_error(
-        std::format("eglSwapBuffers failed (EGL error 0x{:04x})", static_cast<unsigned>(eglGetError()))
-    );
+    // A failed swap is not fatal: during compositor teardown (session logout,
+    // output removal) the wl_egl_window backing buffer can be invalidated and
+    // eglSwapBuffers returns EGL_FALSE, sometimes with EGL_SUCCESS. Genuine GPU
+    // context loss is detected separately via graphicsResetStatus(). Skip this
+    // frame instead of killing the shell.
+    kLog.warn("eglSwapBuffers failed ({}); skipping frame", eglErrorDetail(eglGetError()));
+    return;
   }
   const float ms = elapsedSince(swapStart);
   logSlowRenderOperation(
@@ -331,14 +362,33 @@ void GlesRenderBackend::invalidateGpuResources() {
     return;
   }
   if (eglGetCurrentDisplay() != m_display || eglGetCurrentContext() != m_context) {
-    try {
-      makeCurrentNoSurface();
-    } catch (const std::exception& e) {
-      kLog.warn("skipping GPU resource invalidation: {}", e.what());
+    if (!makeCurrentNoSurface()) {
+      kLog.warn("skipping GPU resource invalidation: could not make context current");
       return;
     }
   }
   destroyGpuObjects();
+}
+
+void GlesRenderBackend::abandonAfterGraphicsReset() noexcept {
+  // Every object in the dead share group is already invalid, and by the time the second
+  // backend gets here the first one has left no context current. Forget the GL names
+  // instead of issuing deletes that would run with no context bound.
+  m_textureManager.abandonGpuResources();
+  abandonGpuObjects();
+
+  if (m_display != EGL_NO_DISPLAY) {
+    eglMakeCurrent(m_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  }
+  if (m_context != EGL_NO_CONTEXT && m_display != EGL_NO_DISPLAY) {
+    eglDestroyContext(m_display, m_context);
+  }
+
+  m_display = EGL_NO_DISPLAY;
+  m_config = nullptr;
+  m_context = EGL_NO_CONTEXT;
+  m_graphicsResetStatus = nullptr;
+  m_maxTextureSize = 0;
 }
 
 std::unique_ptr<RenderSurfaceTarget> GlesRenderBackend::createSurfaceTarget(wl_surface* surface) {
@@ -364,7 +414,13 @@ void GlesRenderBackend::bindFramebuffer(const RenderFramebuffer& framebuffer) {
 void GlesRenderBackend::bindDefaultFramebuffer() { GlesFramebuffer::bindDefault(); }
 
 void GlesRenderBackend::setViewport(std::uint32_t width, std::uint32_t height) {
+  if (m_viewportValid && m_viewportWidth == width && m_viewportHeight == height) {
+    return;
+  }
   glViewport(0, 0, static_cast<GLint>(width), static_cast<GLint>(height));
+  m_viewportWidth = width;
+  m_viewportHeight = height;
+  m_viewportValid = true;
 }
 
 void GlesRenderBackend::clear(Color color) {
@@ -373,6 +429,9 @@ void GlesRenderBackend::clear(Color color) {
 }
 
 void GlesRenderBackend::setBlendMode(RenderBlendMode mode) {
+  if (m_blendMode == mode) {
+    return;
+  }
   switch (mode) {
   case RenderBlendMode::Disabled:
     glDisable(GL_BLEND);
@@ -386,6 +445,7 @@ void GlesRenderBackend::setBlendMode(RenderBlendMode mode) {
     glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     break;
   }
+  m_blendMode = mode;
 }
 
 int GlesRenderBackend::maxTextureSize() {
@@ -414,14 +474,31 @@ void GlesRenderBackend::drawFullscreenQuad(const ShaderProgram& program) {
 }
 
 void GlesRenderBackend::setScissor(RenderScissor scissor) {
-  glEnable(GL_SCISSOR_TEST);
-  glScissor(
-      static_cast<GLint>(scissor.x), static_cast<GLint>(scissor.y), static_cast<GLsizei>(scissor.width),
-      static_cast<GLsizei>(scissor.height)
-  );
+  if (!m_scissorEnabled) {
+    glEnable(GL_SCISSOR_TEST);
+    m_scissorEnabled = true;
+  }
+  if (!m_scissorValid
+      || m_scissor.x != scissor.x
+      || m_scissor.y != scissor.y
+      || m_scissor.width != scissor.width
+      || m_scissor.height != scissor.height) {
+    glScissor(
+        static_cast<GLint>(scissor.x), static_cast<GLint>(scissor.y), static_cast<GLsizei>(scissor.width),
+        static_cast<GLsizei>(scissor.height)
+    );
+    m_scissor = scissor;
+    m_scissorValid = true;
+  }
 }
 
-void GlesRenderBackend::disableScissor() { glDisable(GL_SCISSOR_TEST); }
+void GlesRenderBackend::disableScissor() {
+  if (!m_scissorEnabled) {
+    return;
+  }
+  glDisable(GL_SCISSOR_TEST);
+  m_scissorEnabled = false;
+}
 
 void GlesRenderBackend::drawRect(
     float surfaceWidth, float surfaceHeight, float width, float height, const RoundedRectStyle& style,
@@ -436,7 +513,7 @@ void GlesRenderBackend::drawImage(const RenderImageDraw& draw) {
   m_imageProgram.draw(
       draw.texture, draw.surfaceWidth, draw.surfaceHeight, draw.width, draw.height, draw.tint, draw.monochromeTint,
       draw.alphaMaskTint, draw.opacity, draw.radius, draw.borderColor, draw.borderWidth, static_cast<int>(draw.fitMode),
-      draw.textureWidth, draw.textureHeight, draw.transform
+      draw.textureWidth, draw.textureHeight, draw.transform, draw.scrim
   );
 }
 
@@ -465,6 +542,14 @@ void GlesRenderBackend::drawSpinner(
 ) {
   m_spinnerProgram.ensureInitialized();
   m_spinnerProgram.draw(surfaceWidth, surfaceHeight, width, height, style, transform);
+}
+
+void GlesRenderBackend::drawCountdownRing(
+    float surfaceWidth, float surfaceHeight, float width, float height, const CountdownRingStyle& style,
+    const Mat3& transform
+) {
+  m_countdownRingProgram.ensureInitialized();
+  m_countdownRingProgram.draw(surfaceWidth, surfaceHeight, width, height, style, transform);
 }
 
 void GlesRenderBackend::drawScreenCorner(
@@ -509,19 +594,9 @@ void GlesRenderBackend::drawGraph(
   m_graphProgram.draw(dataTexture, textureWidth, surfaceWidth, surfaceHeight, width, height, style, transform);
 }
 
-void GlesRenderBackend::drawWallpaper(
-    WallpaperTransition transition, WallpaperSourceKind sourceKind1, TextureId texture1, const Color& sourceColor1,
-    WallpaperSourceKind sourceKind2, TextureId texture2, const Color& sourceColor2, float surfaceWidth,
-    float surfaceHeight, float width, float height, float imageWidth1, float imageHeight1, float imageWidth2,
-    float imageHeight2, float progress, float fillMode, const TransitionParams& params, const Color& fillColor,
-    const Mat3& transform
-) {
+void GlesRenderBackend::drawWallpaper(const WallpaperDrawParams& params) {
   m_wallpaperProgram.ensureInitialized();
-  m_wallpaperProgram.draw(
-      transition, sourceKind1, texture1, sourceColor1, sourceKind2, texture2, sourceColor2, surfaceWidth, surfaceHeight,
-      width, height, imageWidth1, imageHeight1, imageWidth2, imageHeight2, progress, fillMode, params, fillColor,
-      transform
-  );
+  m_wallpaperProgram.draw(params);
 }
 
 void GlesRenderBackend::drawFullscreenTexture(TextureId texture, bool flipY) {
@@ -597,6 +672,7 @@ void GlesRenderBackend::destroyGpuObjects() {
   m_imageProgram.destroy();
   m_glyphProgram.destroy();
   m_spinnerProgram.destroy();
+  m_countdownRingProgram.destroy();
   m_screenCornerProgram.destroy();
   m_audioSpectrumProgram.destroy();
   m_fancyAudioVisualizerProgram.destroy();
@@ -607,6 +683,23 @@ void GlesRenderBackend::destroyGpuObjects() {
   m_fullscreenTextureProgram.destroy();
   m_fullscreenTintProgram.destroy();
   m_textureManager.cleanup();
+}
+
+void GlesRenderBackend::abandonGpuObjects() noexcept {
+  m_rectProgram.abandon();
+  m_imageProgram.abandon();
+  m_glyphProgram.abandon();
+  m_spinnerProgram.abandon();
+  m_countdownRingProgram.abandon();
+  m_screenCornerProgram.abandon();
+  m_audioSpectrumProgram.abandon();
+  m_fancyAudioVisualizerProgram.abandon();
+  m_effectProgram.abandon();
+  m_graphProgram.abandon();
+  m_wallpaperProgram.abandon();
+  m_blurProgram.abandon();
+  m_fullscreenTextureProgram.abandon();
+  m_fullscreenTintProgram.abandon();
 }
 
 void GlesRenderBackend::cleanup() {

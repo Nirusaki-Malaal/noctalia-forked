@@ -70,6 +70,19 @@ constexpr bool operator==(const GradientStop& lhs, const GradientStop& rhs) noex
   return lhs.position == rhs.position && lhs.color == rhs.color;
 }
 
+// Linear-gradient darkening applied to an image's texels inside the image draw, so the image and
+// its scrim resolve to a single antialiased edge instead of two stacked rounded rects. Only the
+// color is affected; transparent texels stay transparent.
+struct ImageScrim {
+  GradientDirection direction = GradientDirection::Horizontal;
+  std::array<GradientStop, 4> stops{};
+  bool enabled = false;
+};
+
+constexpr bool operator==(const ImageScrim& lhs, const ImageScrim& rhs) noexcept {
+  return lhs.enabled == rhs.enabled && lhs.direction == rhs.direction && lhs.stops == rhs.stops;
+}
+
 struct RoundedRectStyle {
   Color fill{};
   Color border{};
@@ -78,7 +91,7 @@ struct RoundedRectStyle {
   std::array<GradientStop, 4> gradientStops{};
   CornerShapes corners{};
   RectInsets logicalInset{};
-  Radii radius{};
+  Radii radius;
   float softness = 1.0f;
   bool noAa = false;
   bool invertFill = false;
@@ -93,7 +106,7 @@ struct RoundedRectStyle {
   float shadowExclusionHeight = 0.0f;
   CornerShapes shadowExclusionCorners{};
   RectInsets shadowExclusionLogicalInset{};
-  Radii shadowExclusionRadius{};
+  Radii shadowExclusionRadius;
 };
 
 constexpr bool operator==(const RoundedRectStyle& lhs, const RoundedRectStyle& rhs) noexcept {
@@ -125,6 +138,12 @@ constexpr bool operator==(const RoundedRectStyle& lhs, const RoundedRectStyle& r
 struct SpinnerStyle {
   Color color{};
   float thickness = 2.0f;
+};
+
+struct CountdownRingStyle {
+  Color color{};
+  float thickness = 6.0f;
+  float progress = 1.0f;
 };
 
 enum class ScreenCornerPosition : std::uint8_t {

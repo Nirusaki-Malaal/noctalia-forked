@@ -13,12 +13,16 @@ struct NotificationFilterFields {
   std::string_view appName;
   std::optional<std::string_view> category;
   std::optional<std::string_view> desktopEntry;
+  std::string_view summary;
+  std::string_view body;
 };
 
 struct ResolvedNotificationFilter {
   bool showToast = true;
   bool saveHistory = true;
   bool playSound = true;
+  bool allowPermanent = true;
+  std::optional<std::int32_t> overrideDuration;
   /// Empty = all urgencies allowed for this filter.
   std::unordered_set<Urgency> allowedUrgencies;
   bool matched = false;

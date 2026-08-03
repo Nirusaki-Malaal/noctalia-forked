@@ -1,11 +1,12 @@
 #pragma once
 
 #include "render/core/mat3.h"
-#include "render/core/render_styles.h"
 #include "render/core/shader_program.h"
-#include "render/core/texture_handle.h"
 
 #include <GLES2/gl2.h>
+
+class TextureId;
+struct FancyAudioVisualizerStyle;
 
 class FancyAudioVisualizerProgram {
 public:
@@ -17,6 +18,7 @@ public:
 
   void ensureInitialized();
   void destroy();
+  void abandon() noexcept;
 
   void draw(
       TextureId audioTexture, float surfaceWidth, float surfaceHeight, float width, float height,

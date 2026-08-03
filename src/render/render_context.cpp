@@ -1,14 +1,14 @@
 #include "render/render_context.h"
 
+#include "core/files/resource_paths.h"
 #include "core/log.h"
-#include "core/resource_paths.h"
 #include "core/ui_phase.h"
 #include "render/backend/render_backend.h"
 #include "render/core/texture_handle.h"
 #include "render/core/texture_manager.h"
-#include "render/gl_shared_context.h"
 #include "render/render_target.h"
 #include "render/scene/audio_spectrum_node.h"
+#include "render/scene/countdown_ring_node.h"
 #include "render/scene/effect_node.h"
 #include "render/scene/fancy_audio_visualizer_node.h"
 #include "render/scene/glyph_node.h"
@@ -26,7 +26,6 @@
 #include <cmath>
 #include <cstdint>
 #include <format>
-#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -97,8 +96,8 @@ namespace {
   }
 
   Mat3 nodeLocalTransform(const Node* node) {
-    const float cx = node->width() * 0.5f;
-    const float cy = node->height() * 0.5f;
+    const float cx = node->transformOriginX();
+    const float cy = node->transformOriginY();
     return Mat3::translation(node->x(), node->y())
         * Mat3::translation(cx, cy)
         * Mat3::rotation(node->rotation())
@@ -123,22 +122,41 @@ void RenderContext::initialize(GlSharedContext& shared) {
   m_glyphRenderer.initialize(
       paths::assetPath("fonts/tabler.ttf").string(), m_backend.get(), &m_backend->textureManager()
   );
-  m_textFontFamily = "sans-serif";
+  m_textRenderer.setFontFamily(m_textFontFamily);
   ++m_textMetricsGeneration;
+  m_graphicsResetPending = false;
 }
 
-void RenderContext::makeCurrentNoSurface() {
+void RenderContext::restoreAfterGraphicsReset(GlSharedContext& shared) {
+  if (m_backend == nullptr) {
+    throw std::runtime_error("cannot restore an uninitialized render context");
+  }
+  m_backend->initialize(shared);
+  m_backend->textureManager().probeExtensions();
+  invalidateGpuResourcesNextFrame();
+}
+
+void RenderContext::prepareForGraphicsReset() {
   if (m_backend == nullptr) {
     return;
   }
-  m_backend->makeCurrentNoSurface();
+
+  m_textRenderer.abandonGlyphTextures();
+  m_glyphRenderer.abandonGlyphTextures();
+  m_backend->abandonAfterGraphicsReset();
 }
 
-void RenderContext::makeCurrent(RenderTarget& target) {
-  if (m_backend == nullptr) {
-    throw std::runtime_error("RenderContext has no initialized backend");
+bool RenderContext::makeCurrentNoSurface() {
+  if (m_backend == nullptr || m_graphicsResetPending) {
+    return false;
   }
-  m_backend->makeCurrent(target);
+  return m_backend->makeCurrentNoSurface();
+}
+
+bool RenderContext::makeCurrent(RenderTarget& target) {
+  if (m_backend == nullptr || m_graphicsResetPending || !m_backend->makeCurrent(target)) {
+    return false;
+  }
   // Sync the shared text/glyph renderer to this target's buffer/logical ratio
   // unconditionally on every makeCurrent. The text and glyph renderers are
   // process-singletons; if this is left out, layout/measure on one surface can
@@ -146,6 +164,7 @@ void RenderContext::makeCurrent(RenderTarget& target) {
   // jitter on multi-monitor setups with mixed fractional scales). renderScene
   // also goes through this path indirectly via beginFrame.
   syncContentScale(target);
+  return true;
 }
 
 void RenderContext::syncContentScale(RenderTarget& target) {
@@ -175,11 +194,13 @@ void RenderContext::notifyFontConfigChanged() {
 }
 
 void RenderContext::renderScene(RenderTarget& target, Node* sceneRoot) {
-  if (m_backend == nullptr) {
+  if (m_backend == nullptr || m_graphicsResetPending) {
     return;
   }
   const auto totalStart = std::chrono::steady_clock::now();
-  m_backend->beginFrame(target);
+  if (!m_backend->beginFrame(target)) {
+    return;
+  }
   syncContentScale(target);
 
   if (sceneRoot != nullptr
@@ -222,9 +243,10 @@ void RenderContext::renderScene(RenderTarget& target, Node* sceneRoot) {
 
 TextMetrics RenderContext::measureText(
     std::string_view text, float fontSize, FontWeight fontWeight, float maxWidth, int maxLines, TextAlign align,
-    std::string_view fontFamily, TextEllipsize ellipsize
+    std::string_view fontFamily, TextEllipsize ellipsize, bool useMarkup
 ) {
-  auto m = m_textRenderer.measure(text, fontSize, fontWeight, maxWidth, maxLines, align, fontFamily, ellipsize);
+  auto m =
+      m_textRenderer.measure(text, fontSize, fontWeight, maxWidth, maxLines, align, fontFamily, ellipsize, useMarkup);
   return TextMetrics{
       .width = m.width,
       .left = m.left,
@@ -234,7 +256,8 @@ TextMetrics RenderContext::measureText(
       .inkTop = m.inkTop,
       .inkBottom = m.inkBottom,
       .inkLeft = m.inkLeft,
-      .inkRight = m.inkRight
+      .inkRight = m.inkRight,
+      .lineCount = m.lineCount
   };
 }
 
@@ -259,6 +282,13 @@ void RenderContext::measureTextCursorStops(
     FontWeight fontWeight
 ) {
   m_textRenderer.measureCursorStops(text, fontSize, byteOffsets, outStops, fontWeight);
+}
+
+void RenderContext::measureTextCursorStopsWrapped(
+    std::string_view text, float fontSize, const std::vector<std::size_t>& byteOffsets, float maxWidth,
+    std::vector<TextCursorStop>& outStops, FontWeight fontWeight
+) {
+  m_textRenderer.measureCursorStopsWrapped(text, fontSize, byteOffsets, maxWidth, outStops, fontWeight);
 }
 
 TextMetrics RenderContext::measureGlyph(char32_t codepoint, float fontSize) {
@@ -287,14 +317,11 @@ void RenderContext::invalidateGpuResourcesNextFrame() noexcept {
 }
 
 void RenderContext::handleGraphicsReset(RenderGraphicsResetStatus status) {
-  kLog.warn("graphics reset detected: {}; rebuilding GPU resources", graphicsResetStatusName(status));
-  invalidateGpuResourcesNextFrame();
-  if (m_backend != nullptr) {
-    m_backend->invalidateGpuResources();
+  if (m_graphicsResetPending) {
+    return;
   }
-  m_textRenderer.invalidateGlyphTextures();
-  m_glyphRenderer.invalidateGlyphTextures();
-  m_glyphTexturesDirty = false;
+  kLog.warn("graphics reset detected: {}; scheduling context recovery", graphicsResetStatusName(status));
+  m_graphicsResetPending = true;
   if (m_graphicsResetCallback) {
     m_graphicsResetCallback(status);
   }
@@ -302,14 +329,14 @@ void RenderContext::handleGraphicsReset(RenderGraphicsResetStatus status) {
 
 void RenderContext::renderNode(
     const Node* node, const Mat3& parentTransform, float parentOpacity, float sw, float sh, float bw, float bh,
-    float clipLeft, float clipTop, float clipRight, float clipBottom, bool hasClip
+    float clipLeft, float clipTop, float clipRight, float clipBottom, bool hasClip, bool ignoreNodeOpacity
 ) {
   if (!node->visible()) {
     return;
   }
 
   const Mat3 worldTransform = parentTransform * nodeLocalTransform(node);
-  const float effectiveOpacity = parentOpacity * node->opacity();
+  const float effectiveOpacity = ignoreNodeOpacity ? parentOpacity : parentOpacity * node->opacity();
   float boundsLeft = 0.0f;
   float boundsTop = 0.0f;
   float boundsRight = 0.0f;
@@ -344,14 +371,14 @@ void RenderContext::renderNode(
         const Mat3 shadowTransform = worldTransform * Mat3::translation(text->shadowOffsetX(), text->shadowOffsetY());
         m_textRenderer.draw(
             sw, sh, 0.0f, 0.0f, text->text(), text->fontSize(), shadowColor, shadowTransform, text->fontWeight(),
-            text->maxWidth(), text->maxLines(), text->textAlign(), font, text->ellipsize()
+            text->maxWidth(), text->maxLines(), text->textAlign(), font, text->ellipsize(), text->useMarkup()
         );
       }
       auto color = text->color();
       color.a *= effectiveOpacity;
       m_textRenderer.draw(
           sw, sh, 0.0f, 0.0f, text->text(), text->fontSize(), color, worldTransform, text->fontWeight(),
-          text->maxWidth(), text->maxLines(), text->textAlign(), font, text->ellipsize()
+          text->maxWidth(), text->maxLines(), text->textAlign(), font, text->ellipsize(), text->useMarkup()
       );
     }
     break;
@@ -379,6 +406,7 @@ void RenderContext::renderNode(
               .textureWidth = static_cast<float>(img->textureWidth()),
               .textureHeight = static_cast<float>(img->textureHeight()),
               .transform = worldTransform,
+              .scrim = img->scrim(),
           }
       );
     }
@@ -406,6 +434,13 @@ void RenderContext::renderNode(
     auto style = spinner->style();
     style.color.a *= effectiveOpacity;
     m_backend->drawSpinner(sw, sh, node->width(), node->height(), style, worldTransform);
+    break;
+  }
+  case NodeType::CountdownRing: {
+    const auto* ring = static_cast<const CountdownRingNode*>(node);
+    auto style = ring->style();
+    style.color.a *= effectiveOpacity;
+    m_backend->drawCountdownRing(sw, sh, node->width(), node->height(), style, worldTransform);
     break;
   }
   case NodeType::ScreenCorner: {
@@ -455,6 +490,7 @@ void RenderContext::renderNode(
       auto style = graph->style();
       style.lineColor1.a *= effectiveOpacity;
       style.lineColor2.a *= effectiveOpacity;
+      style.lineColor3.a *= effectiveOpacity;
       style.graphFillOpacity *= effectiveOpacity;
       m_backend->drawGraph(
           graph->textureId(), graph->textureWidth(), sw, sh, node->width(), node->height(), style, worldTransform
@@ -474,13 +510,53 @@ void RenderContext::renderNode(
       const float imageHeight2 = hasSource2 ? wallpaper->imageHeight2() : wallpaper->imageHeight1();
       const float progress = hasSource2 ? wallpaper->progress() : 0.0f;
       m_backend->drawWallpaper(
-          wallpaper->transition(), wallpaper->sourceKind1(), wallpaper->texture1(), wallpaper->sourceColor1(),
-          sourceKind2, texture2, sourceColor2, sw, sh, node->width(), node->height(), wallpaper->imageWidth1(),
-          wallpaper->imageHeight1(), imageWidth2, imageHeight2, progress, static_cast<float>(wallpaper->fillMode()),
-          wallpaper->transitionParams(), wallpaper->fillColor(), worldTransform
+          WallpaperDrawParams{
+              .transition = wallpaper->transition(),
+              .from =
+                  {.kind = wallpaper->sourceKind1(),
+                   .texture = wallpaper->texture1(),
+                   .color = wallpaper->sourceColor1(),
+                   .imageWidth = wallpaper->imageWidth1(),
+                   .imageHeight = wallpaper->imageHeight1()},
+              .to =
+                  {.kind = sourceKind2,
+                   .texture = texture2,
+                   .color = sourceColor2,
+                   .imageWidth = imageWidth2,
+                   .imageHeight = imageHeight2},
+              .surfaceWidth = sw,
+              .surfaceHeight = sh,
+              .quadWidth = node->width(),
+              .quadHeight = node->height(),
+              .progress = progress,
+              .fillMode = static_cast<float>(wallpaper->fillMode()),
+              .params = wallpaper->transitionParams(),
+              .fillColor = wallpaper->fillColor(),
+              .transform = worldTransform,
+              .span = wallpaper->spanParams(),
+          }
       );
     }
     break;
+  }
+  case NodeType::RenderProxy: {
+    const auto* proxy = static_cast<const RenderProxyNode*>(node);
+    const Node* source = proxy->source();
+    bool sourceContainsProxy = false;
+    for (const Node* current = node; current != nullptr; current = current->parent()) {
+      if (current == source) {
+        sourceContainsProxy = true;
+        break;
+      }
+    }
+    if (source != nullptr && !sourceContainsProxy) {
+      const Mat3 sourceParent = worldTransform * Mat3::translation(-source->x(), -source->y());
+      renderNode(
+          source, sourceParent, effectiveOpacity, sw, sh, bw, bh, clipLeft, clipTop, clipRight, clipBottom, hasClip,
+          true
+      );
+    }
+    return;
   }
   case NodeType::Base:
     break;

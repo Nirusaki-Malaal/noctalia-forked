@@ -25,9 +25,22 @@ struct ActiveToplevel {
 struct ToplevelInfo {
   std::string title;
   std::string appId;
+  std::string identifier;
   std::uint64_t order = 0;
   zwlr_foreign_toplevel_handle_v1* handle = nullptr;
   ext_foreign_toplevel_handle_v1* extHandle = nullptr;
+  // True when the compositor announced the output(s) this toplevel sits on.
+  bool outputAnnounced = false;
+};
+
+struct WlrToplevelSnapshot {
+  zwlr_foreign_toplevel_handle_v1* handle = nullptr;
+  std::string title;
+  std::string appId;
+  wl_output* output = nullptr;
+  bool activated = false;
+  bool minimized = false;
+  std::uint64_t order = 0;
 };
 
 class WaylandToplevels {
@@ -45,6 +58,8 @@ public:
   [[nodiscard]] std::vector<std::string> allAppIds(wl_output* outputFilter = nullptr) const;
   [[nodiscard]] std::vector<ToplevelInfo>
   windowsForApp(const std::string& idLower, const std::string& wmClassLower, wl_output* outputFilter = nullptr) const;
+  // Toplevels with no app id / class — still focusable via handle.
+  [[nodiscard]] std::vector<ToplevelInfo> windowsWithoutAppId(wl_output* outputFilter = nullptr) const;
   [[nodiscard]] bool containsWlrHandle(zwlr_foreign_toplevel_handle_v1* handle) const;
   void activateHandle(zwlr_foreign_toplevel_handle_v1* handle, wl_seat* seat);
   void closeHandle(zwlr_foreign_toplevel_handle_v1* handle);
@@ -68,16 +83,42 @@ public:
     }
   }
 
+  template <typename Fn> void visitWlrToplevels(Fn&& fn) const {
+    for (const auto& [handle, state] : m_handles) {
+      if (handle == nullptr) {
+        continue;
+      }
+      fn(WlrToplevelSnapshot{
+          .handle = handle,
+          .title = state.title,
+          .appId = state.appId,
+          .output = state.output,
+          .activated = state.activated,
+          .minimized = state.minimized,
+          .order = state.order,
+      });
+    }
+  }
+
 private:
   struct ToplevelState {
     std::string title;
     std::string appId;
     wl_output* output = nullptr;
+    std::vector<wl_output*> activeOutputs;
     bool activated = false;
+    bool minimized = false;
     bool dirty = false;
+    // Set on the first output_enter, never cleared: distinguishes "never announced an output"
+    // from "left every output".
+    bool sawOutputEnter = false;
     std::uint64_t generation = 0;
     std::uint64_t order = 0;
   };
+
+  // A toplevel whose output the compositor never announced matches every filter; one that announced
+  // an output and later left all of them does not.
+  [[nodiscard]] static bool matchesOutputFilter(const ToplevelState& state, wl_output* outputFilter);
 
   [[nodiscard]] bool notifyIfChanged(const std::optional<ActiveToplevel>& before);
   [[nodiscard]] zwlr_foreign_toplevel_handle_v1* latestActivatedHandle() const;

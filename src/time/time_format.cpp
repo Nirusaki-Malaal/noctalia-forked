@@ -11,6 +11,7 @@
 #include <langinfo.h>
 #include <locale>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -44,6 +45,18 @@ namespace {
     }
     const long days = static_cast<long>(secs / 86400);
     return i18n::trp("time.relative.days-ago", days);
+  }
+
+  std::string formatDurationUnit(std::string_view key, std::uint64_t count) {
+    return i18n::trp(key, static_cast<long>(count));
+  }
+
+  std::string formatDurationParts(const std::string& first, const std::string& second) {
+    return i18n::tr("time.duration.two-parts", "first", first, "second", second);
+  }
+
+  std::string formatDurationParts(const std::string& first, const std::string& second, const std::string& third) {
+    return i18n::tr("time.duration.three-parts", "first", first, "second", second, "third", third);
   }
 
 } // namespace
@@ -197,6 +210,75 @@ std::string formatLocalTime(const char* fmt) {
   } catch (...) {
     return normalizedFmt;
   }
+}
+
+bool isValidTimezone(std::string_view tzName) {
+  if (tzName.empty()) {
+    return true;
+  }
+  try {
+    return std::chrono::locate_zone(tzName) != nullptr;
+  } catch (...) {
+    return false;
+  }
+}
+
+std::string formatTimezoneUnixTime(std::int64_t unixSeconds, std::string_view fmt, std::string_view tzName) {
+  if (tzName.empty()) {
+    return formatLocalUnixTime(unixSeconds, fmt);
+  }
+
+  using namespace std::chrono;
+  const time_zone* tz = nullptr;
+  try {
+    tz = locate_zone(tzName);
+  } catch (...) {
+    return formatLocalUnixTime(unixSeconds, fmt);
+  }
+
+  if (tz == nullptr) {
+    return formatLocalUnixTime(unixSeconds, fmt);
+  }
+
+  const std::string normalizedFmt = normalizeFormatEscapes(fmt);
+  const auto tp = sys_seconds{seconds{unixSeconds}};
+  const auto local = tz->to_local(tp);
+  const auto zoneInfo = tz->get_info(tp);
+
+  std::tm tm{};
+  const auto localDays = floor<days>(local);
+  year_month_day ymd{localDays};
+  hh_mm_ss time{floor<seconds>(local - localDays)};
+  tm.tm_year = static_cast<int>(ymd.year()) - 1900;
+  tm.tm_mon = static_cast<unsigned>(ymd.month()) - 1;
+  tm.tm_mday = static_cast<unsigned>(ymd.day());
+  tm.tm_hour = static_cast<int>(time.hours().count());
+  tm.tm_min = static_cast<int>(time.minutes().count());
+  tm.tm_sec = static_cast<int>(time.seconds().count());
+  tm.tm_wday = weekday(localDays).c_encoding();
+  tm.tm_yday = static_cast<int>((localDays - local_days{ymd.year() / January / 1}).count());
+  tm.tm_isdst = zoneInfo.save != minutes::zero();
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+  tm.tm_gmtoff = static_cast<long>(zoneInfo.offset.count());
+  tm.tm_zone = zoneInfo.abbrev.c_str();
+#endif
+
+  if (auto compat = formatStrftimeCompat(normalizedFmt, tm, unixSeconds)) {
+    return *compat;
+  }
+
+  try {
+    return std::vformat(std::locale(""), normalizedFmt, std::make_format_args(local));
+  } catch (...) {
+    return normalizedFmt;
+  }
+}
+
+std::string formatTimezoneTime(const char* fmt, std::string_view tzName) {
+  using namespace std::chrono;
+  const auto now = floor<seconds>(system_clock::now());
+  const auto unixSeconds = duration_cast<seconds>(now.time_since_epoch()).count();
+  return formatTimezoneUnixTime(unixSeconds, fmt, tzName);
 }
 
 std::string formatLocalUnixTime(std::int64_t unixSeconds, std::string_view fmt) {
@@ -354,20 +436,36 @@ std::string formatElapsedSince(std::chrono::steady_clock::time_point since) {
 }
 
 std::string formatDuration(std::chrono::seconds duration) {
-  const std::uint64_t totalSeconds = static_cast<std::uint64_t>(duration.count());
+  const auto totalSeconds = static_cast<std::uint64_t>(duration.count());
   const std::uint64_t days = totalSeconds / 86400;
   std::uint64_t rem = totalSeconds % 86400;
   const std::uint64_t hours = rem / 3600;
   rem %= 3600;
   const std::uint64_t minutes = rem / 60;
   if (days > 0) {
-    return i18n::tr("time.duration.days-hours-minutes", "days", days, "hours", hours, "minutes", minutes);
+    const std::string dayText = formatDurationUnit("time.units.day", days);
+    if (hours > 0 && minutes > 0) {
+      return formatDurationParts(
+          dayText, formatDurationUnit("time.units.hour", hours), formatDurationUnit("time.units.minute", minutes)
+      );
+    }
+    if (hours > 0) {
+      return formatDurationParts(dayText, formatDurationUnit("time.units.hour", hours));
+    }
+    if (minutes > 0) {
+      return formatDurationParts(dayText, formatDurationUnit("time.units.minute", minutes));
+    }
+    return dayText;
   }
   if (hours > 0) {
-    return i18n::tr("time.duration.hours-minutes", "hours", hours, "minutes", minutes);
+    const std::string hourText = formatDurationUnit("time.units.hour", hours);
+    if (minutes > 0) {
+      return formatDurationParts(hourText, formatDurationUnit("time.units.minute", minutes));
+    }
+    return hourText;
   }
   if (minutes > 0) {
-    return i18n::tr("time.duration.minutes", "minutes", minutes);
+    return formatDurationUnit("time.units.minute", minutes);
   }
   return i18n::tr("time.duration.less-than-minute");
 }

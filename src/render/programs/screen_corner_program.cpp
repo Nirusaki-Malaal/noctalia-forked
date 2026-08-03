@@ -1,5 +1,7 @@
 #include "render/programs/screen_corner_program.h"
 
+#include "render/core/render_styles.h"
+
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -110,6 +112,8 @@ void ScreenCornerProgram::destroy() {
   m_softnessLocation = -1;
   m_transformLocation = -1;
 }
+
+void ScreenCornerProgram::abandon() noexcept { m_program.abandon(); }
 
 void ScreenCornerProgram::draw(
     float surfaceWidth, float surfaceHeight, float pixelScaleX, float pixelScaleY, float width, float height,

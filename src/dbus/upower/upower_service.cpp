@@ -4,6 +4,7 @@
 #include "dbus/system_bus.h"
 #include "i18n/i18n.h"
 #include "util/string_utils.h"
+#include "util/sys_utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -44,6 +45,45 @@ std::string batteryStateLabel(BatteryState state) {
   }
 }
 
+const char* batteryGlyphName(double percentage, BatteryState state) {
+  if (state == BatteryState::Charging) {
+    return "battery-charging";
+  }
+  if (state == BatteryState::FullyCharged || state == BatteryState::PendingCharge) {
+    return "battery-plugged";
+  }
+  if (state == BatteryState::Unknown && percentage <= 0.0) {
+    return "battery-exclamation";
+  }
+  if (percentage >= 85.0) {
+    return "battery-4";
+  }
+  if (percentage >= 55.0) {
+    return "battery-3";
+  }
+  if (percentage >= 30.0) {
+    return "battery-2";
+  }
+  if (percentage >= 10.0) {
+    return "battery-1";
+  }
+  return "battery-0";
+}
+
+const char* batteryDeviceGlyphName(UPowerDeviceType type) {
+  switch (type) {
+  case UPowerDeviceType::Mouse:
+    return "mouse-2";
+  case UPowerDeviceType::Keyboard:
+    return "keyboard";
+  case UPowerDeviceType::Phone:
+  case UPowerDeviceType::Pda:
+    return "device-mobile";
+  default:
+    return "bluetooth";
+  }
+}
+
 namespace {
 
   template <typename T>
@@ -58,6 +98,15 @@ namespace {
 
   bool isBatteryCapableDeviceType(UPowerDeviceType type) {
     return type != UPowerDeviceType::Unknown && type != UPowerDeviceType::LinePower;
+  }
+
+  // A battery belonging to a peripheral rather than to the system. UPower reports peripheral packs
+  // with PowerSupply=false, so only PowerSupply batteries and UPS units power the machine itself.
+  bool isPeripheralBattery(const UPowerDeviceInfo& info) {
+    return info.isPresent
+        && isBatteryCapableDeviceType(info.type)
+        && !info.isLaptopBattery()
+        && info.type != UPowerDeviceType::Ups;
   }
 
   bool isAutoSelector(std::string_view selector) {
@@ -92,6 +141,26 @@ namespace {
   }
 
   constexpr Logger kLog("upower");
+
+  UPowerDeviceInfo makeDummyBatteryDevice() {
+    UPowerDeviceInfo info;
+    info.path = "/org/freedesktop/UPower/devices/dummy_battery";
+    info.nativePath = "dummy_BAT0";
+    info.model = "Dummy Battery";
+    info.type = UPowerDeviceType::Battery;
+    info.powerSupply = true;
+    info.isPresent = true;
+    info.energyFull = 54.0;
+    info.energyFullDesign = 54.0;
+    info.state.percentage = 67.0;
+    info.state.energyRate = 12.5;
+    info.state.state = BatteryState::Discharging;
+    info.state.timeToEmpty = 3 * 3600 + 15 * 60;
+    info.state.energy = 36.2;
+    info.state.isPresent = true;
+    info.state.onBattery = true;
+    return info;
+  }
 
 } // namespace
 
@@ -129,6 +198,11 @@ UPowerService::UPowerService(SystemBus& bus) : m_bus(bus) {
     rescanDevices();
   });
 
+  if (SysUtils::isEnvFlagOn("NOCTALIA_DUMMY_BATTERY")) {
+    m_dummyDevice = makeDummyBatteryDevice();
+    kLog.info("dummy battery enabled ({:.0f}% discharging)", m_dummyDevice->state.percentage);
+  }
+
   rescanDevices();
 
   if (m_state.isPresent) {
@@ -147,11 +221,14 @@ void UPowerService::refresh() { refreshDeviceStates(); }
 
 std::vector<UPowerDeviceInfo> UPowerService::batteryDevices() const {
   std::vector<UPowerDeviceInfo> devices;
-  devices.reserve(m_devices.size());
+  devices.reserve(m_devices.size() + (m_dummyDevice ? 1 : 0));
   for (const auto& device : m_devices) {
     if (device.info.isPresent && isBatteryCapableDeviceType(device.info.type)) {
       devices.push_back(device.info);
     }
+  }
+  if (m_dummyDevice && m_dummyDevice->isPresent) {
+    devices.push_back(*m_dummyDevice);
   }
   return devices;
 }
@@ -248,6 +325,9 @@ UPowerState UPowerService::readDefaultState() const {
   }
 
   next = device->state;
+  if (m_dummyDevice && device == &*m_dummyDevice) {
+    return next;
+  }
   next.onBattery = getPropertyOr<bool>(*m_upowerProxy, kUpowerInterface, "OnBattery", false);
   return next;
 }
@@ -269,7 +349,7 @@ UPowerState UPowerService::readDeviceState(sdbus::IProxy& proxy) const {
   if (next.state == BatteryState::Discharging && next.timeToEmpty <= 0 && next.energyRate > 0.0 && next.energy > 0.0) {
     next.timeToEmpty = static_cast<std::int64_t>(std::round((next.energy / next.energyRate) * 3600.0));
   } else if (next.state == BatteryState::Charging && next.timeToFull <= 0 && next.energyRate > 0.0) {
-    const double energyFull = getPropertyOr<double>(proxy, kDeviceInterface, "EnergyFull", 0.0);
+    const auto energyFull = getPropertyOr<double>(proxy, kDeviceInterface, "EnergyFull", 0.0);
     if (energyFull > next.energy) {
       next.timeToFull = static_cast<std::int64_t>(std::round(((energyFull - next.energy) / next.energyRate) * 3600.0));
     }
@@ -300,6 +380,9 @@ const UPowerDeviceInfo* UPowerService::defaultSystemBattery() const noexcept {
       return &device.info;
     }
   }
+  if (m_dummyDevice && m_dummyDevice->isLaptopBattery() && m_dummyDevice->isPresent) {
+    return &*m_dummyDevice;
+  }
   return nullptr;
 }
 
@@ -311,6 +394,23 @@ const UPowerDeviceInfo* UPowerService::deviceForSelector(std::string_view select
 
   for (const auto& device : m_devices) {
     if (isBatteryCapableDeviceType(device.info.type) && upowerDeviceMatchesSelector(device.info, trimmed)) {
+      return &device.info;
+    }
+  }
+  if (m_dummyDevice
+      && isBatteryCapableDeviceType(m_dummyDevice->type)
+      && upowerDeviceMatchesSelector(*m_dummyDevice, trimmed)) {
+    return &*m_dummyDevice;
+  }
+  return nullptr;
+}
+
+const UPowerDeviceInfo* UPowerService::peripheralBatteryForSerial(std::string_view serial) const {
+  if (serial.empty()) {
+    return nullptr;
+  }
+  for (const auto& device : m_devices) {
+    if (isPeripheralBattery(device.info) && StringUtils::equalsInsensitive(device.info.serial, serial)) {
       return &device.info;
     }
   }

@@ -7,10 +7,10 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 class InputArea;
-class Renderer;
 class ScrollView;
 
 // Adapter that drives a VirtualGridView from an external data source.
@@ -41,6 +41,9 @@ public:
   // updates its own selection state and fires onSelectionChanged.
   virtual void onActivate(std::size_t /*index*/) {}
 
+  // Optional tooltip for the item under the pointer.
+  [[nodiscard]] virtual std::string itemTooltip(std::size_t /*index*/) const { return {}; }
+
   // Return true when an overlay consumed the press.
   virtual bool onPointerPress(
       std::size_t /*index*/, float /*cellLocalX*/, float /*cellLocalY*/, float /*cellWidth*/, float /*cellHeight*/
@@ -65,6 +68,8 @@ class VirtualGridView : public Flex {
 public:
   VirtualGridView();
 
+  [[nodiscard]] InputArea* focusArea() const noexcept { return m_inputArea; }
+
   // Adapter is non-owning and must outlive the grid.
   void setAdapter(VirtualGridAdapter* adapter);
 
@@ -86,6 +91,8 @@ public:
   [[nodiscard]] std::optional<std::size_t> selectedIndex() const noexcept { return m_selectedIndex; }
   // Items to move for a Page Up/Down step (one viewport of rows, at least one item).
   [[nodiscard]] std::size_t pageItemStride() const noexcept;
+  // Column count from the most recent layout pass (for keyboard navigation).
+  [[nodiscard]] std::size_t layoutColumnCount() const noexcept { return m_layoutColumns; }
 
   void setOnSelectionChanged(std::function<void(std::optional<std::size_t>)> callback);
 
@@ -104,6 +111,8 @@ private:
   void onPointerMotion(float localX, float localY);
   void onPointerLeave();
   void onPointerPress(float localX, float localY);
+  void onPoolTooltipMotion(std::size_t slot, float localX, float localY);
+  void onPoolTooltipLeave(std::size_t slot);
   void onSecondaryPointerPress(float localX, float localY);
   [[nodiscard]] std::optional<std::size_t> indexAt(float localX, float localY) const noexcept;
   void cellLocalAt(float localX, float localY, std::size_t index, float& cellLocalX, float& cellLocalY) const noexcept;
@@ -115,6 +124,7 @@ private:
 
   VirtualGridAdapter* m_adapter = nullptr;
   std::vector<Node*> m_pool;
+  std::vector<InputArea*> m_poolTooltipAreas;
   std::vector<std::optional<std::size_t>> m_slotBoundIndex;
   std::vector<bool> m_slotBoundSelected;
   std::vector<bool> m_slotBoundHovered;

@@ -1,5 +1,7 @@
 #include "shell/settings/settings_bar_management.h"
 
+#include "config/config_service.h"
+#include "config/config_types.h"
 #include "i18n/i18n.h"
 #include "ui/builders.h"
 #include "ui/palette.h"
@@ -24,8 +26,8 @@ namespace settings {
       return ui::label({
           .text = std::string(text),
           .fontSize = fontSize,
-          .color = color,
           .fontWeight = fontWeight,
+          .color = color,
       });
     }
 
@@ -77,15 +79,15 @@ namespace settings {
       return std::ranges::contains(cfg.bars, name, &BarConfig::name);
     }
 
-    Flex* makeSection(Flex& content, std::string_view title, float scale, bool showBorder) {
+    Flex* makeSection(Flex& content, std::string_view title, float scale) {
       auto section = ui::column(
           {
               .align = FlexAlign::Stretch,
               .gap = Style::spaceSm * scale,
               .configure =
-                  [scale, showBorder](Flex& container) {
+                  [scale](Flex& container) {
                     container.setPadding(Style::spaceSm * scale, Style::spaceMd * scale);
-                    container.setCardStyle(scale, 1.0f, showBorder);
+                    container.setCardStyle(scale, 1.0f);
                     container.setFill(colorSpecFromRole(ColorRole::Surface));
                   },
           },
@@ -112,10 +114,7 @@ namespace settings {
             ctx.pendingDeleteMonitorOverrideBarName == barName && ctx.pendingDeleteMonitorOverrideMatch == match;
         const bool renaming =
             ctx.renamingMonitorOverrideBarName == barName && ctx.renamingMonitorOverrideMatch == match;
-        auto* management = makeSection(
-            content, i18n::tr("settings.entities.monitor-override.management"), ctx.scale,
-            ctx.config.shell.panel.borders
-        );
+        auto* management = makeSection(content, i18n::tr("settings.entities.monitor-override.management"), ctx.scale);
 
         if (renaming) {
           Input* inputPtr = nullptr;
@@ -284,9 +283,7 @@ namespace settings {
 
         const bool pendingDelete = overrideOnly && ctx.pendingDeleteBarName == barName;
         const bool renaming = overrideOnly && ctx.renamingBarName == barName;
-        auto* management = makeSection(
-            content, i18n::tr("settings.entities.bar.management"), ctx.scale, ctx.config.shell.panel.borders
-        );
+        auto* management = makeSection(content, i18n::tr("settings.entities.bar.management"), ctx.scale);
 
         if (renaming) {
           Input* inputPtr = nullptr;

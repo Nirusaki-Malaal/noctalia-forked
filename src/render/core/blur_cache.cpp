@@ -20,7 +20,9 @@ TextureHandle BlurCache::get(
     m_layer.invalidate();
   }
 
-  backend.makeCurrentNoSurface();
+  if (!backend.makeCurrentNoSurface()) {
+    return {};
+  }
   m_layer.resize(backend, width, height);
 
   m_layer.ensure([&](RenderFramebuffer& target) {
@@ -68,6 +70,14 @@ void BlurCache::destroy() {
     m_backend->makeCurrentNoSurface();
   }
   m_layer.destroy();
+  m_backend = nullptr;
+  m_lastSourceTex = {};
+  m_lastRadius = 0.0f;
+  m_lastRounds = 0;
+}
+
+void BlurCache::abandon() noexcept {
+  m_layer.abandon();
   m_backend = nullptr;
   m_lastSourceTex = {};
   m_lastRadius = 0.0f;

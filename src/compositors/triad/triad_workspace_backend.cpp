@@ -10,8 +10,8 @@
 #include <charconv>
 #include <cstring>
 #include <fcntl.h>
-#include <json.hpp>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -276,6 +276,7 @@ std::vector<WorkspaceWindow> TriadWorkspaceBackend::workspaceWindows(const std::
             .title = window.title,
             .x = window.x,
             .y = window.y,
+            .outputName = {},
         }
     );
   }

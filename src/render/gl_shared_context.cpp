@@ -99,11 +99,27 @@ void GlSharedContext::initialize(wl_display* display, bool createSharedContext) 
 
   buildContextAttributes();
 
+  m_sharedContextEnabled = createSharedContext;
   if (createSharedContext) {
     m_rootContext = createContext(EGL_NO_CONTEXT, "root");
     kLog.info("initialized EGL {}.{} with shared root context", major, minor);
   } else {
     kLog.info("initialized EGL {}.{} without shared context (isolated GPU contexts)", major, minor);
+  }
+}
+
+void GlSharedContext::recreateRootContext() {
+  if (m_display == EGL_NO_DISPLAY) {
+    throw std::runtime_error("cannot recreate EGL root context before initialization");
+  }
+
+  eglMakeCurrent(m_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  if (m_rootContext != EGL_NO_CONTEXT) {
+    eglDestroyContext(m_display, m_rootContext);
+    m_rootContext = EGL_NO_CONTEXT;
+  }
+  if (m_sharedContextEnabled) {
+    m_rootContext = createContext(EGL_NO_CONTEXT, "root recovery");
   }
 }
 
@@ -178,17 +194,20 @@ void GlSharedContext::usePlainContextAttributes() noexcept {
   m_videoMemoryPurgeNotificationEnabled = false;
 }
 
-void GlSharedContext::makeCurrentSurfaceless() const {
+bool GlSharedContext::makeCurrentSurfaceless() const {
   if (m_display == EGL_NO_DISPLAY || m_rootContext == EGL_NO_CONTEXT) {
-    return;
+    return true;
   }
   if (eglMakeCurrent(m_display, EGL_NO_SURFACE, EGL_NO_SURFACE, m_rootContext) != EGL_TRUE) {
-    throw std::runtime_error(
-        std::format(
-            "eglMakeCurrent (root, surfaceless) failed (EGL error 0x{:04x})", static_cast<unsigned>(eglGetError())
-        )
+    // Genuine context loss (e.g. NVIDIA video-memory purge on resume) makes this fail. Skip the
+    // GPU work rather than throwing across the C ABI; graphicsResetStatus() drives the rebuild.
+    kLog.warn(
+        "eglMakeCurrent (root, surfaceless) failed (EGL error 0x{:04x}); skipping GPU work",
+        static_cast<unsigned>(eglGetError())
     );
+    return false;
   }
+  return true;
 }
 
 void GlSharedContext::cleanup() {

@@ -1,5 +1,6 @@
 #include "wayland/wayland_seat.h"
 
+#include "core/input/shortcut_keysym.h"
 #include "core/log.h"
 #include "cursor-shape-v1-client-protocol.h"
 
@@ -7,10 +8,8 @@
 #include <clocale>
 #include <cstring>
 #include <linux/input-event-codes.h>
-#include <ranges>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <wayland-client.h>
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon-names.h>
 #include <xkbcommon/xkbcommon.h>
@@ -39,7 +38,7 @@ namespace {
       .axis = &WaylandSeat::handlePointerAxis,
       .frame = &WaylandSeat::handlePointerFrame,
       .axis_source = &WaylandSeat::handlePointerAxisSource,
-      .axis_stop = [](void*, wl_pointer*, std::uint32_t, std::uint32_t) {},
+      .axis_stop = &WaylandSeat::handlePointerAxisStop,
       .axis_discrete = &WaylandSeat::handlePointerAxisDiscrete,
       .axis_value120 = &WaylandSeat::handlePointerAxisValue120,
       .axis_relative_direction = [](void*, wl_pointer*, std::uint32_t, std::uint32_t) {},
@@ -57,7 +56,8 @@ namespace {
 
   constexpr Logger kLog("seat");
   constexpr float kAxisValue120PerStep = 120.0f;
-  constexpr float kLegacyWheelAxisUnitsPerStep = 10.0f;
+  // libinput reports one wheel detent as 15 degrees of rotation.
+  constexpr float kLegacyWheelAxisUnitsPerStep = 15.0f;
 
 } // namespace
 
@@ -87,6 +87,10 @@ void WaylandSeat::setKeyboardEventCallback(KeyboardEventCallback callback) {
 
 void WaylandSeat::setKeyboardFocusCallback(KeyboardFocusCallback callback) {
   m_keyboardFocusCallback = std::move(callback);
+}
+
+void WaylandSeat::setLockKeysChangeCallback(LockKeysChangeCallback callback) {
+  m_lockKeysChangeCallback = std::move(callback);
 }
 
 void WaylandSeat::setCursorShape(std::uint32_t serial, std::uint32_t shape) {
@@ -285,6 +289,7 @@ void WaylandSeat::handlePointerMotion(
   self->m_pendingPointerEvents.push_back(
       PointerEvent{
           .type = PointerEvent::Type::Motion,
+          .surface = self->m_lastPointerSurface,
           .sx = self->m_lastPointerX,
           .sy = self->m_lastPointerY,
           .time = time,
@@ -308,7 +313,7 @@ void WaylandSeat::handlePointerButton(
           .sy = self->m_hasPointerPosition ? self->m_lastPointerY : 0.0,
           .time = time,
           .button = button,
-          .state = state,
+          .pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED),
       }
   );
 }
@@ -317,18 +322,32 @@ void WaylandSeat::handlePointerAxis(
     void* data, wl_pointer* /*pointer*/, std::uint32_t time, std::uint32_t axis, std::int32_t value
 ) {
   auto* self = static_cast<WaylandSeat*>(data);
-  self->m_pendingPointerEvents.push_back(
-      PointerEvent{
-          .type = PointerEvent::Type::Axis,
-          .surface = self->m_lastPointerSurface,
-          .sx = self->m_hasPointerPosition ? self->m_lastPointerX : 0.0,
-          .sy = self->m_hasPointerPosition ? self->m_lastPointerY : 0.0,
-          .time = time,
-          .axis = axis,
-          .axisSource = self->m_pendingAxisSource,
-          .axisValue = wl_fixed_to_double(value),
-      }
-  );
+  PointerEvent event{
+      .type = PointerEvent::Type::Axis,
+      .surface = self->m_lastPointerSurface,
+      .sx = self->m_hasPointerPosition ? self->m_lastPointerX : 0.0,
+      .sy = self->m_hasPointerPosition ? self->m_lastPointerY : 0.0,
+      .time = time,
+      .axis = axis,
+      .axisSource = self->m_pendingAxisSource,
+      .axisValue = wl_fixed_to_double(value),
+      .axisGestureSerial = axis < self->m_axisGestureSerial.size() ? self->m_axisGestureSerial[axis] : 0,
+  };
+
+  // axis_discrete/axis_value120 arrive before the axis event they describe, and
+  // the protocol couples each of them to exactly one axis event of the same
+  // axis within the frame. Claim whatever was stashed for this axis.
+  if (axis < self->m_pendingAxisDetents.size()) {
+    AxisDetent& detent = self->m_pendingAxisDetents[axis];
+    if (detent.valid) {
+      event.axisDiscrete = detent.discrete;
+      event.axisValue120 = detent.value120;
+      event.axisLines = detent.lines;
+      detent = {};
+    }
+  }
+
+  self->m_pendingPointerEvents.push_back(event);
 }
 
 void WaylandSeat::handlePointerAxisSource(void* data, wl_pointer* /*pointer*/, std::uint32_t axisSource) {
@@ -336,18 +355,27 @@ void WaylandSeat::handlePointerAxisSource(void* data, wl_pointer* /*pointer*/, s
   self->m_pendingAxisSource = axisSource;
 }
 
+void WaylandSeat::handlePointerAxisStop(
+    void* data, wl_pointer* /*pointer*/, std::uint32_t /*time*/, std::uint32_t axis
+) {
+  auto* self = static_cast<WaylandSeat*>(data);
+  if (axis < self->m_axisGestureSerial.size()) {
+    ++self->m_axisGestureSerial[axis];
+  }
+}
+
 void WaylandSeat::handlePointerAxisDiscrete(
     void* data, wl_pointer* /*pointer*/, std::uint32_t axis, std::int32_t discrete
 ) {
   auto* self = static_cast<WaylandSeat*>(data);
-  for (auto& pendingEvent : std::views::reverse(self->m_pendingPointerEvents)) {
-    if (pendingEvent.type == PointerEvent::Type::Axis && pendingEvent.axis == axis) {
-      pendingEvent.axisDiscrete = discrete;
-      if (pendingEvent.axisLines == 0.0f) {
-        pendingEvent.axisLines = static_cast<float>(discrete);
-      }
-      return;
-    }
+  if (axis >= self->m_pendingAxisDetents.size()) {
+    return;
+  }
+  AxisDetent& detent = self->m_pendingAxisDetents[axis];
+  detent.valid = true;
+  detent.discrete = discrete;
+  if (detent.lines == 0.0f) {
+    detent.lines = static_cast<float>(discrete);
   }
 }
 
@@ -355,13 +383,13 @@ void WaylandSeat::handlePointerAxisValue120(
     void* data, wl_pointer* /*pointer*/, std::uint32_t axis, std::int32_t value120
 ) {
   auto* self = static_cast<WaylandSeat*>(data);
-  for (auto& pendingEvent : std::views::reverse(self->m_pendingPointerEvents)) {
-    if (pendingEvent.type == PointerEvent::Type::Axis && pendingEvent.axis == axis) {
-      pendingEvent.axisValue120 = value120;
-      pendingEvent.axisLines = static_cast<float>(value120) / kAxisValue120PerStep;
-      return;
-    }
+  if (axis >= self->m_pendingAxisDetents.size()) {
+    return;
   }
+  AxisDetent& detent = self->m_pendingAxisDetents[axis];
+  detent.valid = true;
+  detent.value120 = value120;
+  detent.lines = static_cast<float>(value120) / kAxisValue120PerStep;
 }
 
 void WaylandSeat::handlePointerFrame(void* data, wl_pointer* /*pointer*/) {
@@ -369,6 +397,8 @@ void WaylandSeat::handlePointerFrame(void* data, wl_pointer* /*pointer*/) {
   std::vector<PointerEvent> events = std::move(self->m_pendingPointerEvents);
   self->m_pendingPointerEvents.clear();
   self->m_pendingAxisSource = 0;
+  // Detents never carry across a frame; drop any the compositor left uncoupled.
+  self->m_pendingAxisDetents.fill({});
 
   if (!self->m_pointerEventCallback) {
     return;
@@ -434,7 +464,7 @@ void WaylandSeat::handleTouchDown(
           .sy = self->m_lastPointerY,
           .time = time,
           .button = BTN_LEFT,
-          .state = WL_POINTER_BUTTON_STATE_PRESSED,
+          .pressed = true,
       }
   );
 }
@@ -457,7 +487,7 @@ void WaylandSeat::handleTouchUp(
           .sy = self->m_lastPointerY,
           .time = time,
           .button = BTN_LEFT,
-          .state = WL_POINTER_BUTTON_STATE_RELEASED,
+          .pressed = false,
       }
   );
   self->m_pendingTouchEvents.push_back(
@@ -539,7 +569,7 @@ void WaylandSeat::handleTouchCancel(void* data, wl_touch* /*touch*/) {
             .sx = self->m_lastPointerX,
             .sy = self->m_lastPointerY,
             .button = BTN_LEFT,
-            .state = WL_POINTER_BUTTON_STATE_RELEASED,
+            .pressed = false,
         }
     );
     self->m_pointerEventCallback(
@@ -708,6 +738,13 @@ void WaylandSeat::handleKeyboardKey(
     // XKB_COMPOSE_NOTHING → pass through normally
   }
 
+  // Prefer Latin letter for Ctrl/Alt/Super shortcuts (active layout may be non-Latin).
+  if ((mods & (KeyMod::Ctrl | KeyMod::Alt | KeyMod::Super)) != 0) {
+    if (const auto latin = input::latinShortcutKeysym(self->m_xkbKeymap, xkbKeycode); latin.has_value()) {
+      sym = *latin;
+    }
+  }
+
   // Set up repeat state BEFORE dispatching, so the callback can authoritatively
   // cancel it via stopKeyRepeat() if the key press causes a state transition
   // (e.g. lockscreen unlock) that makes the held key irrelevant.
@@ -739,6 +776,13 @@ void WaylandSeat::handleKeyboardModifiers(
   auto* self = static_cast<WaylandSeat*>(data);
   if (self->m_xkbState != nullptr) {
     xkb_state_update_mask(self->m_xkbState, modsDepressed, modsLatched, modsLocked, 0, 0, group);
+  }
+  if (self->m_lockKeysChangeCallback) {
+    const LockKeysState current = self->lockKeysState();
+    if (current != self->m_lastLockKeysState) {
+      self->m_lastLockKeysState = current;
+      self->m_lockKeysChangeCallback();
+    }
   }
 }
 

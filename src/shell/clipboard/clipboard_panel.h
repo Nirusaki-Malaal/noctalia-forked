@@ -1,11 +1,7 @@
 #pragma once
 
 #include "core/timer_manager.h"
-#include "render/core/thumbnail_service.h"
 #include "shell/panel/panel.h"
-#include "wayland/clipboard_service.h"
-
-class AsyncTextureCache;
 
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +11,7 @@ class AsyncTextureCache;
 #include <vector>
 
 class Button;
+class AsyncTextureCache;
 class ClipboardService;
 class Flex;
 class Image;
@@ -26,15 +23,13 @@ class ScrollView;
 class ConfigService;
 class ClipboardListAdapter;
 class VirtualGridView;
+struct ClipboardEntry;
 
 class ClipboardPanel : public Panel {
 public:
-  ClipboardPanel(
-      ClipboardService* clipboard, ConfigService* config, ThumbnailService* thumbnails, AsyncTextureCache* asyncTextures
-  );
+  ClipboardPanel(ClipboardService* clipboard, ConfigService* config, AsyncTextureCache* asyncTextures);
   ~ClipboardPanel() override;
   void setActivateCallback(std::function<void(const ClipboardEntry&)> callback);
-  void clearHistoryFromIpc();
 
   void create() override;
   void onOpen(std::string_view context) override;
@@ -42,8 +37,8 @@ public:
 
   [[nodiscard]] float preferredWidth() const override { return scaled(720.0f); }
   [[nodiscard]] float preferredHeight() const override { return scaled(560.0f); }
-  [[nodiscard]] LayerShellLayer layer() const override { return LayerShellLayer::Overlay; }
   [[nodiscard]] LayerShellKeyboard keyboardMode() const override { return LayerShellKeyboard::Exclusive; }
+  [[nodiscard]] bool handleGlobalKey(std::uint32_t sym, std::uint32_t modifiers, bool pressed, bool preedit) override;
   [[nodiscard]] InputArea* initialFocusArea() const override;
   [[nodiscard]] PanelPlacement panelPlacement() const noexcept override;
 
@@ -56,6 +51,7 @@ private:
   void updatePreviewActions();
   void rebuildPreview(Renderer& renderer, float width, float height);
   void selectIndex(std::size_t index);
+  void selectByStorageId(std::string storageId);
   void activateSelected();
   void togglePinSelected();
   void runImageAction();
@@ -78,7 +74,6 @@ private:
   ClipboardService* m_clipboard = nullptr;
   std::function<void(const ClipboardEntry&)> m_activateCallback;
   ConfigService* m_config = nullptr;
-  ThumbnailService* m_thumbnails = nullptr;
   AsyncTextureCache* m_asyncTextures = nullptr;
 
   InputArea* m_focusArea = nullptr;
@@ -124,7 +119,6 @@ private:
   float m_lastHeight = 0.0f;
   float m_lastPreviewWidth = -1.0f;
   float m_lastPreviewHeight = -1.0f;
+  float m_listRowHeight = 0.0f;
   bool m_pendingScrollToSelected = false;
-  bool m_thumbnailRefreshPending = false;
-  ThumbnailService::Subscription m_thumbnailPendingSub;
 };

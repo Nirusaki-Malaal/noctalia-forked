@@ -1,7 +1,8 @@
 #pragma once
 
 #include "config/config_types.h"
-#include "core/process.h"
+#include "core/process/process.h"
+#include "scripting/script_arg.h"
 #include "ui/ui_tree.h"
 
 #include <chrono>
@@ -13,6 +14,8 @@
 #include <vector>
 
 namespace scripting {
+
+  using ScriptSettings = std::unordered_map<std::string, WidgetSettingValue>;
 
   struct ScriptColorPatch {
     std::string role;
@@ -55,6 +58,9 @@ namespace scripting {
     std::string glyph;
     std::string icon;
     std::string badge;
+    std::string category;
+    std::string presentation;
+    std::optional<std::string> query;
     double score = 0.0;
 
     bool operator==(const ScriptLauncherResult&) const = default;
@@ -75,6 +81,7 @@ namespace scripting {
     std::optional<ScriptImagePatch> image;
     std::optional<ScriptTooltipPatch> tooltip;
     std::optional<std::string> fontFamily;
+    std::optional<std::string> fontBaseline;
     std::optional<ScriptColorPatch> textColor;
     std::optional<ScriptColorPatch> glyphColor;
     std::optional<bool> visible;
@@ -89,6 +96,7 @@ namespace scripting {
 
     // Launcher-provider results (the `launcher.*` namespace).
     std::optional<ScriptLauncherResultSet> launcherResults;
+    std::optional<std::string> launcherQuery;
 
     // Desktop-widget fields (the `desktopWidget.*` namespace): the declarative
     // control tree from desktopWidget.render() plus tick opt-ins.
@@ -96,12 +104,16 @@ namespace scripting {
     std::optional<bool> wantsSecondTicks;
     std::optional<bool> needsFrameTick;
 
+    // Panel field (the `panel.*` namespace): a close request.
+    std::optional<bool> requestClose;
+
     [[nodiscard]] bool empty() const {
       return !text.has_value()
           && !glyph.has_value()
           && !image.has_value()
           && !tooltip.has_value()
           && !fontFamily.has_value()
+          && !fontBaseline.has_value()
           && !textColor.has_value()
           && !glyphColor.has_value()
           && !visible.has_value()
@@ -112,9 +124,11 @@ namespace scripting {
           && !active.has_value()
           && !enabled.has_value()
           && !launcherResults.has_value()
+          && !launcherQuery.has_value()
           && !uiTree.has_value()
           && !wantsSecondTicks.has_value()
-          && !needsFrameTick.has_value();
+          && !needsFrameTick.has_value()
+          && !requestClose.has_value();
     }
   };
 
@@ -123,12 +137,28 @@ namespace scripting {
     NotifyInfo,
     NotifyError,
     CopyToClipboard,
+    SetWallpaperEnabled,
+    SetWallpaper,
+    TogglePanel,
+    OpenPluginSettings,
+    LoadSound,
+    PlaySound,
   };
 
   struct ScriptSideEffect {
     ScriptSideEffectKind kind = ScriptSideEffectKind::Log;
     std::string title;
     std::string body;
+    // LoadSound: hostId identifies the sound bank, title the logical name, body the resolved path,
+    // and callbackRef the accepted completion callback.
+    // PlaySound: hostId identifies the sound bank and title the logical name.
+    std::uint64_t hostId = 0;
+    int callbackRef = 0;
+    // SetWallpaperEnabled: title holds the output connector, flag the enabled state.
+    // SetWallpaper: title holds the output connector (empty = all outputs), body the image path.
+    // TogglePanel: title holds the panel id ("author/plugin:panel").
+    // OpenPluginSettings: title holds the plugin id ("author/plugin").
+    bool flag = false;
   };
 
   struct ScriptSnapshot {
@@ -143,14 +173,33 @@ namespace scripting {
     Reload,
     Update,
     Call,
-    CallBool,
-    CallStrings,
+    CallArgs,
     AsyncCommandResult,
     AsyncProcessMatchResult,
     AsyncHttpResult,
+    SoundLoadResult,
+    ColorPickerResult,
     StateWatchResult,
     StreamLine,
+    HttpStreamLine,
+    HttpStreamClosed,
+    SettingsChanged,
     Stop,
+  };
+
+  enum class ScriptExitReason : std::uint8_t {
+    Reload,
+    Disable,
+    Uninstall,
+    Shutdown,
+  };
+
+  // Queue policy for a callback invocation.
+  struct ScriptCallOptions {
+    // A newer queued call to the same callback replaces this one.
+    bool coalesce = false;
+    // This call may be dropped when the queue is full.
+    bool droppable = false;
   };
 
   struct ScriptEvent {
@@ -160,24 +209,39 @@ namespace scripting {
     std::string functionName;
     std::string chunkName;
     std::string source;
+    // StreamLine / HttpStreamLine payload.
     std::string first;
-    std::string second;
-    bool boolValue = false;
+    // CallArgs payload: the callback's argument list, pushed in order.
+    ScriptArgs args;
     bool processMatchResult = false;
-    // When true, a newer CallStrings event with the same functionName supersedes
+    // When true, a newer CallArgs event with the same functionName supersedes
     // this one while it is still queued (only the latest payload matters, e.g.
     // onAudioSpectrum frames). IPC and other callbacks leave this false so every
     // event is delivered.
     bool coalesce = false;
+    // When true, this event may be dropped to make room once the queue is full
+    // (state-echo callbacks such as onHover, where a missed edge is harmless).
+    bool droppable = false;
     int callbackRef = 0;
     process::RunResult commandResult;
-    // AsyncHttpResult payload.
+    // AsyncHttpResult / HttpStreamClosed payload.
     bool httpOk = false;
     bool httpIsDownload = false;
     int httpStatus = 0;
     std::string httpBody;
+    // SoundLoadResult payload.
+    bool soundLoadOk = false;
+    std::string soundLoadError;
+    // ColorPickerResult payload (nil on cancellation).
+    std::optional<std::string> colorPickerResult;
     // StateWatchResult payload (the changed value as JSON).
     std::string stateJson;
+    // Stop payload: SIGINT/SIGTERM for signal-driven process shutdown, otherwise 0.
+    int exitSignal = 0;
+    // Stop payload: identifies why the runtime is being destroyed.
+    ScriptExitReason exitReason = ScriptExitReason::Reload;
+    // SettingsChanged payload: the new seeded settings snapshot to swap in.
+    ScriptSettings newSettings;
     ScriptSnapshot snapshot;
     std::chrono::milliseconds budget{12};
   };
@@ -191,11 +255,12 @@ namespace scripting {
     bool hasOnIpc = false;
     bool hasOnIpcKnown = false;
     bool unhealthy = false;
+    // True when this result included a CopyToClipboard side effect (before dispatch).
+    bool copiedToClipboard = false;
     std::string callbackName;
     std::string error;
   };
 
-  using ScriptSettings = std::unordered_map<std::string, WidgetSettingValue>;
   using ScriptResultCallback = std::function<void(ScriptResult)>;
 
 } // namespace scripting

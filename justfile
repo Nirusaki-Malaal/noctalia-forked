@@ -11,7 +11,7 @@ default:
 configure m=mode install_prefix=prefix:
     #!/usr/bin/env bash
     set -euo pipefail
-    args=(--buildtype={{ if m == "release" { "release" } else { "debug" } }} -Dcpp_std={{cpp-std}})
+    args=(--buildtype={{ if m == "release" { "release" } else { "debug" } }} -Dcpp_std={{cpp-std}} -Dtests=auto)
     [[ "{{m}}" == "release" ]] && args+=(-Db_lto=true)
     [[ "{{m}}" == "asan"    ]] && args+=(-Db_sanitize=address,undefined)
     if [[ -d "build-{{m}}" ]]; then
@@ -22,7 +22,7 @@ configure m=mode install_prefix=prefix:
     ln -sfn "build-{{m}}/compile_commands.json" compile_commands.json
 
 build m=mode: (_ensure-configured m)
-    meson compile -C build-{{m}}
+    meson compile -C build-{{m}} noctalia
 
 _ensure-configured m=mode:
     #!/usr/bin/env bash
@@ -31,22 +31,26 @@ _ensure-configured m=mode:
         just configure {{m}}
         exit 0
     fi
-    current_cpp_std="$(meson configure "build-{{m}}" | awk '$1 == "cpp_std" { print $2; exit }')"
-    if [[ "$current_cpp_std" != "{{cpp-std}}" ]]; then
-        meson configure "build-{{m}}" -Dcpp_std={{cpp-std}}
+    configure_output="$(meson configure "build-{{m}}")"
+    current_cpp_std="$(awk '$1 == "cpp_std" { print $2; found=1 } END { if (!found) exit 1 }' <<<"$configure_output")"
+    current_tests="$(awk '$1 == "tests" { print $2; found=1 } END { if (!found) exit 1 }' <<<"$configure_output")"
+    args=()
+    [[ "$current_cpp_std" != "{{cpp-std}}" ]] && args+=(-Dcpp_std={{cpp-std}})
+    [[ "$current_tests" != "auto" ]] && args+=(-Dtests=auto)
+    if (( ${#args[@]} > 0 )); then
+        meson configure "build-{{m}}" "${args[@]}"
     fi
 
 run m=mode: (build m)
     ./build-{{m}}/noctalia
 
-# Build (forcing tests on, even for release) and run the unit tests.
+# Build and run the unit tests, enabling their targets when auto mode omits them.
 test m=mode *args: (_ensure-configured m)
     #!/usr/bin/env bash
     set -euo pipefail
-    # Plain reconfigure first so build dirs predating the 'tests' option learn it,
-    # then force it on (covers release, where it defaults off).
-    meson setup "build-{{m}}" --reconfigure >/dev/null
-    meson setup "build-{{m}}" -Dtests=enabled --reconfigure >/dev/null
+    if [[ "{{m}}" == "release" || "{{m}}" == "asan" ]]; then
+        meson setup "build-{{m}}" -Dtests=enabled --reconfigure >/dev/null
+    fi
     meson test -C build-{{m}} {{args}}
 
 install m:
@@ -68,19 +72,23 @@ uninstall m:
     ninja -C build-{{m}} uninstall
 
 format:
-    find src \( -name '*.cpp' -o -name '*.h' \) -print0 | xargs -0 clang-format -i
-    find src \( -name '*.cpp' -o -name '*.h' \) -print0 | xargs -0 grep -ZlP '\s+$' | xargs -0 -r sed -i 's/[[:space:]]*$//'
+    find src tests \( -name '*.cpp' -o -name '*.h' \) -print0 | xargs -0 clang-format -i
+    find src tests \( -name '*.cpp' -o -name '*.h' \) -print0 | xargs -0 grep -ZlP '\s+$' | xargs -0 -r sed -i 's/[[:space:]]*$//'
 
 _clang_tidy m=mode *args:
     #!/usr/bin/env bash
     set -euo pipefail
     src_root="$(realpath src)"
-    run-clang-tidy -quiet -p build-{{m}} -j "$(nproc)" -header-filter="^${src_root}/.*" {{args}} "^${src_root}/.*"
+    # compile_commands.json stores build-relative paths, so clang-tidy emits header
+    # diagnostics as ../src/...; the header-filter must match that form (an absolute
+    # ^${src_root} anchor never matches, silently dropping every header diagnostic).
+    # ../src/ also excludes vendored third_party/*/src/* headers.
+    run-clang-tidy -quiet -use-color -p "build-{{m}}" -j "$(nproc)" -header-filter='\.\./src/.*' {{args}} "^${src_root}/.*"
 
-lint m=mode: (configure m)
+lint m=mode: (_ensure-configured m)
     just _clang_tidy {{m}} '-warnings-as-errors=*'
 
-fix m=mode: (configure m)
+fix m=mode: (_ensure-configured m)
     just _clang_tidy {{m}} -fix
     just format
 

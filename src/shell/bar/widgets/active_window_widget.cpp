@@ -1,8 +1,8 @@
 #include "shell/bar/widgets/active_window_widget.h"
 
+#include "compositors/compositor_platform.h"
 #include "config/config_service.h"
 #include "i18n/i18n.h"
-#include "render/core/renderer.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
 #include "system/app_identity.h"
@@ -18,17 +18,16 @@
 #include <cmath>
 #include <string_view>
 
-ActiveWindowWidget::ActiveWindowWidget(
-    ConfigService& config, CompositorPlatform& platform, float maxWidth, float minWidth, float iconSize,
-    ActiveWindowTitleScrollMode titleScrollMode, ActiveWindowDisplayMode displayMode, bool showEmptyLabel
-)
-    : m_config(config), m_platform(platform), m_maxWidth(maxWidth), m_minWidth(minWidth), m_iconSize(iconSize),
-      m_titleScrollMode(titleScrollMode), m_displayMode(displayMode), m_showEmptyLabel(showEmptyLabel) {
+ActiveWindowWidget::ActiveWindowWidget(ConfigService& config, CompositorPlatform& platform, Options options)
+    : m_config(config), m_platform(platform), m_maxWidth(static_cast<float>(options.maxWidth)),
+      m_minWidth(static_cast<float>(options.minWidth)), m_iconSize(static_cast<float>(options.iconSize)),
+      m_titleScrollMode(options.titleScrollMode), m_displayMode(options.displayMode),
+      m_showEmptyLabel(options.showEmptyLabel) {
   buildDesktopIconIndex();
 }
 
 void ActiveWindowWidget::create() {
-  auto rootNode = std::make_unique<InputArea>();
+  auto rootNode = ui::inputArea({});
   rootNode->setOnEnter([this](const InputArea::PointerData&) {
     applyTitleScrollMode(m_title != nullptr && m_title->visible());
     requestUpdate();
@@ -53,11 +52,11 @@ void ActiveWindowWidget::create() {
       ui::label({
           .out = &m_title,
           .fontSize = Style::fontSizeBody * m_contentScale,
+          .fontWeight = labelFontWeight(),
           .fontFamily = labelFontFamily(),
           .color = widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface)),
           .maxWidth = m_maxWidth * m_contentScale,
           .maxLines = 1,
-          .fontWeight = labelFontWeight(),
           .autoScroll = false,
       })
   );
@@ -196,6 +195,10 @@ void ActiveWindowWidget::syncState(Renderer& renderer) {
     m_lastAppId = {};
     m_lastEmptyState = emptyState;
     m_lastIconPath = {};
+    m_lastTooltipTitle.clear();
+    if (m_area != nullptr) {
+      m_area->clearTooltip();
+    }
     if (m_icon != nullptr) {
       m_icon->clear(renderer);
     }
@@ -216,6 +219,18 @@ void ActiveWindowWidget::syncState(Renderer& renderer) {
   m_lastTitle = title;
   m_lastAppId = appId;
   m_lastEmptyState = emptyState;
+
+  const std::string tooltipText = emptyState ? std::string{} : title;
+  if (tooltipText != m_lastTooltipTitle) {
+    m_lastTooltipTitle = tooltipText;
+    if (m_area != nullptr) {
+      if (tooltipText.empty()) {
+        m_area->clearTooltip();
+      } else {
+        m_area->setTooltip(tooltipText);
+      }
+    }
+  }
 
   std::string iconPath = emptyState ? std::string{} : resolveIconPath(appId);
 
@@ -247,10 +262,7 @@ std::string ActiveWindowWidget::resolveIconPath(const std::string& appId) {
     return internal->iconPath;
   }
 
-  const app_identity::DesktopEntryLookupOptions lookupOptions = appId.starts_with("steam_app_")
-      ? app_identity::DesktopEntryLookupOptions{.includeHidden = true, .includeNoDisplay = true}
-      : app_identity::DesktopEntryLookupOptions{};
-  if (const auto entry = app_identity::findDesktopEntry(appId, desktopEntries(), lookupOptions);
+  if (const auto entry = app_identity::findDesktopEntry(appId, desktopEntries());
       entry.has_value() && !entry->icon.empty()) {
     const int iconTargetSize = static_cast<int>(std::round(48.0f * m_contentScale));
     const std::string& resolved = m_iconResolver.resolve(entry->icon, iconTargetSize);

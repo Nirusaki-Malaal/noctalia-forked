@@ -14,10 +14,8 @@
 #include <string_view>
 
 namespace {
-
   constexpr Logger kLog("notification");
   constexpr auto kImplicitDuplicateWindow = std::chrono::seconds(1);
-
   constexpr std::string_view urgencyStr(Urgency u) noexcept {
     switch (u) {
     case Urgency::Low:
@@ -84,8 +82,8 @@ namespace {
   bool shouldSaveNotificationToHistory(
       const std::vector<NotificationFilterConfig>& filters, const Notification& notification
   ) {
-    if (notification.origin != NotificationOrigin::External) {
-      return shouldTrackHistory(notification.origin, notification.urgency, notification.transient);
+    if (!shouldTrackHistory(notification.origin, notification.urgency, notification.transient)) {
+      return false;
     }
     const auto resolved = resolveNotificationFilter(
         filters,
@@ -96,10 +94,11 @@ namespace {
             .desktopEntry = notification.desktopEntry.has_value()
                 ? std::optional<std::string_view>{*notification.desktopEntry}
                 : std::nullopt,
+            .summary = notification.summary,
+            .body = notification.body,
         }
     );
-    return resolved.saveHistory
-        && shouldTrackHistory(NotificationOrigin::External, notification.urgency, notification.transient);
+    return resolved.saveHistory;
   }
 
   bool shouldRetainHistoryEntry(const NotificationHistoryEntry& entry) noexcept {
@@ -123,6 +122,42 @@ void NotificationManager::rebuildHistoryIndex() {
   for (size_t i = 0; i < m_history.size(); ++i) {
     m_historyIndex[m_history[i].notification.id] = i;
   }
+}
+
+void NotificationManager::cleanupOldHistoryEntries() {
+  if (m_historyRetentionHours <= 0 || m_history.empty()) {
+    return;
+  }
+
+  const auto retention = std::chrono::hours(m_historyRetentionHours);
+  const auto cutoff = WallClock::now() - retention;
+
+  const auto isExpired = [&](const NotificationHistoryEntry& entry) {
+    return !entry.active
+        && entry.notification.receivedWallClock.has_value()
+        && *entry.notification.receivedWallClock <= cutoff;
+  };
+
+  // Check first: moving into `kept` then bailing on same size leaves emptied husks in m_history.
+  if (std::ranges::none_of(m_history, isExpired)) {
+    return;
+  }
+
+  const bool hadUnreadBefore = computeHasUnreadNotificationHistory();
+  std::deque<NotificationHistoryEntry> kept;
+  for (auto& entry : m_history) {
+    if (isExpired(entry)) {
+      emitPendingDBusClose(entry.notification.id, CloseReason::Expired);
+    } else {
+      kept.push_back(std::move(entry));
+    }
+  }
+
+  m_history = std::move(kept);
+  ++m_changeSerial;
+  rebuildHistoryIndex();
+  schedulePersistHistory();
+  notifyUnreadStateChangedIfNeeded(hadUnreadBefore);
 }
 
 void NotificationManager::upsertHistory(
@@ -178,12 +213,30 @@ void NotificationManager::notifyUnreadStateChangedIfNeeded(bool previousUnreadSt
   }
 }
 
-uint32_t NotificationManager::addOrReplace(
-    uint32_t replacesId, std::string appName, std::string summary, std::string body, Urgency urgency, int32_t timeout,
-    NotificationOrigin origin, bool transient, std::vector<std::string> actions, std::optional<std::string> icon,
-    std::optional<NotificationImageData> imageData, std::optional<std::string> category,
-    std::optional<std::string> desktopEntry
-) {
+uint32_t NotificationManager::addOrReplace(NotificationRequest request) {
+  const uint32_t replacesId = request.replacesId;
+  auto& appName = request.appName;
+  auto& summary = request.summary;
+  auto& body = request.body;
+  const Urgency urgency = request.urgency;
+  int32_t timeout = request.timeout;
+  const NotificationOrigin origin = request.origin;
+  const bool transient = request.transient;
+  auto& actions = request.actions;
+  auto& icon = request.icon;
+  auto& imageData = request.imageData;
+  auto& category = request.category;
+  auto& desktopEntry = request.desktopEntry;
+  const auto& forcedId = request.forcedId;
+
+  if (actions.size() > kMaxNotificationActions * 2) {
+    kLog.warn(
+        "notification from \"{}\" supplied {} action pairs, truncating to {}", appName, actions.size() / 2,
+        kMaxNotificationActions
+    );
+    actions.resize(kMaxNotificationActions * 2);
+  }
+
   const auto now = Clock::now();
   const auto wallNow = WallClock::now();
 
@@ -195,13 +248,21 @@ uint32_t NotificationManager::addOrReplace(
     );
   };
 
-  const ExternalNotificationDispatch externalDispatch = origin == NotificationOrigin::External
-      ? evaluateExternalDispatch(urgency, appName, category, desktopEntry, transient)
-      : ExternalNotificationDispatch{};
+  const ExternalNotificationDispatch dispatch =
+      evaluateExternalDispatch(origin, urgency, appName, category, desktopEntry, summary, body, transient);
+
+  if (dispatch.overrideDuration.has_value()) {
+    timeout = normalizeNotifyExpireTimeout(*dispatch.overrideDuration);
+  }
+
+  // A matching filter with allow_permanent = false expires otherwise-permanent (timeout 0) notifications.
+  if (timeout == 0 && dispatch.disallowPermanent) {
+    timeout = kDefaultNotificationTimeout;
+  }
 
   if (replacesId != 0) {
     if (m_suppressedIds.contains(replacesId)) {
-      if (externalDispatch.fullySuppress) {
+      if (dispatch.fullySuppress) {
         kLog.debug("notification suppressed #{} from=\"{}\" urgency={}", replacesId, appName, urgencyStr(urgency));
         return replacesId;
       }
@@ -244,10 +305,7 @@ uint32_t NotificationManager::addOrReplace(
       n.expiryWallClock = scheduleExpiryWall(wallNow, timeout);
 
       logNotification(n, "updated");
-      const bool saveHistory = origin == NotificationOrigin::External
-          ? externalDispatch.saveHistory
-          : shouldTrackHistory(n.origin, n.urgency, n.transient);
-      if (saveHistory) {
+      if (dispatch.saveHistory) {
         const bool hadUnreadBefore = computeHasUnreadNotificationHistory();
         upsertHistory(n, true, std::nullopt);
         notifyUnreadStateChangedIfNeeded(hadUnreadBefore);
@@ -255,7 +313,7 @@ uint32_t NotificationManager::addOrReplace(
         removeHistoryEntry(n.id);
       }
 
-      if (changed && (origin != NotificationOrigin::External || externalDispatch.showToast)) {
+      if (changed && dispatch.showToast) {
         for (auto& [token, cb] : m_eventCallbacks) {
           cb(n, NotificationEvent::Updated);
         }
@@ -265,7 +323,7 @@ uint32_t NotificationManager::addOrReplace(
     }
   }
 
-  if (externalDispatch.fullySuppress) {
+  if (dispatch.fullySuppress) {
     return suppressExternal(appName, urgency);
   }
 
@@ -278,7 +336,10 @@ uint32_t NotificationManager::addOrReplace(
     }
   }
 
-  const uint32_t id = m_nextId++;
+  const uint32_t id = forcedId.has_value() ? *forcedId : m_nextId++;
+  if (forcedId.has_value() && *forcedId >= m_nextId) {
+    m_nextId = *forcedId + 1;
+  }
   m_notifications.push_back(
       Notification{
           .id = id,
@@ -304,25 +365,46 @@ uint32_t NotificationManager::addOrReplace(
 
   const auto& n = m_notifications.back();
   logNotification(n, "added");
-  if (origin == NotificationOrigin::External ? externalDispatch.saveHistory
-                                             : shouldTrackHistory(n.origin, n.urgency, n.transient)) {
+  if (dispatch.saveHistory) {
     const bool hadUnreadBefore = computeHasUnreadNotificationHistory();
     upsertHistory(n, true, std::nullopt);
     notifyUnreadStateChangedIfNeeded(hadUnreadBefore);
   }
 
-  if (origin != NotificationOrigin::External || externalDispatch.showToast) {
+  if (dispatch.showToast) {
     for (auto& [token, cb] : m_eventCallbacks) {
       cb(n, NotificationEvent::Added);
     }
   }
-  if (!m_doNotDisturb
-      && m_soundPlayer != nullptr
-      && (origin != NotificationOrigin::External || externalDispatch.playSound)) {
+  if (!m_doNotDisturb && m_soundPlayer != nullptr && dispatch.playSound) {
     m_soundPlayer->play("notification");
   }
 
   return n.id;
+}
+
+uint32_t NotificationManager::adoptExternal(uint32_t id, NotificationRequest request) {
+  request.origin = NotificationOrigin::External;
+
+  if (id == 0) {
+    request.replacesId = 0;
+    request.forcedId = std::nullopt;
+    return addOrReplace(std::move(request));
+  }
+
+  if (m_idToIndex.contains(id)) {
+    request.replacesId = id;
+    request.forcedId = std::nullopt;
+    return addOrReplace(std::move(request));
+  }
+
+  if (id >= m_nextId) {
+    m_nextId = id + 1;
+  }
+
+  request.replacesId = 0;
+  request.forcedId = id;
+  return addOrReplace(std::move(request));
 }
 
 uint32_t NotificationManager::addInternal(
@@ -331,8 +413,18 @@ uint32_t NotificationManager::addInternal(
     std::optional<std::string> category, std::optional<std::string> desktopEntry
 ) {
   return addOrReplace(
-      0, std::move(appName), std::move(summary), std::move(body), urgency, timeout, NotificationOrigin::Internal, false,
-      {}, std::move(icon), std::move(imageData), std::move(category), std::move(desktopEntry)
+      NotificationRequest{
+          .appName = std::move(appName),
+          .summary = std::move(summary),
+          .body = std::move(body),
+          .urgency = urgency,
+          .timeout = timeout,
+          .origin = NotificationOrigin::Internal,
+          .icon = std::move(icon),
+          .imageData = std::move(imageData),
+          .category = std::move(category),
+          .desktopEntry = std::move(desktopEntry),
+      }
   );
 }
 
@@ -557,6 +649,16 @@ void NotificationManager::pauseExpiry(uint32_t id) {
   m_notifications[it->second].expiryWallClock.reset();
 }
 
+void NotificationManager::setHistoryRetentionHours(int hours) {
+  m_historyRetentionHours = hours;
+  if (hours > 0) {
+    m_historyRetentionTimer.startRepeating(std::chrono::seconds(60), [this]() { cleanupOldHistoryEntries(); });
+  } else {
+    m_historyRetentionTimer.stop();
+  }
+  cleanupOldHistoryEntries();
+}
+
 void NotificationManager::resumeExpiry(uint32_t id, int32_t remainingMs) {
   const auto it = m_idToIndex.find(id);
   if (it == m_idToIndex.end()) {
@@ -580,8 +682,8 @@ void NotificationManager::setFilters(std::vector<NotificationFilterConfig> filte
 const std::vector<NotificationFilterConfig>& NotificationManager::filters() const noexcept { return m_filters; }
 
 NotificationManager::ExternalNotificationDispatch NotificationManager::evaluateExternalDispatch(
-    Urgency urgency, std::string_view appName, const std::optional<std::string>& category,
-    const std::optional<std::string>& desktopEntry, bool transient
+    NotificationOrigin origin, Urgency urgency, std::string_view appName, const std::optional<std::string>& category,
+    const std::optional<std::string>& desktopEntry, std::string_view summary, std::string_view body, bool transient
 ) const {
   ExternalNotificationDispatch dispatch;
   const auto resolved = resolveNotificationFilter(
@@ -590,8 +692,11 @@ NotificationManager::ExternalNotificationDispatch NotificationManager::evaluateE
           .appName = appName,
           .category = category.has_value() ? std::optional<std::string_view>{*category} : std::nullopt,
           .desktopEntry = desktopEntry.has_value() ? std::optional<std::string_view>{*desktopEntry} : std::nullopt,
+          .summary = summary,
+          .body = body,
       }
   );
+  dispatch.disallowPermanent = resolved.matched && !resolved.allowPermanent;
   if (resolved.matched && !urgencyIsAllowed(resolved.allowedUrgencies, urgency)) {
     dispatch.fullySuppress = true;
     dispatch.showToast = false;
@@ -600,9 +705,12 @@ NotificationManager::ExternalNotificationDispatch NotificationManager::evaluateE
     return dispatch;
   }
   dispatch.showToast = resolved.showToast;
-  dispatch.saveHistory = resolved.saveHistory && shouldTrackHistory(NotificationOrigin::External, urgency, transient);
+  // Internal notifications are toast/sound only — filters never put them in history.
+  dispatch.saveHistory =
+      origin == NotificationOrigin::External && resolved.saveHistory && shouldTrackHistory(origin, urgency, transient);
   dispatch.playSound = resolved.playSound && dispatch.showToast;
   dispatch.fullySuppress = !dispatch.showToast && !dispatch.saveHistory;
+  dispatch.overrideDuration = resolved.overrideDuration;
   return dispatch;
 }
 

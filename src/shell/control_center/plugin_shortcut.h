@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config/config_types.h"
+#include "core/files/file_watcher.h"
 #include "core/timer_manager.h"
 #include "scripting/script_runtime.h"
 #include "shell/control_center/shortcut_registry.h"
@@ -15,21 +16,19 @@ class HttpClient;
 class ClipboardService;
 class CompositorPlatform;
 namespace scripting {
+  struct PluginRuntimeContext;
   class ScriptApiContext;
-}
+} // namespace scripting
 
 // A control-center shortcut backed by a plugin's [[shortcut]] entry. The native
 // Shortcut interface is polled, so the latest label/icon/active/enabled patch is
-// cached and a redraw is kicked when it changes. Lives for the panel's open span
-// (created in HomeTab::create, destroyed on close), so its runtime restarts each
-// time the control center is opened.
+// cached and a redraw is kicked when it changes. Instances are reused across
+// Control Center open/close (HomeTab keeps them); timers and the source file
+// watch are suspended while the panel is closed. Reopen reloads the script if
+// the source file changed while closed.
 class PluginShortcut : public Shortcut {
 public:
-  PluginShortcut(
-      std::string entryId, std::filesystem::path sourcePath,
-      std::unordered_map<std::string, WidgetSettingValue> settings, scripting::ScriptApiContext& scriptApi,
-      HttpClient* httpClient, ClipboardService* clipboard, CompositorPlatform* platform = nullptr
-  );
+  explicit PluginShortcut(scripting::PluginRuntimeContext context);
   ~PluginShortcut() override;
 
   [[nodiscard]] std::string_view id() const override { return m_entryId; }
@@ -42,9 +41,17 @@ public:
   [[nodiscard]] bool active() const override { return m_active; }
   void onClick() override;
   void onRightClick() override;
+  void onPanelClose() override;
+  void onPanelOpen() override;
 
 private:
-  void start(std::unordered_map<std::string, WidgetSettingValue> settings);
+  void start();
+  void setupScriptWatch();
+  void teardownScriptWatch();
+  void reloadScript(bool notifyUser = true);
+  void recordLoadedSourceMtime();
+  [[nodiscard]] bool sourceChangedSinceLoad() const;
+  void resetPresentation();
   void handleResult(const scripting::ScriptResult& result);
   void armTimer();
   [[nodiscard]] scripting::ScriptSnapshot makeScriptSnapshot() const;
@@ -53,12 +60,15 @@ private:
   std::string m_entryId;
   std::filesystem::path m_sourcePath;
   std::filesystem::path m_pluginDir;
+  std::unordered_map<std::string, WidgetSettingValue> m_settings;
   scripting::ScriptApiContext& m_scriptApi;
+  FileWatcher* m_fileWatcher = nullptr;
   HttpClient* m_httpClient = nullptr;
   ClipboardService* m_clipboard = nullptr;
   CompositorPlatform* m_platform = nullptr;
   std::shared_ptr<scripting::ScriptRuntime> m_runtime;
   scripting::ScriptRuntime::SubscriberId m_subscription = 0;
+  FileWatcher::WatchId m_watchId = 0;
   std::string m_label;
   std::string m_iconOn = "circle";
   std::string m_iconOff = "circle";
@@ -66,5 +76,6 @@ private:
   bool m_enabled = true;
   Timer m_updateTimer;
   int m_updateIntervalMs = 1000;
+  std::filesystem::file_time_type m_loadedSourceMtime;
   std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
 };

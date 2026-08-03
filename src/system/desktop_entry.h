@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,7 @@ struct DesktopEntry {
   bool noDisplay = false;
   bool hidden = false;
   bool terminal = false;
+  bool dbusActivatable = false;
 
   // Pre-lowercased for matching
   std::string nameLower;
@@ -42,7 +44,17 @@ struct DesktopEntry {
 std::vector<DesktopEntry> scanDesktopEntries();
 
 const std::vector<DesktopEntry>& desktopEntries();
+
+// Shared snapshot of the current entry list, safe to call from non-main
+// threads (e.g. plugin script workers). Does not trigger a refresh —
+// freshness is owned by the main thread's reload path.
+std::shared_ptr<const std::vector<DesktopEntry>> desktopEntriesSnapshot();
+
 std::uint64_t desktopEntriesVersion();
 int desktopEntryWatchFd() noexcept;
 void checkDesktopEntryReload();
-void requestDesktopEntryRescan() noexcept;
+
+// Cheaply re-stat the resolved XDG application source directories and mark the
+// cache dirty only if they changed. Catches Nix profile-generation symlink
+// swaps that inotify cannot see (the watched store path is immutable).
+void refreshDesktopEntriesIfSourcesChanged();

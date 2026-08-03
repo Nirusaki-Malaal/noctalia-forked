@@ -1,33 +1,37 @@
 #include "system/day_night_schedule.h"
 
+#include "config/config_types.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <ctime>
 #include <numbers>
+#include <utility>
 
 namespace day_night_schedule {
 
   namespace {
 
+    // Callers must have accepted the string through normalizedClock first.
     int timeToMinutes(std::string_view hhmm) {
       return (hhmm[0] - '0') * 600 + (hhmm[1] - '0') * 60 + (hhmm[3] - '0') * 10 + (hhmm[4] - '0');
     }
 
-    int currentLocalMinutes() {
+    std::pair<int, int> currentLocalTime() {
       const auto now = std::chrono::system_clock::now();
       const std::time_t t = std::chrono::system_clock::to_time_t(now);
       std::tm local{};
       ::localtime_r(&t, &local);
-      return local.tm_hour * 60 + local.tm_min;
+      return {local.tm_hour * 60 + local.tm_min, local.tm_sec};
     }
 
-    int currentLocalSeconds() {
-      const auto now = std::chrono::system_clock::now();
-      const std::time_t t = std::chrono::system_clock::to_time_t(now);
-      std::tm local{};
-      ::localtime_r(&t, &local);
-      return local.tm_sec;
+    std::chrono::milliseconds sinceBoundaryMs(int nowMin, int nowSec, int lastBoundaryMin) {
+      int sinceMin = nowMin - lastBoundaryMin;
+      if (sinceMin < 0) {
+        sinceMin += 1440;
+      }
+      return std::chrono::milliseconds(sinceMin * 60 * 1000 + nowSec * 1000);
     }
 
     bool hasResolvedCoordinates(std::optional<double> latitude, std::optional<double> longitude) {
@@ -46,7 +50,7 @@ namespace day_night_schedule {
       ::localtime_r(&t, &local);
 
       constexpr double kPi = std::numbers::pi;
-      const double dayOfYear = static_cast<double>(local.tm_yday + 1);
+      const auto dayOfYear = static_cast<double>(local.tm_yday + 1);
       const double fractionalYear = 2.0 * kPi / 365.0 * (dayOfYear - 1.0);
 
       const double equationOfTime = 229.18
@@ -126,23 +130,18 @@ namespace day_night_schedule {
     return {};
   }
 
-  bool isManualMode(
-      const LocationConfig& config, std::optional<double> resolvedLatitude, std::optional<double> resolvedLongitude
-  ) {
-    // Fixed clock times apply only when no coordinates (resolved or manual) are available.
-    return !hasResolvedCoordinates(resolvedLatitude, resolvedLongitude)
-        && !(config.latitude.has_value() && config.longitude.has_value())
-        && normalizedClock(config.sunset).has_value()
-        && normalizedClock(config.sunrise).has_value();
+  bool hasUsableCustomTimes(const LocationConfig& config) {
+    return normalizedClock(config.sunset).has_value() && normalizedClock(config.sunrise).has_value();
   }
+
+  bool isManualMode(const LocationConfig& config) { return config.customSchedule && hasUsableCustomTimes(config); }
 
   Evaluation evaluate(
       const LocationConfig& config, std::optional<double> resolvedLatitude, std::optional<double> resolvedLongitude
   ) {
-    const int nowMin = currentLocalMinutes();
-    const int nowSec = currentLocalSeconds();
+    const auto [nowMin, nowSec] = currentLocalTime();
 
-    if (isManualMode(config, resolvedLatitude, resolvedLongitude)) {
+    if (isManualMode(config)) {
       const int sunsetMin = timeToMinutes(config.sunset);
       const int sunriseMin = timeToMinutes(config.sunrise);
       const bool night = sunsetMin < sunriseMin ? (nowMin >= sunsetMin && nowMin < sunriseMin)
@@ -153,19 +152,26 @@ namespace day_night_schedule {
         diffMin += 1440;
       }
       const auto ms = std::chrono::milliseconds(diffMin * 60 * 1000 - nowSec * 1000);
-      return Evaluation{.night = night, .untilBoundary = std::max(ms, std::chrono::milliseconds(1000))};
+      return Evaluation{
+          .night = night,
+          .untilBoundary = std::max(ms, std::chrono::milliseconds(1000)),
+          .sinceBoundary = sinceBoundaryMs(nowMin, nowSec, night ? sunsetMin : sunriseMin),
+      };
     }
 
     const auto coords = resolveCoordinates(config, resolvedLatitude, resolvedLongitude);
     if (!coords.latitude.has_value() || !coords.longitude.has_value()) {
+      // No coordinates available, retry in 1 hour in case location resolves later.
       return Evaluation{.night = false, .untilBoundary = std::chrono::hours(1)};
     }
 
     const auto times = computeSolarTimes(*coords.latitude, *coords.longitude);
     if (times.sunriseMinutes == 0 && times.sunsetMinutes == 0) {
+      // Polar night: the sun never rises, so there is no boundary today.
       return Evaluation{.night = true, .untilBoundary = std::chrono::hours(1)};
     }
     if (times.sunriseMinutes == 0 && times.sunsetMinutes == 1440) {
+      // Polar day: the sun never sets, so there is no boundary today.
       return Evaluation{.night = false, .untilBoundary = std::chrono::hours(1)};
     }
 
@@ -179,7 +185,11 @@ namespace day_night_schedule {
       diffMin += 1440;
     }
     const auto ms = std::chrono::milliseconds(diffMin * 60 * 1000 - nowSec * 1000);
-    return Evaluation{.night = night, .untilBoundary = std::max(ms, std::chrono::milliseconds(1000))};
+    return Evaluation{
+        .night = night,
+        .untilBoundary = std::max(ms, std::chrono::milliseconds(1000)),
+        .sinceBoundary = sinceBoundaryMs(nowMin, nowSec, night ? sunset : sunrise),
+    };
   }
 
 } // namespace day_night_schedule

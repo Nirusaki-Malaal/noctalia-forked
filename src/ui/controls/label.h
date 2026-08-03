@@ -6,6 +6,7 @@
 #include "ui/palette.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -13,9 +14,26 @@
 class Renderer;
 
 enum class LabelBaselineMode : std::uint8_t {
-  StableLogical,
+  // Normal text: cap band centered from the baseline, box from per-string metrics.
+  Text,
+  // Center the current glyph's ink.
   InkCentered,
+  // Cap-band centering like Text, but the box height comes from the primary
+  // font's line extent (measureFont) instead of the per-string metrics. Prevents
+  // fallback fonts for unusual Unicode characters from inflating the label height
+  // — useful in lists with unpredictable content.
+  TextFixedHeight,
+  // Centers a cap-height band anchored at the glyph's ink top instead of the
+  // baseline. For pictographic script/icon fonts (e.g. bongocat poses) the ink top
+  // is the fixed part of the art and lower ink moves per glyph: this keeps the art
+  // vertically put (no bob, unlike InkCentered) and centered (cap-band-from-baseline
+  // sits it too high). Degrades to cap-band centering for normal text.
+  Pictographic,
 };
+
+// Map a plugin-facing baseline token ("text", "textFixedHeight", "inkCentered",
+// "pictographic") to a mode. Returns nullopt for an unknown token.
+[[nodiscard]] std::optional<LabelBaselineMode> labelBaselineModeFromToken(std::string_view token);
 
 class Label : public InputArea {
 public:
@@ -34,8 +52,10 @@ public:
   void setTextAlign(TextAlign align);
   // Which end of an overflowing single line gets the ellipsis (Start keeps the tail, e.g. file paths).
   void setEllipsize(TextEllipsize ellipsize);
-  // StableLogical uses the resolved font line box; InkCentered centers the current glyph ink.
+  void setUseMarkup(bool markup);
+  // Text uses the resolved font line box; InkCentered centers the current glyph ink.
   void setBaselineMode(LabelBaselineMode mode);
+  void setShadow(const ColorSpec& color, float offsetX, float offsetY);
   void setShadow(const Color& color, float offsetX, float offsetY);
   void clearShadow();
   // Single-line horizontal marquee when the line is wider than the laid-out width.
@@ -79,11 +99,19 @@ private:
   void applyScrollPosition();
   void syncHoverInteraction();
 
+  // Guard token for deferred callbacks that run on the next main-loop tick.
+  // Callbacks capture a weak_ptr so they can detect destruction without
+  // relying on a raw this pointer staying valid.
+  std::shared_ptr<void> m_aliveGuard = std::make_shared<int>(0);
+
   TextNode* m_textNode = nullptr;
   float m_minWidth = 0.0f;
   float m_baselineOffset = 0.0f;
   ColorSpec m_color = colorSpecFromRole(ColorRole::OnSurface);
   Signal<>::ScopedConnection m_paletteConn;
+  std::optional<ColorSpec> m_shadowColor;
+  float m_shadowOffsetX = 0.0f;
+  float m_shadowOffsetY = 0.0f;
 
   // User-visible text (wire text may duplicate for seamless marquee).
   std::string m_plainText;
@@ -100,12 +128,16 @@ private:
   std::uint64_t m_cachedTextMetricsGeneration = 0;
   int m_cachedMaxLines = 0;
   TextAlign m_cachedTextAlign = TextAlign::Start;
-  LabelBaselineMode m_cachedBaselineMode = LabelBaselineMode::StableLogical;
+  LabelBaselineMode m_cachedBaselineMode = LabelBaselineMode::Text;
   FontWeight m_cachedFontWeight = FontWeight::Normal;
   bool m_cachedAutoScroll = false;
   bool m_cachedHasConstraintMaxWidth = false;
   bool m_measureCached = false;
-  LabelBaselineMode m_baselineMode = LabelBaselineMode::StableLogical;
+  LabelBaselineMode m_baselineMode = LabelBaselineMode::Text;
+
+  // Line count from the last measure pass; the arrange re-measure must agree
+  // (line breaking is decided once, on measure). -1 until first measure.
+  int m_measuredLineCount = -1;
 
   float m_userMaxWidth = 0.0f;
   int m_userMaxLines = 0;
@@ -115,6 +147,7 @@ private:
   float m_scrollOffset = 0.0f;
   float m_fullTextWidth = 0.0f;
   float m_marqueeLoopPeriod = 0.0f;
+  float m_marqueeRenderScale = 1.0f;
   float m_textBaseX = 0.0f;
   std::uint32_t m_marqueeAnimId = 0;
   std::uint32_t m_snapAnimId = 0;

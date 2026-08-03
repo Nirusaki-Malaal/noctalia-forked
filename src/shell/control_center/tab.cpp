@@ -6,12 +6,12 @@
 
 namespace control_center {
 
-  void applySectionCardStyle(Flex& card, float scale, float fillOpacity, bool showBorder) {
-    card.setCardStyle(scale, fillOpacity, showBorder);
+  void applySectionCardStyle(Flex& card, float scale, float fillOpacity) {
+    card.setCardStyle(scale, fillOpacity);
     card.setDirection(FlexDirection::Vertical);
     card.setAlign(FlexAlign::Stretch);
     card.setGap(Style::spaceSm * scale);
-    card.setPadding((Style::spaceSm + Style::spaceXs) * scale, Style::spaceMd * scale);
+    card.setPadding(Style::spaceMd * scale);
   }
 
   Label* addTitle(Flex& parent, const std::string& text, float scale) {
@@ -20,8 +20,8 @@ namespace control_center {
         .out = &ptr,
         .text = text,
         .fontSize = Style::fontSizeTitle * scale,
-        .color = colorSpecFromRole(ColorRole::OnSurface),
         .fontWeight = FontWeight::Bold,
+        .color = colorSpecFromRole(ColorRole::OnSurface),
     });
     parent.addChild(std::move(label));
     return ptr;
@@ -43,8 +43,8 @@ namespace control_center {
         ui::label({
             .text = title,
             .fontSize = Style::fontSizeBody * scale,
-            .color = colorSpecFromRole(ColorRole::OnSurface),
             .fontWeight = FontWeight::Bold,
+            .color = colorSpecFromRole(ColorRole::OnSurface),
             .flexGrow = 1.0f,
         })
     );

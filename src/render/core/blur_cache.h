@@ -1,7 +1,6 @@
 #pragma once
 
 #include "render/core/cached_layer.h"
-#include "render/core/texture_manager.h"
 
 #include <cstdint>
 
@@ -21,6 +20,7 @@ public:
 
   void invalidate() { m_layer.invalidate(); }
   void destroy();
+  void abandon() noexcept;
 
 private:
   CachedLayer m_layer;

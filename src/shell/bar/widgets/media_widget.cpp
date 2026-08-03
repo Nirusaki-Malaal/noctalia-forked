@@ -13,7 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <linux/input-event-codes.h>
+#include <wayland-client-protocol.h>
 
 using namespace mpris;
 
@@ -23,16 +23,15 @@ namespace {
 
 } // namespace
 
-MediaWidget::MediaWidget(
-    MprisService* mpris, HttpClient* httpClient, wl_output* /*output*/, float maxWidth, float minWidth, float artSize,
-    MediaTitleScrollMode titleScrollMode, bool hideWhenNoMedia, bool albumArtOnly
-)
-    : m_mpris(mpris), m_httpClient(httpClient), m_maxWidth(maxWidth), m_minWidth(minWidth), m_artSize(artSize),
-      m_titleScrollMode(titleScrollMode), m_hideWhenNoMedia(hideWhenNoMedia), m_albumArtOnly(albumArtOnly) {}
+MediaWidget::MediaWidget(MprisService* mpris, HttpClient* httpClient, wl_output* /*output*/, Options options)
+    : m_mpris(mpris), m_httpClient(httpClient), m_maxWidth(static_cast<float>(options.maxWidth)),
+      m_minWidth(static_cast<float>(options.minWidth)), m_artSize(static_cast<float>(options.artSize)),
+      m_titleScrollMode(options.titleScrollMode), m_hideWhenNoMedia(options.hideWhenNoMedia),
+      m_albumArtOnly(options.albumArtOnly), m_hideAlbumArt(options.hideAlbumArt), m_hideArtist(options.hideArtist),
+      m_artistFirst(options.artistFirst) {}
 
 void MediaWidget::create() {
-  auto area = std::make_unique<InputArea>();
-  area->setAcceptedButtons(InputArea::buttonMask({BTN_LEFT, BTN_RIGHT}));
+  auto area = ui::inputArea({});
   area->setOnEnter([this](const InputArea::PointerData&) {
     applyTitleScrollMode(m_label != nullptr && m_label->visible());
     this->requestUpdate();
@@ -40,15 +39,6 @@ void MediaWidget::create() {
   area->setOnLeave([this]() {
     applyTitleScrollMode(m_label != nullptr && m_label->visible());
     this->requestUpdate();
-  });
-  area->setOnClick([this](const InputArea::PointerData& data) {
-    if (data.button == BTN_LEFT) {
-      requestPanelToggle("control-center", "media");
-      return;
-    }
-    if (data.button == BTN_RIGHT && m_mpris != nullptr) {
-      m_mpris->playPauseActive();
-    }
   });
   m_area = area.get();
 
@@ -66,11 +56,11 @@ void MediaWidget::create() {
       ui::label({
           .out = &m_label,
           .fontSize = Style::fontSizeBody * m_contentScale,
+          .fontWeight = labelFontWeight(),
           .fontFamily = labelFontFamily(),
           .color = widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface)),
           .maxWidth = m_maxWidth * m_contentScale,
           .maxLines = 1,
-          .fontWeight = labelFontWeight(),
           .autoScroll = false,
       })
   );
@@ -109,7 +99,8 @@ void MediaWidget::doLayout(Renderer& renderer, float containerWidth, float conta
   m_emptyGlyph->setColor(colorSpecFromRole(ColorRole::OnSurfaceVariant));
   m_emptyGlyph->measure(renderer);
 
-  const bool showArtSlot = m_art->hasImage();
+  const bool hideAlbumArt = m_hideAlbumArt && !isVertical;
+  const bool showArtSlot = !hideAlbumArt && m_art->hasImage();
 
   // Clamp art to the label's single-line height so oversized art_size cannot
   // distort the bar capsule. The bar uses a uniform cross-axis extent derived
@@ -127,7 +118,7 @@ void MediaWidget::doLayout(Renderer& renderer, float containerWidth, float conta
     m_art->setRadius(0.0f);
   }
 
-  const bool showEmptyGlyph = !showArtSlot;
+  const bool showEmptyGlyph = !showArtSlot && !hideAlbumArt;
   m_label->setVisible(!artOnly && !m_label->text().empty());
   m_emptyGlyph->setVisible(showEmptyGlyph);
   const bool showLabel = m_label->visible();
@@ -147,26 +138,34 @@ void MediaWidget::doLayout(Renderer& renderer, float containerWidth, float conta
     contentHeight = std::max(contentHeight, m_emptyGlyph->height());
   }
   if (artOnly) {
-    if (!showArtSlot) {
+    if (showArtSlot) {
+      m_art->setPosition(0.0f, 0.0f);
+      rootNode->setSize(artSize, artSize);
+    } else if (showEmptyGlyph) {
       m_art->setPosition(0.0f, 0.0f);
       m_emptyGlyph->setPosition(0.0f, 0.0f);
       rootNode->setSize(m_emptyGlyph->width(), m_emptyGlyph->height());
     } else {
       m_art->setPosition(0.0f, 0.0f);
-      rootNode->setSize(artSize, artSize);
+      m_emptyGlyph->setPosition(0.0f, 0.0f);
+      rootNode->setSize(0.0f, 0.0f);
     }
   } else {
     if (showArtSlot) {
       m_art->setPosition(0.0f, std::round((contentHeight - artSize) * 0.5f));
       m_emptyGlyph->setPosition(0.0f, 0.0f);
       m_label->setPosition(artSize + spacing, std::round((contentHeight - m_label->height()) * 0.5f));
-    } else {
+    } else if (showEmptyGlyph) {
       m_art->setPosition(0.0f, 0.0f);
       m_emptyGlyph->setPosition(0.0f, std::round((contentHeight - m_emptyGlyph->height()) * 0.5f));
       m_label->setPosition(m_emptyGlyph->width() + spacing, std::round((contentHeight - m_label->height()) * 0.5f));
+    } else {
+      m_art->setPosition(0.0f, 0.0f);
+      m_emptyGlyph->setPosition(0.0f, 0.0f);
+      m_label->setPosition(0.0f, std::round((contentHeight - m_label->height()) * 0.5f));
     }
-    const float contentWidth =
-        showLabel ? m_label->x() + m_label->width() : (showArtSlot ? artSize : m_emptyGlyph->width());
+    const float contentWidth = showLabel ? m_label->x() + m_label->width()
+                                         : (showArtSlot ? artSize : (showEmptyGlyph ? m_emptyGlyph->width() : 0.0f));
     rootNode->setSize(std::clamp(contentWidth, minLength, maxLength), contentHeight);
   }
 }
@@ -204,6 +203,7 @@ void MediaWidget::syncState(Renderer& renderer) {
   const auto active = m_mpris != nullptr ? m_mpris->activePlayer() : std::nullopt;
   syncWidgetVisibility(active.has_value());
   if (m_hideWhenNoMedia && !active.has_value()) {
+    applyTitleScrollMode(false);
     return;
   }
 
@@ -213,7 +213,7 @@ void MediaWidget::syncState(Renderer& renderer) {
 
   if (active.has_value()) {
     playbackStatus = active->playbackStatus;
-    displayText = buildDisplayText(*active);
+    displayText = buildDisplayText(*active, m_hideArtist, m_artistFirst);
     artUrl = effectiveArtUrl(*active);
   }
 
@@ -249,23 +249,27 @@ void MediaWidget::syncState(Renderer& renderer) {
 
   const int artDecodePx = static_cast<int>(std::round(64.0f * m_contentScale));
   if (artChanged) {
-    const std::string artPath = resolveArtworkSource(
-        m_httpClient, m_pendingArtDownloads, m_lastArtUrl, [this] { requestUpdate(); }, m_aliveGuard
-    );
-    if (!artPath.empty()) {
-      if (!m_art->setSourceFile(renderer, artPath, artDecodePx, true, true)) {
-        kLog.warn(R"(artwork load failed url="{}" path="{}")", m_lastArtUrl, artPath);
-        m_art->clear(renderer);
-      } else {
-        kLog.debug(R"(artwork loaded url="{}" path="{}")", m_lastArtUrl, artPath);
-      }
-    } else {
-      if (!m_lastArtUrl.empty()) {
-        kLog.debug("artwork unresolved url=\"{}\"", m_lastArtUrl);
-      }
+    if (m_hideAlbumArt) {
       m_art->clear(renderer);
+    } else {
+      const std::string artPath = resolveArtworkSource(
+          m_httpClient, m_pendingArtDownloads, m_lastArtUrl, [this] { requestUpdate(); }, m_aliveGuard
+      );
+      if (!artPath.empty()) {
+        if (!m_art->setSourceFile(renderer, artPath, artDecodePx, true, true)) {
+          kLog.warn(R"(artwork load failed url="{}" path="{}")", m_lastArtUrl, artPath);
+          m_art->clear(renderer);
+        } else {
+          kLog.debug(R"(artwork loaded url="{}" path="{}")", m_lastArtUrl, artPath);
+        }
+      } else {
+        if (!m_lastArtUrl.empty()) {
+          kLog.debug("artwork unresolved url=\"{}\"", m_lastArtUrl);
+        }
+        m_art->clear(renderer);
+      }
     }
-  } else if (!m_lastArtUrl.empty() && !m_art->hasImage()) {
+  } else if (!m_lastArtUrl.empty() && !m_art->hasImage() && !m_hideAlbumArt) {
     const std::string artPath = cachedArtworkPath(m_lastArtUrl);
     if (!artPath.empty()) {
       if (m_art->setSourceFile(renderer, artPath, artDecodePx, false, true)) {
@@ -281,9 +285,12 @@ void MediaWidget::syncState(Renderer& renderer) {
   }
 }
 
-std::string MediaWidget::buildDisplayText(const MprisPlayerInfo& player) {
-  const std::string artists = joinArtists(player.artists);
+std::string MediaWidget::buildDisplayText(const MprisPlayerInfo& player, bool hideArtist, bool artistFirst) {
+  const std::string artists = hideArtist ? std::string() : joinArtists(player.artists);
   if (!player.title.empty() && !artists.empty()) {
+    if (artistFirst) {
+      return artists + " - " + player.title;
+    }
     return player.title + " - " + artists;
   }
   if (!player.title.empty()) {

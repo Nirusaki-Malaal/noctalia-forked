@@ -1,7 +1,5 @@
 #pragma once
 
-#include "render/core/color.h"
-#include "render/core/renderer.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
 #include "ui/controls/box.h"
@@ -47,12 +45,19 @@ namespace ui {
   // They are valid only while that subtree remains alive.
   struct NodeProps {
     Node** out = nullptr;
+    std::optional<float> x = std::nullopt;
+    std::optional<float> y = std::nullopt;
     std::optional<float> width = std::nullopt;
     std::optional<float> height = std::nullopt;
+    std::optional<float> frameWidth = std::nullopt;
+    std::optional<float> frameHeight = std::nullopt;
+    std::optional<std::int32_t> zIndex = std::nullopt;
     std::optional<float> flexGrow = std::nullopt;
     std::optional<float> opacity = std::nullopt;
     std::optional<bool> visible = std::nullopt;
     std::optional<bool> participatesInLayout = std::nullopt;
+    std::optional<bool> hitTestVisible = std::nullopt;
+    AnimationManager* animationManager = nullptr;
     std::optional<bool> clipChildren = std::nullopt;
     std::function<void(Node&)> configure = nullptr;
   };
@@ -65,19 +70,28 @@ namespace ui {
     std::optional<bool> enabled = std::nullopt;
     std::optional<InputArea::HitShape> hitShape = std::nullopt;
     std::optional<bool> focusable = std::nullopt;
+    std::optional<bool> tabStop = std::nullopt;
+    TextInputClient* textInputClient = nullptr;
     std::optional<std::string> tooltip = std::nullopt;
     std::optional<std::vector<TooltipRow>> tooltipRows = std::nullopt;
     std::function<TooltipContent()> tooltipProvider = nullptr;
     std::optional<std::chrono::milliseconds> tooltipRefreshInterval = std::nullopt;
     std::optional<TooltipPlacement> tooltipPlacement = std::nullopt;
     std::optional<TooltipAnchorInsets> tooltipAnchorInsets = std::nullopt;
+    std::optional<float> x = std::nullopt;
+    std::optional<float> y = std::nullopt;
     std::optional<float> width = std::nullopt;
     std::optional<float> height = std::nullopt;
+    std::optional<float> frameWidth = std::nullopt;
+    std::optional<float> frameHeight = std::nullopt;
+    std::optional<std::int32_t> zIndex = std::nullopt;
     std::optional<float> flexGrow = std::nullopt;
     std::optional<float> opacity = std::nullopt;
     std::optional<bool> visible = std::nullopt;
     std::optional<bool> participatesInLayout = std::nullopt;
     std::optional<bool> clipChildren = std::nullopt;
+    std::optional<bool> hitTestVisible = std::nullopt;
+    AnimationManager* animationManager = nullptr;
     std::function<void(const InputArea::PointerData&)> onEnter = nullptr;
     std::function<void()> onLeave = nullptr;
     std::function<void(const InputArea::PointerData&)> onMotion = nullptr;
@@ -96,6 +110,7 @@ namespace ui {
     Flex** out = nullptr;
     std::optional<FlexAlign> align = std::nullopt;
     std::optional<FlexJustify> justify = std::nullopt;
+    std::optional<bool> wrap = std::nullopt;
     std::optional<float> gap = std::nullopt;
     std::optional<float> padding = std::nullopt;  // uniform; overridden per-axis by paddingV/paddingH
     std::optional<float> paddingV = std::nullopt; // vertical (top+bottom)
@@ -159,6 +174,7 @@ namespace ui {
     std::optional<std::string> glyph = std::nullopt;
     std::optional<float> fontSize = std::nullopt;
     std::optional<float> glyphSize = std::nullopt;
+    std::optional<float> controlHeight = std::nullopt;
     std::optional<bool> enabled = std::nullopt;
     std::optional<bool> selected = std::nullopt;
     std::optional<ButtonContentAlign> contentAlign = std::nullopt;
@@ -201,20 +217,20 @@ namespace ui {
     Label** out = nullptr;
     std::optional<std::string> text = std::nullopt;
     std::optional<float> fontSize = std::nullopt;
+    std::optional<FontWeight> fontWeight = std::nullopt;
     std::optional<std::string> fontFamily = std::nullopt;
     std::optional<ColorSpec> color = std::nullopt;
+    std::optional<float> width = std::nullopt;
+    std::optional<float> height = std::nullopt;
     std::optional<float> minWidth = std::nullopt;
     std::optional<float> maxWidth = std::nullopt;
     std::optional<int> maxLines = std::nullopt;
-    std::optional<FontWeight> fontWeight = std::nullopt;
     std::optional<TextAlign> textAlign = std::nullopt;
     std::optional<TextEllipsize> ellipsize = std::nullopt;
     std::optional<LabelBaselineMode> baselineMode = std::nullopt;
     std::optional<bool> autoScroll = std::nullopt;
     std::optional<float> autoScrollSpeed = std::nullopt;
     std::optional<bool> autoScrollOnlyWhenHovered = std::nullopt;
-    std::optional<float> width = std::nullopt;
-    std::optional<float> height = std::nullopt;
     std::optional<float> flexGrow = std::nullopt;
     std::optional<float> opacity = std::nullopt;
     std::optional<bool> visible = std::nullopt;
@@ -225,11 +241,12 @@ namespace ui {
   struct BoxProps {
     Box** out = nullptr;
     std::optional<ColorSpec> fill = std::nullopt;
+    std::optional<ColorSpec> border = std::nullopt;
+    std::optional<float> borderWidth = std::nullopt;
     std::optional<float> radius = std::nullopt;
     std::optional<float> softness = std::nullopt;
     std::optional<float> cardStyleScale = std::nullopt;
     std::optional<float> cardStyleFillOpacity = std::nullopt;
-    std::optional<bool> cardStyleShowBorder = std::nullopt;
     std::optional<float> width = std::nullopt;
     std::optional<float> height = std::nullopt;
     std::optional<float> flexGrow = std::nullopt;
@@ -355,9 +372,9 @@ namespace ui {
   };
 
   struct SegmentedOption {
-    std::string label = {};
-    std::string glyph = {};
-    std::string tooltip = {};
+    std::string label;
+    std::string glyph;
+    std::string tooltip;
   };
 
   struct SegmentedProps {
@@ -369,6 +386,7 @@ namespace ui {
     std::optional<bool> compact = std::nullopt;
     std::optional<bool> enabled = std::nullopt;
     std::optional<float> surfaceOpacity = std::nullopt;
+    std::optional<ColorRole> surfaceRole = std::nullopt;
     std::optional<bool> equalSegmentWidths = std::nullopt;
     std::optional<float> width = std::nullopt;
     std::optional<float> height = std::nullopt;
@@ -383,6 +401,7 @@ namespace ui {
   struct ScrollViewProps {
     ScrollView** out = nullptr;
     ScrollViewState* state = nullptr;
+    std::optional<ScrollOrientation> orientation = std::nullopt;
     std::optional<bool> scrollbarVisible = std::nullopt;
     std::optional<float> viewportPaddingH = std::nullopt;
     std::optional<float> viewportPaddingV = std::nullopt;

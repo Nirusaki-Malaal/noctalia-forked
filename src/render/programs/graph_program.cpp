@@ -1,5 +1,8 @@
 #include "render/programs/graph_program.h"
 
+#include "render/core/render_styles.h"
+#include "render/core/texture_handle.h"
+
 #include <array>
 #include <stdexcept>
 
@@ -260,6 +263,8 @@ void GraphProgram::destroy() {
   m_aaSizeLoc = -1;
   m_dataSourceLoc = -1;
 }
+
+void GraphProgram::abandon() noexcept { m_program.abandon(); }
 
 void GraphProgram::draw(
     TextureId dataTexture, int texWidth, float surfaceWidth, float surfaceHeight, float width, float height,

@@ -3,20 +3,22 @@
 #include "core/log.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <numeric>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace {
 
   constexpr Logger kLog("ipc");
-  constexpr int kMaxLineBytes = 512;
+  constexpr std::size_t kMaxCommandBytes = 64 * 1024;
   constexpr int kRecvTimeoutMs = 100;
   constexpr char kCallerCwdSeparator = '\x1e';
 
@@ -41,6 +43,13 @@ namespace {
   }
 
 } // namespace
+
+IpcService::InvocationScope::InvocationScope(const IpcService& ipc, std::optional<IpcInvocationContext> context)
+    : m_ipc(ipc), m_previous(std::move(ipc.m_invocationContext)) {
+  m_ipc.m_invocationContext = std::move(context);
+}
+
+IpcService::InvocationScope::~InvocationScope() { m_ipc.m_invocationContext = std::move(m_previous); }
 
 IpcService::~IpcService() {
   if (m_listenFd >= 0) {
@@ -95,12 +104,59 @@ bool IpcService::start() {
 }
 
 void IpcService::registerHandler(
-    const std::string& command, Handler handler, std::string usage, std::string description,
-    HandlerVisibility visibility
+    const std::string& command, Handler handler, std::string argsSpec, std::string description, HandlerOptions options
 ) {
   // Remove existing entry for this command if re-registering
   std::erase_if(m_handlers, [&command](const auto& e) { return e.first == command; });
-  m_handlers.push_back({command, {std::move(handler), std::move(usage), std::move(description), visibility}});
+  m_handlers.push_back({
+      command,
+      {
+          std::move(handler),
+          std::move(argsSpec),
+          std::move(description),
+          options.helpVisibility,
+          options.actionEditorVisibility,
+          false,
+      },
+  });
+}
+
+void IpcService::registerCycleHandler(
+    const std::string& command, Handler handler, std::string argsSpec, std::string description, HandlerOptions options
+) {
+  registerHandler(command, std::move(handler), std::move(argsSpec), std::move(description), options);
+  const auto it = std::ranges::find_if(m_handlers, [&command](const auto& e) { return e.first == command; });
+  if (it != m_handlers.end()) {
+    it->second.cycles = true;
+  }
+}
+
+bool IpcService::handlerCycles(std::string_view command) const noexcept {
+  const auto it = std::ranges::find_if(m_handlers, [command](const auto& e) { return e.first == command; });
+  return it != m_handlers.end() && it->second.cycles;
+}
+
+std::vector<IpcService::HandlerInfo> IpcService::handlers() const {
+  std::vector<HandlerInfo> infos;
+  infos.reserve(m_handlers.size());
+  for (const auto& [command, entry] : m_handlers) {
+    infos.push_back(
+        HandlerInfo{
+            .command = command,
+            .args = entry.argsSpec,
+            .description = entry.description,
+            .helpVisibility = entry.helpVisibility,
+            .actionEditorVisibility = entry.actionEditorVisibility,
+            .cycles = entry.cycles,
+        }
+    );
+  }
+  std::ranges::sort(infos, {}, &HandlerInfo::command);
+  return infos;
+}
+
+bool IpcService::hasHandler(std::string_view command) const noexcept {
+  return std::ranges::any_of(m_handlers, [command](const auto& entry) { return entry.first == command; });
 }
 
 void IpcService::dispatch() {
@@ -147,32 +203,65 @@ void IpcService::handleConnection(int connFd) {
   tv.tv_usec = kRecvTimeoutMs * 1000;
   ::setsockopt(connFd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-  // Read up to kMaxLineBytes or until '\n'
-  char buf[kMaxLineBytes];
-  int total = 0;
-  while (total < kMaxLineBytes - 1) {
-    const auto n = ::read(connFd, buf + total, 1);
-    if (n <= 0) {
+  // Read until the client closes its write side. Newlines are valid command
+  // payload, so they cannot be used as the frame delimiter.
+  std::string command;
+  char buf[4096];
+  bool reachedEof = false;
+  while (command.size() < kMaxCommandBytes) {
+    const std::size_t limit = std::min(sizeof(buf), kMaxCommandBytes - command.size());
+    const auto n = ::read(connFd, buf, limit);
+    if (n > 0) {
+      command.append(buf, static_cast<std::size_t>(n));
+      continue;
+    }
+    if (n == 0) {
+      reachedEof = true;
       break;
     }
-    if (buf[total] == '\n') {
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
       break;
     }
-    ++total;
-  }
-  buf[total] = '\0';
-
-  // Trim trailing '\r' for clients that send CRLF
-  if (total > 0 && buf[total - 1] == '\r') {
-    buf[--total] = '\0';
+    kLog.warn("IPC read failed: {}", std::strerror(errno));
+    break;
   }
 
-  if (total == 0) {
+  if (command.size() >= kMaxCommandBytes && !reachedEof) {
+    const std::string response = "error: IPC command too large\n";
+    std::size_t sent = 0;
+    while (sent < response.size()) {
+      const auto n = ::send(connFd, response.data() + sent, response.size() - sent, MSG_NOSIGNAL);
+      if (n <= 0) {
+        break;
+      }
+      sent += static_cast<std::size_t>(n);
+    }
+    return;
+  }
+
+  // Legacy external clients may still send one newline-terminated command and
+  // keep the socket open while waiting for the response.
+  if (!reachedEof) {
+    if (const auto newline = command.find('\n'); newline != std::string::npos) {
+      command.resize(newline);
+    }
+    if (!command.empty() && command.back() == '\r') {
+      command.pop_back();
+    }
+  }
+
+  if (command.empty()) {
     // Client closed the connection without sending anything (e.g. a liveness probe).
     return;
   }
 
-  const std::string response = execute(std::string(buf, static_cast<std::size_t>(total)));
+  // A socket command has no in-process origin, even when the dispatch re-enters from a handler
+  // that pumped the event loop.
+  const InvocationScope socketScope(*this, std::nullopt);
+  const std::string response = execute(command);
   std::size_t sent = 0;
   while (sent < response.size()) {
     const auto n = ::send(connFd, response.data() + sent, response.size() - sent, MSG_NOSIGNAL);
@@ -183,35 +272,34 @@ void IpcService::handleConnection(int connFd) {
   }
 }
 
-std::string IpcService::buildHelp() const {
-  std::vector<std::size_t> order(m_handlers.size());
-  std::ranges::iota(order, 0);
-  std::ranges::sort(order, [this](std::size_t lhs, std::size_t rhs) {
-    return m_handlers[lhs].first < m_handlers[rhs].first;
-  });
+std::string IpcService::HandlerInfo::signature() const {
+  std::string out(command);
+  if (!args.empty()) {
+    out += ' ';
+    out += args;
+  }
+  return out;
+}
 
-  // Find the longest usage string for alignment
-  std::size_t maxUsage = 0;
-  for (const auto& [cmd, entry] : m_handlers) {
-    if (entry.visibility == HandlerVisibility::Hidden) {
-      continue;
-    }
-    const auto& u = entry.usage.empty() ? cmd : entry.usage;
-    maxUsage = std::max(maxUsage, u.size());
+std::string IpcService::buildHelp() const {
+  auto infos = handlers();
+  std::erase_if(infos, [](const HandlerInfo& info) { return info.helpVisibility == HelpVisibility::Hidden; });
+
+  std::vector<std::string> signatures;
+  signatures.reserve(infos.size());
+  std::size_t maxSignature = 0;
+  for (const auto& info : infos) {
+    signatures.push_back(info.signature());
+    maxSignature = std::max(maxSignature, signatures.back().size());
   }
 
   std::string out = "Usage: noctalia msg <command> [args]\n\nCommands:\n";
-  for (const auto index : order) {
-    const auto& [cmd, entry] = m_handlers[index];
-    if (entry.visibility == HandlerVisibility::Hidden) {
-      continue;
-    }
-    const auto& u = entry.usage.empty() ? cmd : entry.usage;
+  for (std::size_t i = 0; i < infos.size(); ++i) {
     out += "  ";
-    out += u;
-    if (!entry.description.empty()) {
-      out += std::string(maxUsage - u.size() + 2, ' ');
-      out += entry.description;
+    out += signatures[i];
+    if (!infos[i].description.empty()) {
+      out += std::string(maxSignature - signatures[i].size() + 2, ' ');
+      out += infos[i].description;
     }
     out += '\n';
   }

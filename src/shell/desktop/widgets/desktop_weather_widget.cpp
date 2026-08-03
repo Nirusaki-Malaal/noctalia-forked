@@ -68,14 +68,12 @@ namespace {
 
 } // namespace
 
-DesktopWeatherWidget::DesktopWeatherWidget(
-    const WeatherService* weather, ColorSpec color, bool shadow, bool showForecast, int forecastDays
-)
-    : m_weather(weather), m_color(color), m_shadow(shadow), m_showForecast(showForecast),
-      m_forecastDays(std::clamp(forecastDays, 1, static_cast<int>(kMaxForecastRows))) {}
+DesktopWeatherWidget::DesktopWeatherWidget(const WeatherService* weather, Options options)
+    : m_weather(weather), m_color(options.color), m_shadow(options.shadow), m_showForecast(options.showForecast),
+      m_forecastDays(std::clamp(options.forecastDays, 1, static_cast<int>(kMaxForecastRows))) {}
 
 void DesktopWeatherWidget::create() {
-  auto rootNode = std::make_unique<Node>();
+  auto rootNode = ui::node({});
   rootNode->setClipChildren(true);
 
   auto glyph = ui::glyph({
@@ -89,9 +87,9 @@ void DesktopWeatherWidget::create() {
   auto temperature = ui::label({
       .out = &m_temperature,
       .fontSize = temperatureFontSize(contentScale()),
+      .fontWeight = FontWeight::Bold,
       .color = m_color,
       .maxLines = 1,
-      .fontWeight = FontWeight::Bold,
       .textAlign = TextAlign::Start,
   });
   rootNode->addChild(std::move(temperature));
@@ -322,13 +320,14 @@ void DesktopWeatherWidget::doUpdate(Renderer& renderer) {
 }
 
 void DesktopWeatherWidget::applyShadow() {
-  const auto applyToLabel = [this](Label* label) {
+  const ColorSpec shadow = colorSpecFromRole(ColorRole::Shadow, kShadowAlpha);
+  const auto applyToLabel = [this, shadow](Label* label) {
     if (label == nullptr) {
       return;
     }
     if (m_shadow) {
       const float offset = kShadowOffset * contentScale();
-      label->setShadow(Color(0.0f, 0.0f, 0.0f, kShadowAlpha), offset, offset);
+      label->setShadow(shadow, offset, offset);
     } else {
       label->clearShadow();
     }
@@ -339,7 +338,6 @@ void DesktopWeatherWidget::applyShadow() {
   }
   if (m_shadow) {
     const float offset = kShadowOffset * contentScale();
-    const Color shadow(0.0f, 0.0f, 0.0f, kShadowAlpha);
     m_glyph->setShadow(shadow, offset, offset);
     m_temperature->setShadow(shadow, offset, offset);
     m_condition->setShadow(shadow, offset, offset);
@@ -355,7 +353,7 @@ void DesktopWeatherWidget::applyShadow() {
     if (row.glyph != nullptr) {
       if (m_shadow) {
         const float offset = kShadowOffset * contentScale();
-        row.glyph->setShadow(Color(0.0f, 0.0f, 0.0f, kShadowAlpha), offset, offset);
+        row.glyph->setShadow(shadow, offset, offset);
       } else {
         row.glyph->clearShadow();
       }

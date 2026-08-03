@@ -5,11 +5,10 @@
 #include "util/string_utils.h"
 
 #include <algorithm>
-#include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
 #include <format>
-#include <json.hpp>
+#include <nlohmann/json.hpp>
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -24,8 +23,8 @@ namespace {
   constexpr std::uint32_t kIpcGetWorkspaces = 1;
   constexpr std::uint32_t kIpcSubscribe = 2;
   constexpr std::uint32_t kIpcGetTree = 4;
-  constexpr std::uint32_t kIpcWorkspaceEvent = 0x80000000u;
-  constexpr std::uint32_t kIpcWindowEvent = 0x80000003u;
+  constexpr std::uint32_t kIpcWorkspaceEvent = 0x80000000U;
+  constexpr std::uint32_t kIpcWindowEvent = 0x80000003U;
 
   std::string jsonStringValue(const nlohmann::json& object, std::string_view key) {
     const auto it = object.find(key);
@@ -186,7 +185,7 @@ namespace {
       y = rectIt->value("y", 0);
     }
 
-    if (isLeaf && !workspaceName.empty() && !workspaceKey.empty() && !appId.empty()) {
+    if (isLeaf && !workspaceName.empty() && !workspaceKey.empty() && (!appId.empty() || !windowId.empty())) {
       windows.push_back(
           WorkspaceWindow{
               .windowId = windowId,
@@ -195,6 +194,7 @@ namespace {
               .title = StringUtils::windowTitleSingleLine(jsonStringValue(node, "name")),
               .x = x,
               .y = y,
+              .outputName = {},
           }
       );
     }
@@ -474,7 +474,7 @@ void SwayWorkspaceBackend::sendMessage(std::uint32_t type, const std::string& pa
     return;
   }
 
-  const std::uint32_t payloadLength = static_cast<std::uint32_t>(payload.size());
+  const auto payloadLength = static_cast<std::uint32_t>(payload.size());
   std::vector<char> message;
   message.reserve(kIpcMagic.size() + sizeof(payloadLength) + sizeof(type) + payload.size());
   message.insert(message.end(), kIpcMagic.begin(), kIpcMagic.end());

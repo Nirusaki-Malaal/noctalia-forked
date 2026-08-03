@@ -1,9 +1,8 @@
 #pragma once
 
 #include "render/core/async_texture_cache.h"
-#include "render/core/texture_manager.h"
+#include "render/core/render_styles.h"
 #include "render/scene/node.h"
-#include "ui/app_icon_colorization.h"
 #include "ui/palette.h"
 #include "ui/signal.h"
 
@@ -15,6 +14,7 @@
 
 class ImageNode;
 class Renderer;
+enum class PixmapFormat;
 
 enum class ImageFit : std::uint8_t {
   Contain,
@@ -30,6 +30,9 @@ public:
   ~Image() override;
 
   void setRadius(float radius);
+  // Darkens the image's texels with a linear gradient inside the image draw, so a scrimmed image
+  // keeps a single antialiased edge instead of needing a rounded rect stacked on top.
+  void setScrim(const ImageScrim& scrim);
   void setBorder(const ColorSpec& color, float width);
   void setBorder(const Color& color, float width);
   void setTint(const Color& tint);

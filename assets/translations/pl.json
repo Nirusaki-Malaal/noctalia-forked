@@ -1,14 +1,26 @@
 {
   "auth": {
+    "fingerprint": {
+      "disconnected": "Czytnik linii papilarnych został odłączony",
+      "error": "Błąd uwierzytelniania odciskiem palca",
+      "no-match": "Niepasujący odcisk palca",
+      "not-centered": "Umieść palec na środku i spróbuj ponownie",
+      "present": "Odczytywanie odcisku palca…",
+      "ready": "Przyłóż palec do czytnika",
+      "remove-and-retry": "Odsuń palec i spróbuj ponownie.",
+      "retry": "Proszę zeskanować odcisk palca ponownie",
+      "swipe-too-short": "Przyłożenie palca zbyt krótkie ",
+      "too-many-attempts": "Czytnik linii papilarnych wyłączony (zbyt wiele prób)"
+    },
     "pam": {
       "authentication-failed": "Uwierzytelnianie nie powiodło się",
       "start-failed": "Nie udało się uruchomić PAM",
-      "user-unavailable": "Nie można ustalić bieżącego użytkownika"
+      "user-unavailable": "Nie można ustalić aktualnego użytkownika"
     },
     "polkit": {
-      "authenticate": "Uwierzytelniaj",
+      "authenticate": "Uwierzytelnij",
       "authenticating": "Uwierzytelnianie...",
-      "default-message": "wymagane uwierzytelnianie",
+      "default-message": "Wymagane uwierzytelnianie",
       "invalid-password": "Nieprawidłowe hasło",
       "password-placeholder": "Hasło",
       "title": "Wymagane uwierzytelnianie"
@@ -17,10 +29,21 @@
   "bar": {
     "screenshot": {
       "choose-display": "Wybierz ekran",
+      "confirm-region": "Enter lub Spacja aby wykonać zrzut · Esc aby anulować · Przeciągnij, aby wybrać ponownie",
       "fullscreen": "Pełny ekran",
       "region": "Wybierz obszar"
     },
     "widgets": {
+      "active-window": {
+        "no-active-window": "Brak aktywnego okna"
+      },
+      "bluetooth": {
+        "connected": "Połączono"
+      },
+      "brightness": {
+        "brightness": "Jasność",
+        "display": "Ekran"
+      },
       "lock-keys": {
         "caps": "Caps",
         "caps-short": "C",
@@ -30,10 +53,18 @@
         "scroll-short": "S"
       },
       "media": {
-        "nothing-playing": "Nic nie odtwarza",
+        "nothing-playing": "Nic nie jest odtwarzane",
         "playing": "Odtwarzanie"
       },
       "network": {
+        "active": "Aktywna",
+        "connected": "Połączono",
+        "connecting": "Łączenie",
+        "download": "Pobieranie",
+        "interface": "Interfejs",
+        "ip": "IP",
+        "network": "Sieć",
+        "networks": "Sieci",
         "wired": "Przewodowa"
       },
       "scripted": {
@@ -98,7 +129,6 @@
   "control-center": {
     "audio": {
       "application-volumes": "Głośność aplikacji",
-      "input-volume": "Głośność wejścia",
       "no-application-audio": "Brak dźwięku aplikacji",
       "no-application-audio-body": "Brak dostępnych strumieni odtwarzania aplikacji.",
       "no-input-devices": "Brak urządzeń wejściowych",
@@ -107,7 +137,6 @@
       "no-output-devices": "Brak urządzeń wyjściowych",
       "no-output-devices-body": "Brak dostępnych wyjść do odtwarzania.",
       "no-output-selected": "Nie wybrano urządzenia wyjściowego",
-      "output-volume": "Głośność wyjścia",
       "unavailable-body": "PipeWire nie jest aktywny.",
       "unavailable-title": "Audio niedostępne"
     },
@@ -165,7 +194,6 @@
       "unknown": "nieznane",
       "uptime": "Czas działania - {uptime}",
       "weather": {
-        "configure-location": "Dodaj [weather].address lub włącz auto_locate.",
         "data-unavailable": "Dane pogodowe niedostępne.",
         "disabled": "Pogoda jest wyłączona w konfiguracji.",
         "fetching": "Pobieranie prognozy…"
@@ -266,9 +294,9 @@
       "audio": "Dźwięk",
       "bluetooth": "Bluetooth",
       "calendar": "Kalendarz",
-      "display": "Monitor",
       "home": "Strona główna",
       "media": "Multimedia",
+      "monitor": "Monitor",
       "network": "Sieć",
       "notifications": "Powiadomienia",
       "screen-time": "Czas na ekranie",
@@ -276,7 +304,6 @@
       "weather": "Pogoda"
     },
     "weather": {
-      "configure-location": "Ustaw [weather].address lub włącz auto_locate",
       "data-unavailable": "Dane pogodowe niedostępne",
       "details": {
         "elevation": "Wysokość",
@@ -374,10 +401,6 @@
         "visualization-mode-wave-rings": "Fala + pierścienie",
         "wave-thickness": "Grubość fali",
         "widget-section": "Widget"
-      },
-      "state": {
-        "grid-off": "Siatka wyłączona",
-        "grid-on": "Siatka włączona"
       },
       "title": "Widgety pulpitu",
       "types": {
@@ -817,7 +840,7 @@
         "name-label": "Nazwa",
         "name-placeholder": "idle-behavior",
         "resume-command-label": "Polecenie wznowienia",
-        "resume-command-placeholder": "noctalia:dpms-on",
+        "resume-command-placeholder": "",
         "summary": "{name} · {seconds}s",
         "summary-disabled-timeout": "{name} · timeout wyłączony",
         "timeout-label": "Timeout w sekundach",
@@ -874,7 +897,6 @@
         "overview": "przegląd",
         "pinned-apps": "przypięte aplikacje",
         "power": "zasilanie",
-        "privacy-security": "prywatność i bezpieczeństwo",
         "profile": "profil",
         "screen-corners": "narożniki ekranu",
         "screen-time": "czas ekranu",
@@ -982,7 +1004,6 @@
       "shell": {
         "panel-placement": {
           "attached": "Przyłączone",
-          "centered": "Wyśrodkowane",
           "floating": "Pływające"
         },
         "panel-transparency": {
@@ -1056,7 +1077,6 @@
         "empty": "Nie znaleziono wtyczek. Dodaj źródło, albo sprawdź swoją sieć.",
         "loading": "Ładowanie wtyczek...",
         "refreshing": "Odświeżanie wtyczek...",
-        "requires-newer-noctalia": "wymaga nowszej Noctalii",
         "title": "Wtyczki"
       },
       "settings": {
@@ -1083,8 +1103,7 @@
         "name-placeholder": "moje-wtyczki",
         "remove": "Usuń źródło",
         "title": "Źródła",
-        "update": "Aktualizacja",
-        "update-on-startup": "Zaaktualizuj przy uruchomieniu"
+        "update": "Aktualizacja źródła"
       }
     },
     "schema": {
@@ -1950,10 +1969,6 @@
           "description": "Uruchamia aplikacje w oddzielnych usługach systemd, aby nie udostępniały cgroup Noctalia",
           "label": "Uruchamiaj aplikacje jako usługi systemd"
         },
-        "middle-click-opens-widget-settings": {
-          "description": "Otwórz ustawienia widżetu paska ze środkowym klikiem",
-          "label": "Środkowy klik otwiera ustawienia widżetu"
-        },
         "niri-overview-type-to-launch": {
           "description": "Otwórz launcher podczas pisania w przeglądzie niri; używa małą powierzchnię fokusu klawiatury podczas otwartego przeglądu",
           "label": "Pisanie aby uruchomić"
@@ -2241,7 +2256,6 @@
         "always": "Zawsze",
         "cpu-temp": "Temperatura CPU",
         "cpu-usage": "Użycie CPU",
-        "disk-percent": "Procent dysku",
         "full": "Pełny",
         "gauge": "Gauge",
         "glyph": "Symbol",
@@ -2263,8 +2277,6 @@
         "output": "Wyjście",
         "ram-percent": "Procent RAM",
         "ram-used": "Użyty RAM",
-        "screenshot-primary-fullscreen": "Pełny ekran",
-        "screenshot-primary-region": "Obszar",
         "shared": "Wspólny",
         "short": "Krótki",
         "swap-percent": "Procent zamiany",
@@ -2329,10 +2341,6 @@
           "description": "Rola koloru pierwszego planu widżetu; obsługiwane są również stałe kolory szesnastkowe",
           "label": "Kolor"
         },
-        "command": {
-          "description": "Polecenie powłoki uruchomiane po lewym kliknięciu tego przycisku",
-          "label": "Polecenie lewego kliknięcia"
-        },
         "custom-image": {
           "description": "Ścieżka do niestandardowego obrazu. Pozostaw puste, aby użyć glify ikony",
           "dialog-title": "Wybierz obraz niestandardowy",
@@ -2345,10 +2353,6 @@
         "custom-labels": {
           "description": "Mapuj nazwy układu klawiatury na etykiety niestandardowe",
           "label": "Etykiety niestandardowe"
-        },
-        "cycle-command": {
-          "description": "Polecenie uruchomiane przy zmianie układu klawiatury",
-          "label": "Polecenie zmiany"
         },
         "detached-panel": {
           "description": "Otwórz szufladę jako pływający panel z własnym tłem zamiast łączenia się z paskiem",
@@ -2494,18 +2498,13 @@
           "description": "Maksymalna długość widżetu w pikselach",
           "label": "Maksymalna długość"
         },
-        "middle-command": {
-          "description": "Polecenie powłoki wykonywane po kliknięciu środkowym przycisku. Po ustawieniu, środkowe kliknięcie otwiera to polecenie zamiast ustawień widżetu",
-          "label": "Polecenie środkowego klisku"
-        },
         "min-length": {
           "description": "Minimalna długość widżetu w pikselach",
           "label": "Minimalna długość"
         },
         "minimal": {
           "description": "Pokaż tylko etykiety identyfikacyjne lub nazwy obszarów roboczych, bez animowanych pilli",
-          "label": "Minimalny styl",
-          "workspaces-description": "Etykiety tylko tekstowe obszarów roboczych bez tła pilek ani animacji przesuwania"
+          "label": "Minimalny styl"
         },
         "mirrored": {
           "description": "Odbij wizualizer wokół jego środka",
@@ -2532,14 +2531,6 @@
           "description": "Identyfikatory elementów Tray, które pozostają widoczne w pasku, gdy włączony jest tryb szuflady",
           "label": "Przypięte elementy"
         },
-        "primary-click": {
-          "description": "Akcja wykonywana po kliknięciu lewym przyciskiem na przycisk paska",
-          "label": "Lewy klik"
-        },
-        "right-command": {
-          "description": "Polecenie powłoki wykonywane po kliknięciu prawym przyciskiem tego przycisku",
-          "label": "Polecenie prawego klisku"
-        },
         "scale": {
           "description": "Skaluj ten widżet względem skali zawartości paska",
           "label": "Skala"
@@ -2551,18 +2542,6 @@
         "script": {
           "description": "Ścieżka do skryptu lua",
           "label": "Skrypt"
-        },
-        "scroll-down-command": {
-          "description": "Polecenie powłoki wykonane podczas przewijania w dół nad tym przyciskiem",
-          "label": "Polecenie przewijania w dół"
-        },
-        "scroll-step": {
-          "description": "Zmiana procentowa zastosowana na każdy krok kółka myszy",
-          "label": "Krok przewijania"
-        },
-        "scroll-up-command": {
-          "description": "Polecenie powłoki wykonane podczas przewijania w górę nad tym przyciskiem",
-          "label": "Polecenie przewijania w górę"
         },
         "show-active-indicator": {
           "description": "Pokaż małą kropkę poniżej ikony aktywnego okna na pasku zadań",
@@ -2695,7 +2674,6 @@
     "window": {
       "export-config": "Eksportuj konfigurację…",
       "export-config-saved": "Konfiguracja wyeksportowana.",
-      "filter-modified": "Zmodyfikowane",
       "native-title": "Ustawienia Noctalia",
       "no-results": "Nie znaleziono ustawień",
       "no-results-hint": "Spróbuj innej nazwy ustawienia lub klucza konfiguracji.",
@@ -2744,10 +2722,7 @@
   },
   "time": {
     "duration": {
-      "days-hours-minutes": "{days}d {hours}h {minutes}m",
-      "hours-minutes": "{hours}h {minutes}m",
-      "less-than-minute": "<1m",
-      "minutes": "{minutes}m"
+      "less-than-minute": "<1m"
     },
     "file": {
       "unknown": "Nieznane"

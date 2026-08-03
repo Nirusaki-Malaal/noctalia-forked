@@ -1,9 +1,8 @@
 #include "shell/desktop/widgets/desktop_button_widget.h"
 
 #include "core/log.h"
-#include "core/process.h"
+#include "core/process/process.h"
 #include "core/ui_phase.h"
-#include "render/core/renderer.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
 #include "ui/builders.h"
@@ -12,6 +11,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <utility>
 
 namespace {
 
@@ -21,16 +21,13 @@ namespace {
 
 } // namespace
 
-DesktopButtonWidget::DesktopButtonWidget(
-    std::string glyph, std::string label, std::string command, ButtonVariant variant, bool showBackground,
-    std::optional<ColorSpec> labelColor, ColorSpec hoverBackground
-)
-    : m_glyph(std::move(glyph)), m_label(std::move(label)), m_command(std::move(command)), m_variant(variant),
-      m_labelColor(std::move(labelColor)), m_hoverBackground(std::move(hoverBackground)),
-      m_showBackground(showBackground) {}
+DesktopButtonWidget::DesktopButtonWidget(Options options)
+    : m_glyph(std::move(options.glyph)), m_label(std::move(options.label)), m_command(std::move(options.command)),
+      m_variant(options.variant), m_labelColor(options.labelColor), m_hoverBackground(options.hoverBackground),
+      m_showBackground(options.showBackground) {}
 
 void DesktopButtonWidget::create() {
-  auto rootNode = std::make_unique<Node>();
+  auto rootNode = ui::node({});
 
   auto button = ui::button({
       .out = &m_button,

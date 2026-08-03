@@ -17,6 +17,7 @@ namespace desktop_settings {
     using settings::WidgetSettingSelectOption;
     using settings::WidgetSettingSpec;
     using settings::WidgetSettingVisibility;
+    using settings::WidgetSettingVisibilityCondition;
 
     const std::vector<DesktopWidgetTypeSpec> kDesktopWidgetTypeSpecs = {
         {.type = "audio_visualizer", .labelKey = "desktop-widgets.editor.types.audio-visualizer"},
@@ -27,6 +28,7 @@ namespace desktop_settings {
         {.type = "media_player", .labelKey = "desktop-widgets.editor.types.media-player"},
         {.type = "sticker", .labelKey = "desktop-widgets.editor.types.sticker"},
         {.type = "sysmon", .labelKey = "desktop-widgets.editor.types.system-monitor"},
+        {.type = "volume", .labelKey = "desktop-widgets.editor.types.volume"},
         {.type = "weather", .labelKey = "desktop-widgets.editor.types.weather"},
     };
 
@@ -111,12 +113,14 @@ namespace desktop_settings {
     }
 
     // Resolve "author/plugin:entry" to its [[desktop_widget]] entry, or nullopt.
-    std::optional<scripting::ResolvedPluginEntry> resolvePluginDesktopWidget(std::string_view type) {
+    std::optional<scripting::ResolvedPluginEntry>
+    resolvePluginDesktopWidget(std::string_view type, scripting::PluginRegistry* pluginRegistry = nullptr) {
       if (!type.contains('/')) {
         return std::nullopt;
       }
-      scripting::PluginRegistry::instance().ensureScanned();
-      auto entry = scripting::PluginRegistry::instance().resolve(type);
+      auto& registry = pluginRegistry != nullptr ? *pluginRegistry : scripting::PluginRegistry::instance();
+      registry.ensureScanned();
+      auto entry = registry.resolve(type);
       if (entry.has_value() && entry->entry->kind == scripting::PluginEntryKind::DesktopWidget) {
         return entry;
       }
@@ -166,7 +170,7 @@ namespace desktop_settings {
   std::vector<WidgetSettingSpec> commonDesktopWidgetSettingSpecs(std::string_view type) {
     if (type == "login_box") {
       auto bgColor = colorSpec("background_color", "surface_variant");
-      auto bgRadius = doubleSpec("background_radius", 12.0, 0.0, 32.0, 1.0);
+      auto bgRadius = intSpec("background_radius", 12.0, 0.0, 32.0, 1.0);
       auto bgOpacity = doubleSpec("background_opacity", 0.88, 0.0, 1.0, 0.01);
       return {
           std::move(bgColor),
@@ -185,10 +189,10 @@ namespace desktop_settings {
     auto bgColor = colorSpec("background_color", "surface");
     bgColor.visibleWhen = backgroundOn;
 
-    auto bgRadius = doubleSpec("background_radius", 12.0, 0.0, 32.0, 1.0);
+    auto bgRadius = intSpec("background_radius", 12.0, 0.0, 32.0, 1.0);
     bgRadius.visibleWhen = backgroundOn;
 
-    auto bgPadding = doubleSpec("background_padding", 10.0, 0.0, 32.0, 1.0);
+    auto bgPadding = intSpec("background_padding", 10.0, 0.0, 32.0, 1.0);
     bgPadding.visibleWhen = backgroundOn;
 
     auto bgOpacity = doubleSpec("background_opacity", 0.8, 0.0, 1.0, 0.01);
@@ -227,6 +231,12 @@ namespace desktop_settings {
     };
     sysmonStatsWithNone.insert(sysmonStatsWithNone.end(), sysmonStats.begin(), sysmonStats.end());
 
+    const std::vector<WidgetSettingSelectOption> networkSpeedUnits = {
+        {"auto", "desktop-widgets.editor.settings.network-speed-unit-auto"},
+        {"kb", "desktop-widgets.editor.settings.network-speed-unit-kilobytes"},
+        {"mb", "desktop-widgets.editor.settings.network-speed-unit-megabytes"},
+    };
+
     std::vector<WidgetSettingSpec> specs;
     auto add = [&](WidgetSettingSpec spec) { specs.push_back(std::move(spec)); };
 
@@ -244,15 +254,21 @@ namespace desktop_settings {
       auto centerText = boolSpec("center_text", false);
       centerText.visibleWhen = digitalOnly;
       add(std::move(centerText));
+      auto timezone = stringSpec("timezone", "");
+      timezone.labelKey = "settings.widgets.settings.timezone.label";
+      timezone.descriptionKey = "settings.widgets.settings.timezone.description";
+      add(std::move(timezone));
       add(colorSpec("color", "on_surface"));
       add(fontFamilySpec());
-      add(boolSpec("shadow", true));
+      // Shadow is a text shadow on the digital label; analog mode has no shadow.
+      auto shadow = boolSpec("shadow", true);
+      shadow.visibleWhen = digitalOnly;
+      add(std::move(shadow));
       auto circle = boolSpec("circle", true);
       circle.visibleWhen = analogOnly;
       add(std::move(circle));
     } else if (type == "audio_visualizer") {
-      add(doubleSpec("aspect_ratio", 2.5, 0.5, 6.0, 0.1));
-      add(doubleSpec("bands", 32.0, 4.0, 128.0, 4.0));
+      add(intSpec("bands", 32, 4.0, 128.0, 4.0));
       add(boolSpec("mirrored", true));
       add(boolSpec("centered", true));
       add(boolSpec("show_when_idle", true));
@@ -313,6 +329,7 @@ namespace desktop_settings {
       add(stringSpec("title", "Title"));
       add(stringSpec("description"));
       add(colorSpec("color", "on_surface"));
+      add(doubleSpec("opacity", 1.0, 0.0, 1.0, 0.01));
       add(fontFamilySpec());
       add(boolSpec("shadow", true));
     } else if (type == "button") {
@@ -333,32 +350,122 @@ namespace desktop_settings {
       add(colorSpec("hover_background", "hover"));
       add(fontFamilySpec());
     } else if (type == "sysmon") {
+      const std::vector<WidgetSettingSelectOption> sysmonDisplay = {
+          {"graph", "desktop-widgets.editor.settings.display-graph"},
+          {"gauge", "desktop-widgets.editor.settings.display-gauge"},
+      };
+      const WidgetSettingVisibility graphOnly{"display", {"graph"}};
+      const WidgetSettingVisibility gaugeOnly{"display", {"gauge"}};
+
       add(selectSpec("stat", "cpu_usage", sysmonStats));
-      add(selectSpec("stat2", "", sysmonStatsWithNone));
+      {
+        auto stat2 = selectSpec("stat2", "", sysmonStatsWithNone);
+        stat2.visibleWhen = graphOnly;
+        add(std::move(stat2));
+      }
       {
         auto interface = stringSpec("interface");
         interface.visibleWhen =
             WidgetSettingVisibility{{{"stat", {"net_rx", "net_tx"}}, {"stat2", {"net_rx", "net_tx"}}}};
         add(std::move(interface));
       }
+      {
+        auto unit = selectSpec("network_speed_unit", "auto", networkSpeedUnits);
+        unit.visibleWhen = WidgetSettingVisibility{{{"stat", {"net_rx", "net_tx"}}, {"stat2", {"net_rx", "net_tx"}}}};
+        add(std::move(unit));
+      }
+      {
+        auto compact = boolSpec("network_speed_compact", false);
+        compact.visibleWhen =
+            WidgetSettingVisibility{{{"stat", {"net_rx", "net_tx"}}, {"stat2", {"net_rx", "net_tx"}}}};
+        add(std::move(compact));
+      }
+      add(segmentedSpec("display", "graph", sysmonDisplay));
+      {
+        auto gaugeLayout = segmentedSpec(
+            "gauge_layout", "horizontal",
+            {
+                {"horizontal", "desktop-widgets.editor.settings.horizontal"},
+                {"vertical", "desktop-widgets.editor.settings.vertical"},
+            }
+        );
+        gaugeLayout.visibleWhen = gaugeOnly;
+        add(std::move(gaugeLayout));
+      }
       add(colorSpec("color", "primary"));
-      add(colorSpec("color2", "secondary"));
+      {
+        auto color2 = colorSpec("color2", "secondary");
+        color2.visibleWhen = graphOnly;
+        add(std::move(color2));
+      }
+      {
+        auto highlight = colorSpec("highlight_color", "error");
+        highlight.visibleWhen = gaugeOnly;
+        add(std::move(highlight));
+      }
       add(fontFamilySpec());
       add(boolSpec("show_label", true));
+      {
+        auto minW = intSpec("label_min_width", 0, 0.0, 200.0, 1.0);
+        WidgetSettingVisibility showLabelGauge;
+        showLabelGauge.all = {
+            WidgetSettingVisibilityCondition{"display", {"gauge"}},
+            WidgetSettingVisibilityCondition{"show_label", {"true"}},
+        };
+        minW.visibleWhen = showLabelGauge;
+        add(std::move(minW));
+      }
+      add(boolSpec("shadow", true));
+    } else if (type == "volume") {
+      add(segmentedSpec(
+          "device", "output",
+          {{"output", "settings.widgets.options.output"}, {"input", "settings.widgets.options.input"}}
+      ));
+      add(glyphSpec("glyph", ""));
+      add(colorSpec("fill_color", "primary"));
+      add(colorSpec("track_color", "on_surface_variant"));
+      add(boolSpec("show_device", true));
+      add(stepperIntSpec("scroll_step", 5, 1.0, 25.0, 1.0));
+      add(fontFamilySpec());
       add(boolSpec("shadow", true));
     } else if (type == "login_box") {
+      add(segmentedSpec(
+          "layout", "regular",
+          {{"compact", "settings.widgets.options.compact"}, {"regular", "settings.widgets.options.regular"}}
+      ));
+      const WidgetSettingVisibility regularOnly{"layout", {"regular"}};
+      auto showSessionButtons = boolSpec("show_session_buttons", true);
+      showSessionButtons.visibleWhen = regularOnly;
+      add(std::move(showSessionButtons));
+      auto showMedia = boolSpec("show_media", true);
+      showMedia.visibleWhen = regularOnly;
+      add(std::move(showMedia));
+      auto showWeather = boolSpec("show_weather", true);
+      showWeather.visibleWhen = regularOnly;
+      add(std::move(showWeather));
       add(boolSpec("show_login_button", true));
+      add(boolSpec("show_unlock_hint", true));
+      add(boolSpec("show_caps_lock", true));
+      add(boolSpec("show_keyboard_layout", true));
       add(doubleSpec("input_opacity", 1.0, 0.0, 1.0, 0.01));
-      add(doubleSpec("input_radius", 6.0, 0.0, 32.0, 1.0));
+      add(intSpec("input_radius", 6.0, 0.0, 32.0, 1.0));
+      add(boolSpec("center_password_text", false));
     }
 
     return specs;
   }
 
-  noctalia::config::schema::WidgetSettingSchema desktopWidgetSettingSchema(std::string_view type) {
+  noctalia::config::schema::WidgetSettingSchema
+  desktopWidgetSettingSchema(std::string_view type, scripting::PluginRegistry* pluginRegistry) {
     noctalia::config::schema::WidgetSettingSchema out;
-    for (const auto& spec : desktopWidgetSettingSpecs(type)) {
-      out.push_back(spec.schema);
+    if (auto pluginEntry = resolvePluginDesktopWidget(type, pluginRegistry)) {
+      for (const auto& spec : settings::manifestSettingSpecs(pluginEntry->entry->settings)) {
+        out.push_back(spec.schema);
+      }
+    } else {
+      for (const auto& spec : desktopWidgetSettingSpecs(type)) {
+        out.push_back(spec.schema);
+      }
     }
     for (const auto& spec : commonDesktopWidgetSettingSpecs(type)) {
       out.push_back(spec.schema);
