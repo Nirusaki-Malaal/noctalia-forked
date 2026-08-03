@@ -598,7 +598,7 @@ void Application::initPanelManagerAndPanels() {
   {
     auto launcherPanel = std::make_unique<LauncherPanel>(&m_configService, &m_asyncTextureCache);
     launcherPanel->addProvider(std::make_unique<AppProvider>(&m_configService, &m_compositorPlatform));
-    launcherPanel->addProvider(std::make_unique<BalooProvider>(&m_configService));
+    launcherPanel->addProvider(std::make_unique<BalooProvider>());
     launcherPanel->addProvider(std::make_unique<WallpaperProvider>(&m_configService, &m_wayland, &m_themeService));
     launcherPanel->addProvider(std::make_unique<WindowProvider>(&m_compositorPlatform));
     launcherPanel->addProvider(std::make_unique<SessionProvider>(&m_configService, &m_sessionActionRunner));

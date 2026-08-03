@@ -105,7 +105,6 @@ std::vector<SessionPanelActionConfig> defaultSessionPanelActions() {
           .shortcut = KeyChord{.sym = XKB_KEY_3},
       },
       SessionPanelActionConfig{
-      SessionPanelActionConfig{
           .action = "lock_and_hibernate",
           .shortcut = KeyChord{.sym = XKB_KEY_4},
       },
