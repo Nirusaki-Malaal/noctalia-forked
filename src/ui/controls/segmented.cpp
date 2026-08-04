@@ -195,6 +195,7 @@ std::unique_ptr<Separator> Segmented::makeSegmentSeparator() {
 std::unique_ptr<Button>
 Segmented::makeSegmentButton(std::string_view label, std::string_view glyph, std::size_t index) {
   auto btn = std::make_unique<Button>();
+  btn->setClipChildren(true);
   if (!glyph.empty()) {
     btn->setGlyph(glyph);
     btn->setGlyphSize(effectiveFontSize());
@@ -215,12 +216,12 @@ Segmented::makeSegmentButton(std::string_view label, std::string_view glyph, std
 void Segmented::applyButtonMetrics(Button& button) const {
   if (m_compact) {
     button.setMinHeight(Style::controlHeightSm * m_scale);
-    button.setPadding(Style::spaceXs * m_scale, Style::spaceSm * m_scale);
+    button.setPadding(Style::spaceXs * m_scale, Style::spaceXs * m_scale);
     return;
   }
 
   button.setMinHeight(Style::controlHeight * m_scale);
-  button.setPadding(Style::spaceXs * m_scale, Style::spaceMd * m_scale);
+  button.setPadding(Style::spaceXs * m_scale, Style::spaceSm * m_scale);
 }
 
 void Segmented::setEqualSegmentWidths(bool equalWidths) {

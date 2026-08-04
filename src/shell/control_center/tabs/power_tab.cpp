@@ -174,8 +174,8 @@ void PowerTab::buildProfilesCard(Flex& root, float scale) {
       m_profileOrder.emplace_back(candidate);
     }
   }
-  if (m_profileOrder.empty()) {
-    return;
+  if (m_profileOrder.empty() && !available.empty()) {
+    m_profileOrder.assign(available.begin(), available.end());
   }
 
   auto card = ui::column({
@@ -193,11 +193,13 @@ void PowerTab::buildProfilesCard(Flex& root, float scale) {
     options.push_back({.label = profileLabel(profile), .glyph = std::string(profileGlyphName(profile))});
   }
 
+  const bool isCompactMode = m_profileOrder.size() > 3;
+
   card->addChild(
       ui::segmented({
           .out = &m_profiles,
           .options = std::move(options),
-          .fontSize = Style::fontSizeCaption * scale,
+          .fontSize = (isCompactMode ? Style::fontSizeCaption * 0.82f : Style::fontSizeCaption) * scale,
           .scale = scale,
           .surfaceOpacity = panelCardOpacity(),
           .surfaceRole = ColorRole::Surface,
@@ -210,6 +212,9 @@ void PowerTab::buildProfilesCard(Flex& root, float scale) {
           },
       })
   );
+  if (isCompactMode && m_profiles != nullptr) {
+    m_profiles->setCompact(true);
+  }
 
   auto inhibitedRow = ui::row(
       {.out = &m_inhibitedRow, .align = FlexAlign::Center, .gap = Style::spaceXs * scale, .visible = false},
@@ -390,8 +395,31 @@ void PowerTab::syncBatteryStatus() {
 }
 
 void PowerTab::syncPowerProfiles() {
-  if (m_profiles == nullptr || m_powerProfiles == nullptr || m_profileOrder.empty()) {
+  if (m_profiles == nullptr || m_powerProfiles == nullptr) {
     return;
+  }
+
+  const auto& available = m_powerProfiles->profiles();
+  std::vector<std::string> currentOrder;
+  for (const auto& candidate : powerProfileOrder()) {
+    if (std::ranges::find(available, candidate) != available.end()) {
+      currentOrder.emplace_back(candidate);
+    }
+  }
+  if (currentOrder.empty() && !available.empty()) {
+    currentOrder.assign(available.begin(), available.end());
+  }
+
+  if (currentOrder != m_profileOrder) {
+    m_profileOrder = currentOrder;
+    m_profiles->clearOptions();
+    const bool isCompactMode = m_profileOrder.size() > 3;
+    const float scale = contentScale();
+    m_profiles->setFontSize((isCompactMode ? Style::fontSizeCaption * 0.82f : Style::fontSizeCaption) * scale);
+    m_profiles->setCompact(isCompactMode);
+    for (const auto& profile : m_profileOrder) {
+      m_profiles->addOption(profileLabel(profile), std::string(profileGlyphName(profile)));
+    }
   }
 
   const auto& active = m_powerProfiles->activeProfile();
