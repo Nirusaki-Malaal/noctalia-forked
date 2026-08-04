@@ -8,22 +8,36 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <map>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <sdbus-c++/IProxy.h>
 #include <sdbus-c++/Types.h>
 #include <span>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <vector>
 
 std::string profileLabel(std::string_view profile) {
   if (profile == "power-saver") {
     return i18n::tr("power.profiles.power-saver");
   }
+  if (profile == "low-power") {
+    return "Eco";
+  }
+  if (profile == "quiet") {
+    return "Quiet";
+  }
   if (profile == "balanced") {
     return i18n::tr("power.profiles.balanced");
   }
+  if (profile == "balanced-performance") {
+    return "Performance";
+  }
   if (profile == "performance") {
-    return i18n::tr("power.profiles.performance");
+    return "Turbo";
   }
   return std::string(profile);
 }
@@ -31,6 +45,90 @@ std::string profileLabel(std::string_view profile) {
 namespace {
 
   constexpr Logger kLog("power");
+
+  struct PredatrixThermalInfo {
+    std::string current;
+    std::vector<std::string> available;
+  };
+
+  std::optional<PredatrixThermalInfo> queryPredatrix() {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+      return std::nullopt;
+    }
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, "/var/run/predatrix.sock", sizeof(addr.sun_path) - 1);
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+      ::close(fd);
+      return std::nullopt;
+    }
+    std::string req = "{\"command\":\"get_thermal_profile\"}\n";
+    if (::send(fd, req.data(), req.size(), 0) < 0) {
+      ::close(fd);
+      return std::nullopt;
+    }
+    char buf[4096];
+    ssize_t n = ::recv(fd, buf, sizeof(buf) - 1, 0);
+    ::close(fd);
+    if (n <= 0) {
+      return std::nullopt;
+    }
+    buf[n] = '\0';
+    try {
+      auto json = nlohmann::json::parse(buf);
+      if (json.value("success", false) && json.contains("data")) {
+        const auto& data = json["data"];
+        PredatrixThermalInfo info;
+        info.current = data.value("current", "");
+        if (data.contains("available") && data["available"].is_array()) {
+          for (const auto& item : data["available"]) {
+            if (item.is_string()) {
+              info.available.push_back(item.get<std::string>());
+            }
+          }
+        }
+        return info;
+      }
+    } catch (...) {
+    }
+    return std::nullopt;
+  }
+
+  bool setPredatrixProfile(std::string_view profile) {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+      return false;
+    }
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, "/var/run/predatrix.sock", sizeof(addr.sun_path) - 1);
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+      ::close(fd);
+      return false;
+    }
+    nlohmann::json req;
+    req["command"] = "set_thermal_profile";
+    req["params"] = {{"profile", std::string(profile)}};
+    std::string reqStr = req.dump() + "\n";
+    if (::send(fd, reqStr.data(), reqStr.size(), 0) < 0) {
+      ::close(fd);
+      return false;
+    }
+    char buf[4096];
+    ssize_t n = ::recv(fd, buf, sizeof(buf) - 1, 0);
+    ::close(fd);
+    if (n <= 0) {
+      return false;
+    }
+    buf[n] = '\0';
+    try {
+      auto json = nlohmann::json::parse(buf);
+      return json.value("success", false);
+    } catch (...) {
+      return false;
+    }
+  }
 
   const sdbus::ServiceName kPowerProfilesBusName{"org.freedesktop.UPower.PowerProfiles"};
   const sdbus::ObjectPath kPowerProfilesObjectPath{"/org/freedesktop/UPower/PowerProfiles"};
@@ -129,17 +227,25 @@ namespace {
 } // namespace
 
 std::string_view profileGlyphName(std::string_view profile) {
-  if (profile == "performance") {
+  if (profile == "performance" || profile == "turbo") {
+    return "bolt";
+  }
+  if (profile == "balanced-performance") {
     return "performance";
   }
-  if (profile == "power-saver") {
+  if (profile == "power-saver" || profile == "low-power") {
     return "powersaver";
+  }
+  if (profile == "quiet") {
+    return "moon";
   }
   return "balanced";
 }
 
 std::span<const std::string_view> powerProfileOrder() {
-  static constexpr std::array<std::string_view, 3> kOrder = {"power-saver", "balanced", "performance"};
+  static constexpr std::array<std::string_view, 6> kOrder = {
+      "low-power", "quiet", "power-saver", "balanced", "balanced-performance", "performance"
+  };
   return kOrder;
 }
 
@@ -179,6 +285,14 @@ PowerProfilesService::~PowerProfilesService() { m_lifetimeToken.reset(); }
 void PowerProfilesService::setChangeCallback(ChangeCallback callback) { m_changeCallback = std::move(callback); }
 
 void PowerProfilesService::refresh() {
+  if (auto predatrix = queryPredatrix()) {
+    PowerProfilesState next;
+    next.activeProfile = predatrix->current;
+    next.profiles = predatrix->available;
+    emitChangedIfNeeded(std::move(next), true);
+    return;
+  }
+
   if (m_refreshInFlight) {
     m_refreshQueued = true;
     return;
@@ -229,6 +343,14 @@ bool PowerProfilesService::setActiveProfile(std::string_view profile) {
   const std::string requested(profile);
   if (requested != m_state.activeProfile) {
     m_pendingLocalActiveProfile = requested;
+  }
+
+  if (setPredatrixProfile(requested)) {
+    PowerProfilesState next = m_state;
+    next.activeProfile = requested;
+    emitChangedIfNeeded(std::move(next), false);
+    refresh();
+    return true;
   }
 
   const std::weak_ptr<int> lifetimeToken = m_lifetimeToken;
