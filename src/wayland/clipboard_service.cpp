@@ -59,6 +59,8 @@ namespace {
       std::string_view{"image/png"},
       std::string_view{"image/jpeg"},
       std::string_view{"image/jxl"},
+      std::string_view{"image/gif"},
+      std::string_view{"image/webp"},
   };
 
   constexpr std::array kPasswordHintMimeTypes = {
@@ -844,6 +846,20 @@ bool ClipboardService::copyImagePng(std::vector<std::uint8_t> png) {
     return false;
   }
   return copyData({"image/png"}, std::move(png));
+}
+
+bool ClipboardService::copyImageGif(std::vector<std::uint8_t> gif) {
+  if (gif.empty()) {
+    return false;
+  }
+  return copyData({"image/gif"}, std::move(gif));
+}
+
+bool ClipboardService::copyMedia(std::string mimeType, std::vector<std::uint8_t> data) {
+  if (data.empty() || mimeType.empty()) {
+    return false;
+  }
+  return copyData({std::move(mimeType)}, std::move(data));
 }
 
 std::size_t ClipboardService::maxEntryBytesFor(std::string_view mimeType) {

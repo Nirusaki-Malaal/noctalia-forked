@@ -23,6 +23,7 @@
 #include "launcher/dmenu_ipc.h"
 #include "net/http_client.h"
 #include "net/http_client_poll_source.h"
+#include "net/tenor_service.h"
 #include "notification/notification_manager.h"
 #include "render/core/async_texture_cache.h"
 #include "render/core/shared_texture_cache.h"
@@ -231,6 +232,7 @@ private:
   VirtualKeyboardService m_virtualKeyboardService;
   ConfigService m_configService;
   HttpClient m_httpClient;
+  TenorService m_tenorService{&m_httpClient, &m_configService};
   FileWatcher m_fileWatcher;
   noctalia::theme::CommunityPaletteService m_communityPaletteService{m_httpClient};
   noctalia::theme::CommunityTemplateService m_communityTemplateService{m_httpClient};

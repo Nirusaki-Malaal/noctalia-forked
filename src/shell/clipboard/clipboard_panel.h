@@ -1,6 +1,8 @@
 #pragma once
 
+#include "core/emoji_store.h"
 #include "core/timer_manager.h"
+#include "net/tenor_service.h"
 #include "shell/panel/panel.h"
 
 #include <cstddef>
@@ -22,12 +24,24 @@ class Renderer;
 class ScrollView;
 class ConfigService;
 class ClipboardListAdapter;
+class GifGridAdapter;
+class EmojiGridAdapter;
 class VirtualGridView;
+class Segmented;
 struct ClipboardEntry;
+
+enum class ClipboardTabMode : std::uint8_t {
+  History,
+  Gifs,
+  Emojis,
+};
 
 class ClipboardPanel : public Panel {
 public:
-  ClipboardPanel(ClipboardService* clipboard, ConfigService* config, AsyncTextureCache* asyncTextures);
+  ClipboardPanel(
+      ClipboardService* clipboard, ConfigService* config, AsyncTextureCache* asyncTextures,
+      TenorService* tenor = nullptr
+  );
   ~ClipboardPanel() override;
   void setActivateCallback(std::function<void(const ClipboardEntry&)> callback);
 
@@ -35,8 +49,8 @@ public:
   void onOpen(std::string_view context) override;
   void onClose() override;
 
-  [[nodiscard]] float preferredWidth() const override { return scaled(720.0f); }
-  [[nodiscard]] float preferredHeight() const override { return scaled(560.0f); }
+  [[nodiscard]] float preferredWidth() const override { return scaled(740.0f); }
+  [[nodiscard]] float preferredHeight() const override { return scaled(580.0f); }
   [[nodiscard]] LayerShellKeyboard keyboardMode() const override { return LayerShellKeyboard::Exclusive; }
   [[nodiscard]] bool handleGlobalKey(std::uint32_t sym, std::uint32_t modifiers, bool pressed, bool preedit) override;
   [[nodiscard]] InputArea* initialFocusArea() const override;
@@ -46,6 +60,7 @@ private:
   void doLayout(Renderer& renderer, float width, float height) override;
   void doUpdate(Renderer& renderer) override;
   void onPanelCardOpacityChanged(float opacity) override;
+  void setTabMode(ClipboardTabMode mode);
   void schedulePreviewPayloadRefresh(bool debounced);
   void updateListState();
   void updatePreviewActions();
@@ -71,10 +86,18 @@ private:
   void onFilterChanged(const std::string& text);
   [[nodiscard]] std::size_t selectedHistoryIndex() const;
 
+  void fetchTrendingGifs();
+  void searchGifs(const std::string& query);
+  void searchEmojis(const std::string& query);
+
   ClipboardService* m_clipboard = nullptr;
   std::function<void(const ClipboardEntry&)> m_activateCallback;
   ConfigService* m_config = nullptr;
   AsyncTextureCache* m_asyncTextures = nullptr;
+  TenorService* m_tenor = nullptr;
+
+  ClipboardTabMode m_tabMode = ClipboardTabMode::History;
+  Segmented* m_tabSegmented = nullptr;
 
   InputArea* m_focusArea = nullptr;
   Flex* m_rootLayout = nullptr;
@@ -89,8 +112,14 @@ private:
   Input* m_filterInput = nullptr;
   VirtualGridView* m_listGrid = nullptr;
   Label* m_listEmptyLabel = nullptr;
+
   std::unique_ptr<ClipboardListAdapter> m_listAdapter;
+  std::unique_ptr<GifGridAdapter> m_gifAdapter;
+  std::unique_ptr<EmojiGridAdapter> m_emojiAdapter;
+
   std::vector<std::size_t> m_filteredIndices;
+  std::vector<TenorMediaItem> m_gifResults;
+  std::vector<std::size_t> m_emojiIndices;
   std::string m_filterQuery;
 
   Flex* m_previewCard = nullptr;
@@ -105,6 +134,7 @@ private:
   ScrollView* m_previewScrollView = nullptr;
   Flex* m_previewContent = nullptr;
   Image* m_previewImage = nullptr;
+  Label* m_previewEmojiLabel = nullptr;
 
   std::size_t m_selectedIndex = 0;
   std::size_t m_previewPayloadIndex = static_cast<std::size_t>(-1);
@@ -121,4 +151,5 @@ private:
   float m_lastPreviewHeight = -1.0f;
   float m_listRowHeight = 0.0f;
   bool m_pendingScrollToSelected = false;
+  bool m_isLoadingGifs = false;
 };

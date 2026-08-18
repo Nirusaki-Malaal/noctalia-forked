@@ -533,7 +533,8 @@ void Application::initPanelManagerAndPanels() {
       m_settingsWindow.onExternalOptionsChanged();
     });
   });
-  auto clipboardPanel = std::make_unique<ClipboardPanel>(&m_clipboardService, &m_configService, &m_asyncTextureCache);
+  auto clipboardPanel =
+      std::make_unique<ClipboardPanel>(&m_clipboardService, &m_configService, &m_asyncTextureCache, &m_tenorService);
   clipboardPanel->setActivateCallback([this](const ClipboardEntry& entry) {
     const ClipboardAutoPasteMode mode = m_configService.config().shell.clipboardAutoPaste;
     if (mode == ClipboardAutoPasteMode::Off) {

@@ -124,6 +124,8 @@ public:
   bool copyText(std::string text);
   bool copyText(std::string text, std::string mimeType);
   bool copyImagePng(std::vector<std::uint8_t> png);
+  bool copyImageGif(std::vector<std::uint8_t> gif);
+  bool copyMedia(std::string mimeType, std::vector<std::uint8_t> data);
   bool copyEntry(const ClipboardEntry& entry);
   bool promoteEntry(std::size_t index);
   bool setEntryPinned(std::size_t index, bool pinned);

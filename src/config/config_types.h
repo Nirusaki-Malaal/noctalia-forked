@@ -1040,6 +1040,9 @@ struct ShellConfig {
   bool disableMipmaps = false;
   ClipboardAutoPasteMode clipboardAutoPaste = ClipboardAutoPasteMode::Auto;
   std::string clipboardImageActionCommand;
+  std::string tenorApiKey;
+  std::string tenorContentFilter = "medium";
+  std::string giphyApiKey;
   ShadowConfig shadow;
   PanelConfig panel;
   LauncherConfig launcher;

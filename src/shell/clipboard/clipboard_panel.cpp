@@ -2,6 +2,8 @@
 
 #include "config/config_service.h"
 #include "core/deferred_call.h"
+#include "core/emoji_store.h"
+#include "core/input/key_modifiers.h"
 #include "core/input/key_symbols.h"
 #include "core/input/keybind_matcher.h"
 #include "core/log.h"
@@ -16,6 +18,8 @@
 #include "shell/panel/panel_manager.h"
 #include "time/time_format.h"
 #include "ui/builders.h"
+#include "ui/controls/segmented.h"
+#include "ui/controls/virtual_grid_view.h"
 #include "ui/palette.h"
 #include "ui/style.h"
 #include "util/string_utils.h"
@@ -26,6 +30,7 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -41,10 +46,9 @@ namespace {
   constexpr std::size_t kListOverscanRows = 3;
   constexpr auto kPreviewPayloadDebounceInterval = std::chrono::milliseconds(75);
   constexpr auto kFilterDebounceInterval = std::chrono::milliseconds(120);
+  constexpr auto kGifSearchDebounceInterval = std::chrono::milliseconds(250);
   constexpr Logger kLog("clipboard");
 
-  // Row height derives from measured font metrics so fonts with oversized
-  // declared line extents still fit the title + meta stack.
   [[nodiscard]] float listRowHeight(Renderer& renderer, float scale) {
     const TextMetrics title = renderer.measureFont(Style::fontSizeBody * scale, FontWeight::SemiBold);
     const TextMetrics meta = renderer.measureFont(Style::fontSizeCaption * scale, FontWeight::Normal);
@@ -388,15 +392,6 @@ namespace {
       }
       if (m_lead != nullptr) {
         m_lead->setSize(thumbPx, thumbPx);
-        m_lead->setMinWidth(thumbPx);
-        m_lead->setMinHeight(thumbPx);
-      }
-      if (m_image != nullptr) {
-        m_image->setSize(thumbPx, thumbPx);
-      }
-      if (m_colorSwatch != nullptr && m_colorSwatch->visible()) {
-        const float swatchPx = std::round(thumbPx * 0.82f);
-        m_colorSwatch->setSize(swatchPx, swatchPx);
       }
       if (m_title != nullptr && m_meta != nullptr) {
         const float pinW = m_pinned ? kListPinGlyphSize * m_scale + Style::spaceMd * m_scale : 0.0f;
@@ -458,6 +453,206 @@ namespace {
     std::string m_imageSource;
   };
 
+  class GifGridTile final : public InputArea {
+  public:
+    GifGridTile(
+        float scale, AsyncTextureCache* asyncTextures, TenorService* tenor,
+        std::optional<ColorSpec> listItemBackground
+    )
+        : m_scale(scale), m_asyncTextures(asyncTextures), m_tenor(tenor), m_listItemBackground(listItemBackground) {
+      setVisible(false);
+
+      addChild(
+          ui::box({
+              .out = &m_background,
+              .radius = Style::scaledRadiusMd(scale),
+          })
+      );
+
+      auto col = ui::column({
+          .out = &m_column,
+          .align = FlexAlign::Stretch,
+          .gap = Style::spaceXs * scale,
+          .padding = Style::spaceXs * scale,
+      });
+      addChild(std::move(col));
+
+      m_column->addChild(
+          ui::image({
+              .out = &m_image,
+              .fit = ImageFit::Cover,
+              .radius = Style::scaledRadiusSm(scale),
+              .configure = [](Image& image) {
+                image.setAsyncReadyCallback([]() { PanelManager::instance().refresh(); });
+              },
+          })
+      );
+
+      m_column->addChild(
+          ui::label({
+              .out = &m_title,
+              .fontSize = Style::fontSizeCaption * scale,
+              .maxLines = 1,
+              .baselineMode = LabelBaselineMode::TextFixedHeight,
+              .configure = [](Label& label) { label.setHitTestVisible(false); },
+          })
+      );
+    }
+
+    void bind(Renderer& renderer, const TenorMediaItem& item, float width, float height, bool selected, bool hovered) {
+      m_selected = selected;
+      m_hovered = hovered;
+      setVisible(true);
+      setEnabled(true);
+      setSize(width, height);
+
+      m_title->setText(item.title.empty() ? "GIF" : item.title);
+
+      if (m_tenor != nullptr && !item.previewUrl.empty()) {
+        const auto path = m_tenor->localPathForUrl(item.previewUrl);
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) > 0) {
+          m_image->setSourceFileAsync(renderer, *m_asyncTextures, path.string(), static_cast<int>(std::ceil(width)));
+          m_image->setVisible(true);
+        } else {
+          m_tenor->ensureLocalPreview(
+              const_cast<TenorMediaItem&>(item),
+              [this, &renderer, w = width](std::optional<std::filesystem::path> p) {
+                if (p.has_value() && m_image != nullptr) {
+                  m_image->setSourceFileAsync(renderer, *m_asyncTextures, p->string(), static_cast<int>(std::ceil(w)));
+                  m_image->setVisible(true);
+                  PanelManager::instance().refresh();
+                }
+              }
+          );
+        }
+      }
+
+      applyVisualState();
+      layout(renderer);
+    }
+
+    void applyVisualState() {
+      if (m_background == nullptr || m_title == nullptr) {
+        return;
+      }
+      if (m_selected) {
+        m_background->setFill(colorSpecFromRole(ColorRole::Primary));
+      } else if (m_hovered) {
+        m_background->setFill(colorSpecFromRole(ColorRole::Hover));
+      } else {
+        m_background->setFill(m_listItemBackground.value_or(clearColorSpec()));
+      }
+
+      const auto activeRole = m_selected ? ColorRole::OnPrimary : ColorRole::OnHover;
+      const bool active = m_selected || m_hovered;
+      m_title->setColor(colorSpecFromRole(active ? activeRole : ColorRole::OnSurface));
+    }
+
+  private:
+    void doLayout(Renderer& renderer) override {
+      if (m_background != nullptr) {
+        m_background->setPosition(0.0f, 0.0f);
+        m_background->setSize(width(), height());
+      }
+      if (m_column != nullptr) {
+        m_column->setPosition(0.0f, 0.0f);
+        m_column->setSize(width(), height());
+      }
+      if (m_image != nullptr) {
+        const float textH = Style::fontSizeCaption * m_scale + Style::spaceXs * m_scale;
+        m_image->setSize(
+            std::max(10.0f, width() - Style::spaceXs * m_scale * 2.0f),
+            std::max(10.0f, height() - textH - Style::spaceXs * m_scale * 2.0f)
+        );
+      }
+      InputArea::doLayout(renderer);
+    }
+
+    float m_scale = 1.0f;
+    AsyncTextureCache* m_asyncTextures = nullptr;
+    TenorService* m_tenor = nullptr;
+    std::optional<ColorSpec> m_listItemBackground;
+    Box* m_background = nullptr;
+    Flex* m_column = nullptr;
+    Image* m_image = nullptr;
+    Label* m_title = nullptr;
+    bool m_selected = false;
+    bool m_hovered = false;
+  };
+
+  class EmojiGridTile final : public InputArea {
+  public:
+    EmojiGridTile(float scale, std::optional<ColorSpec> listItemBackground)
+        : m_scale(scale), m_listItemBackground(listItemBackground) {
+      setVisible(false);
+
+      addChild(
+          ui::box({
+              .out = &m_background,
+              .radius = Style::scaledRadiusMd(scale),
+          })
+      );
+
+      addChild(
+          ui::label({
+              .out = &m_emojiLabel,
+              .fontSize = 28.0f * scale,
+              .baselineMode = LabelBaselineMode::TextFixedHeight,
+              .configure = [](Label& label) { label.setHitTestVisible(false); },
+          })
+      );
+    }
+
+    void bind(Renderer& renderer, const EmojiItem& item, float width, float height, bool selected, bool hovered) {
+      m_selected = selected;
+      m_hovered = hovered;
+      setVisible(true);
+      setEnabled(true);
+      setSize(width, height);
+
+      m_emojiLabel->setText(item.emoji);
+      applyVisualState();
+      layout(renderer);
+    }
+
+    void applyVisualState() {
+      if (m_background == nullptr) {
+        return;
+      }
+      if (m_selected) {
+        m_background->setFill(colorSpecFromRole(ColorRole::Primary));
+      } else if (m_hovered) {
+        m_background->setFill(colorSpecFromRole(ColorRole::Hover));
+      } else {
+        m_background->setFill(m_listItemBackground.value_or(clearColorSpec()));
+      }
+    }
+
+  private:
+    void doLayout(Renderer& renderer) override {
+      if (m_background != nullptr) {
+        m_background->setPosition(0.0f, 0.0f);
+        m_background->setSize(width(), height());
+      }
+      if (m_emojiLabel != nullptr) {
+        const float emojiSize = 28.0f * m_scale;
+        m_emojiLabel->setPosition(
+            std::max(0.0f, (width() - emojiSize) * 0.5f), std::max(0.0f, (height() - emojiSize) * 0.5f)
+        );
+        m_emojiLabel->setSize(emojiSize, emojiSize);
+      }
+      InputArea::doLayout(renderer);
+    }
+
+    float m_scale = 1.0f;
+    std::optional<ColorSpec> m_listItemBackground;
+    Box* m_background = nullptr;
+    Label* m_emojiLabel = nullptr;
+    bool m_selected = false;
+    bool m_hovered = false;
+  };
+
 } // namespace
 
 class ClipboardListAdapter final : public VirtualGridAdapter {
@@ -482,9 +677,7 @@ public:
   }
 
   void bindTile(Node& tile, std::size_t index, bool selected, bool hovered) override {
-    if (m_renderer == nullptr
-        || m_clipboard == nullptr
-        || m_filteredIndices == nullptr
+    if (m_renderer == nullptr || m_clipboard == nullptr || m_filteredIndices == nullptr
         || index >= m_filteredIndices->size()) {
       return;
     }
@@ -498,10 +691,7 @@ public:
     if (history[historyIndex].isImage()) {
       imageSource = m_clipboard->imageDataUri(historyIndex).value_or("");
     }
-    row->bind(
-        *m_renderer, history[historyIndex], historyIndex, row->width(), row->height(), selected, hovered && !selected,
-        std::move(imageSource)
-    );
+    row->bind(*m_renderer, history[historyIndex], historyIndex, row->width(), row->height(), selected, hovered, imageSource);
   }
 
   void onActivate(std::size_t index) override {
@@ -512,21 +702,128 @@ public:
 
 private:
   float m_scale = 1.0f;
+  Renderer* m_renderer = nullptr;
   ClipboardService* m_clipboard = nullptr;
   AsyncTextureCache* m_asyncTextures = nullptr;
   std::optional<ColorSpec> m_listItemBackground;
-  Renderer* m_renderer = nullptr;
   const std::vector<std::size_t>* m_filteredIndices = nullptr;
   std::function<void(std::size_t)> m_onActivate;
 };
 
-ClipboardPanel::ClipboardPanel(ClipboardService* clipboard, ConfigService* config, AsyncTextureCache* asyncTextures)
-    : m_clipboard(clipboard), m_config(config), m_asyncTextures(asyncTextures) {}
+class GifGridAdapter final : public VirtualGridAdapter {
+public:
+  GifGridAdapter(
+      float scale, AsyncTextureCache* asyncTextures, TenorService* tenor,
+      std::optional<ColorSpec> listItemBackground
+  )
+      : m_scale(scale), m_asyncTextures(asyncTextures), m_tenor(tenor),
+        m_listItemBackground(listItemBackground) {}
+
+  void setRenderer(Renderer* renderer) { m_renderer = renderer; }
+  void setItems(const std::vector<TenorMediaItem>* items) { m_items = items; }
+  void setOnActivate(std::function<void(std::size_t)> cb) { m_onActivate = std::move(cb); }
+
+  [[nodiscard]] std::size_t itemCount() const override { return m_items != nullptr ? m_items->size() : 0; }
+
+  [[nodiscard]] std::unique_ptr<Node> createTile() override {
+    return std::make_unique<GifGridTile>(m_scale, m_asyncTextures, m_tenor, m_listItemBackground);
+  }
+
+  void bindTile(Node& tile, std::size_t index, bool selected, bool hovered) override {
+    if (m_renderer == nullptr || m_items == nullptr || index >= m_items->size()) {
+      return;
+    }
+    auto* t = static_cast<GifGridTile*>(&tile);
+    t->bind(*m_renderer, (*m_items)[index], t->width(), t->height(), selected, hovered);
+  }
+
+  void onActivate(std::size_t index) override {
+    if (m_onActivate) {
+      m_onActivate(index);
+    }
+  }
+
+  [[nodiscard]] std::string itemTooltip(std::size_t index) const override {
+    if (m_items != nullptr && index < m_items->size()) {
+      return (*m_items)[index].title;
+    }
+    return {};
+  }
+
+private:
+  float m_scale = 1.0f;
+  Renderer* m_renderer = nullptr;
+  AsyncTextureCache* m_asyncTextures = nullptr;
+  TenorService* m_tenor = nullptr;
+  std::optional<ColorSpec> m_listItemBackground;
+  const std::vector<TenorMediaItem>* m_items = nullptr;
+  std::function<void(std::size_t)> m_onActivate;
+};
+
+class EmojiGridAdapter final : public VirtualGridAdapter {
+public:
+  EmojiGridAdapter(float scale, std::optional<ColorSpec> listItemBackground)
+      : m_scale(scale), m_listItemBackground(listItemBackground) {}
+
+  void setRenderer(Renderer* renderer) { m_renderer = renderer; }
+  void setIndices(const std::vector<std::size_t>* indices) { m_indices = indices; }
+  void setOnActivate(std::function<void(std::size_t)> cb) { m_onActivate = std::move(cb); }
+
+  [[nodiscard]] std::size_t itemCount() const override { return m_indices != nullptr ? m_indices->size() : 0; }
+
+  [[nodiscard]] std::unique_ptr<Node> createTile() override {
+    return std::make_unique<EmojiGridTile>(m_scale, m_listItemBackground);
+  }
+
+  void bindTile(Node& tile, std::size_t index, bool selected, bool hovered) override {
+    if (m_renderer == nullptr || m_indices == nullptr || index >= m_indices->size()) {
+      return;
+    }
+    const std::size_t emojiIndex = (*m_indices)[index];
+    const auto* item = EmojiStore::instance().get(emojiIndex);
+    if (item == nullptr) {
+      return;
+    }
+    auto* t = static_cast<EmojiGridTile*>(&tile);
+    t->bind(*m_renderer, *item, t->width(), t->height(), selected, hovered);
+  }
+
+  void onActivate(std::size_t index) override {
+    if (m_onActivate) {
+      m_onActivate(index);
+    }
+  }
+
+  [[nodiscard]] std::string itemTooltip(std::size_t index) const override {
+    if (m_indices != nullptr && index < m_indices->size()) {
+      const auto* item = EmojiStore::instance().get((*m_indices)[index]);
+      if (item != nullptr) {
+        return item->name + " (" + item->category + ")";
+      }
+    }
+    return {};
+  }
+
+private:
+  float m_scale = 1.0f;
+  Renderer* m_renderer = nullptr;
+  std::optional<ColorSpec> m_listItemBackground;
+  const std::vector<std::size_t>* m_indices = nullptr;
+  std::function<void(std::size_t)> m_onActivate;
+};
+
+ClipboardPanel::ClipboardPanel(
+    ClipboardService* clipboard, ConfigService* config, AsyncTextureCache* asyncTextures, TenorService* tenor
+)
+    : m_clipboard(clipboard), m_config(config), m_asyncTextures(asyncTextures), m_tenor(tenor) {}
 
 ClipboardPanel::~ClipboardPanel() = default;
 
 PanelPlacement ClipboardPanel::panelPlacement() const noexcept {
-  return m_config != nullptr ? m_config->config().shell.panel.clipboardPlacement : PanelPlacement::Floating;
+  if (m_config == nullptr) {
+    return PanelPlacement::Floating;
+  }
+  return m_config->config().shell.panel.clipboardPlacement;
 }
 
 void ClipboardPanel::setActivateCallback(std::function<void(const ClipboardEntry&)> callback) {
@@ -585,6 +882,25 @@ void ClipboardPanel::create() {
       })
   );
   sidebar->addChild(std::move(sidebarHeader));
+
+  // Tab mode switcher
+  std::vector<ui::SegmentedOption> tabOptions;
+  tabOptions.push_back({.label = i18n::tr("clipboard.title"), .glyph = "clipboard"});
+  tabOptions.push_back({.label = "GIFs", .glyph = "movie"});
+  tabOptions.push_back({.label = "Emojis", .glyph = "mood-smile"});
+
+  sidebar->addChild(
+      ui::segmented({
+          .out = &m_tabSegmented,
+          .options = std::move(tabOptions),
+          .fontSize = Style::fontSizeCaption * scale,
+          .scale = scale,
+          .surfaceOpacity = panelCardOpacity(),
+          .surfaceRole = ColorRole::Surface,
+          .equalSegmentWidths = true,
+          .onChange = [this](std::size_t index) { setTabMode(static_cast<ClipboardTabMode>(index)); },
+      })
+  );
 
   auto clearConfirmPanel = makeInlineConfirmPanel(&m_clearConfirmPanel, scale);
   clearConfirmPanel->addChild(
@@ -656,13 +972,41 @@ void ClipboardPanel::create() {
     selectIndex(index);
   });
 
+  m_gifAdapter = std::make_unique<GifGridAdapter>(
+      scale, m_asyncTextures, m_tenor,
+      listItemBackground ? std::optional(colorSpecFromRole(ColorRole::SurfaceVariant, panelCardOpacity()))
+                         : std::nullopt
+  );
+  m_gifAdapter->setItems(&m_gifResults);
+  m_gifAdapter->setOnActivate([this](std::size_t index) {
+    if (m_selectedIndex == index) {
+      activateSelected();
+      return;
+    }
+    selectIndex(index);
+  });
+
+  m_emojiAdapter = std::make_unique<EmojiGridAdapter>(
+      scale,
+      listItemBackground ? std::optional(colorSpecFromRole(ColorRole::SurfaceVariant, panelCardOpacity()))
+                         : std::nullopt
+  );
+  m_emojiAdapter->setIndices(&m_emojiIndices);
+  m_emojiAdapter->setOnActivate([this](std::size_t index) {
+    if (m_selectedIndex == index) {
+      activateSelected();
+      return;
+    }
+    selectIndex(index);
+  });
+
   sidebar->addChild(
       ui::virtualGridView({
           .out = &m_listGrid,
           .columns = 1,
           .cellHeight = kRowHeightEstimate * scale,
           .squareCells = false,
-          .columnGap = 0.0f,
+          .columnGap = Style::spaceXs * scale,
           .rowGap = Style::spaceXs * scale,
           .overscanRows = kListOverscanRows,
           .scrollbarVisible = true,
@@ -745,6 +1089,7 @@ void ClipboardPanel::create() {
   );
   deleteConfirmPanel->addChild(
       ui::label({
+          .out = &m_clearConfirmDesc,
           .text = i18n::tr("clipboard.confirm.delete-desc"),
           .fontSize = Style::fontSizeCaption * scale,
           .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
@@ -794,11 +1139,126 @@ void ClipboardPanel::create() {
   schedulePreviewPayloadRefresh(false);
 }
 
+void ClipboardPanel::setTabMode(ClipboardTabMode mode) {
+  if (m_tabMode == mode) {
+    return;
+  }
+  m_tabMode = mode;
+  m_selectedIndex = 0;
+  m_pendingFilterQuery.clear();
+  m_filterQuery.clear();
+
+  if (m_filterInput != nullptr) {
+    m_filterInput->setValue("");
+    switch (m_tabMode) {
+    case ClipboardTabMode::History:
+      m_filterInput->setPlaceholder(i18n::tr("clipboard.filter-placeholder"));
+      break;
+    case ClipboardTabMode::Gifs:
+      m_filterInput->setPlaceholder("Search Tenor GIFs...");
+      break;
+    case ClipboardTabMode::Emojis:
+      m_filterInput->setPlaceholder("Search emojis...");
+      break;
+    }
+  }
+
+  if (m_clearHistoryButton != nullptr) {
+    m_clearHistoryButton->setVisible(m_tabMode == ClipboardTabMode::History);
+    m_clearHistoryButton->setParticipatesInLayout(m_tabMode == ClipboardTabMode::History);
+  }
+
+  const float scale = contentScale();
+  if (m_listGrid != nullptr) {
+    switch (m_tabMode) {
+    case ClipboardTabMode::History:
+      m_listGrid->setColumns(1);
+      m_listGrid->setCellHeight(m_listRowHeight > 0.0f ? m_listRowHeight : kRowHeightEstimate * scale);
+      m_listGrid->setSquareCells(false);
+      m_listGrid->setAdapter(m_listAdapter.get());
+      applyFilter();
+      break;
+    case ClipboardTabMode::Gifs:
+      m_listGrid->setColumns(2);
+      m_listGrid->setCellHeight(130.0f * scale);
+      m_listGrid->setSquareCells(false);
+      m_listGrid->setAdapter(m_gifAdapter.get());
+      if (m_gifResults.empty()) {
+        fetchTrendingGifs();
+      }
+      break;
+    case ClipboardTabMode::Emojis:
+      m_listGrid->setColumns(6);
+      m_listGrid->setCellHeight(48.0f * scale);
+      m_listGrid->setSquareCells(true);
+      m_listGrid->setAdapter(m_emojiAdapter.get());
+      searchEmojis("");
+      break;
+    }
+    m_listGrid->notifyDataChanged();
+    m_listGrid->setSelectedIndex(0);
+    m_listGrid->scrollView().setScrollOffset(0.0f);
+  }
+
+  updateListState();
+  PanelManager::instance().refresh();
+}
+
+void ClipboardPanel::fetchTrendingGifs() {
+  if (m_tenor == nullptr) {
+    return;
+  }
+  m_isLoadingGifs = true;
+  m_tenor->featuredGifs(50, [this](std::vector<TenorMediaItem> results) {
+    m_isLoadingGifs = false;
+    if (m_tabMode == ClipboardTabMode::Gifs && m_filterQuery.empty()) {
+      m_gifResults = std::move(results);
+      if (m_listGrid != nullptr) {
+        m_listGrid->notifyDataChanged();
+        m_listGrid->setSelectedIndex(m_gifResults.empty() ? std::nullopt : std::optional<std::size_t>(0));
+      }
+      updateListState();
+      PanelManager::instance().refresh();
+    }
+  });
+}
+
+void ClipboardPanel::searchGifs(const std::string& query) {
+  if (m_tenor == nullptr) {
+    return;
+  }
+  if (query.empty()) {
+    fetchTrendingGifs();
+    return;
+  }
+  m_isLoadingGifs = true;
+  m_tenor->searchGifs(query, 50, [this, query](std::vector<TenorMediaItem> results) {
+    m_isLoadingGifs = false;
+    if (m_tabMode == ClipboardTabMode::Gifs && m_filterQuery == query) {
+      m_gifResults = std::move(results);
+      if (m_listGrid != nullptr) {
+        m_listGrid->notifyDataChanged();
+        m_listGrid->setSelectedIndex(m_gifResults.empty() ? std::nullopt : std::optional<std::size_t>(0));
+      }
+      updateListState();
+      PanelManager::instance().refresh();
+    }
+  });
+}
+
+void ClipboardPanel::searchEmojis(const std::string& query) {
+  EmojiStore::instance().loadIfNeeded();
+  m_emojiIndices = EmojiStore::instance().search(query);
+  if (m_listGrid != nullptr) {
+    m_listGrid->notifyDataChanged();
+    m_listGrid->setSelectedIndex(m_emojiIndices.empty() ? std::nullopt : std::optional<std::size_t>(0));
+  }
+  updateListState();
+  PanelManager::instance().refresh();
+}
+
 void ClipboardPanel::doLayout(Renderer& renderer, float width, float height) {
-  if (m_rootLayout == nullptr
-      || m_sidebar == nullptr
-      || m_previewCard == nullptr
-      || m_listGrid == nullptr
+  if (m_rootLayout == nullptr || m_sidebar == nullptr || m_previewCard == nullptr || m_listGrid == nullptr
       || m_previewScrollView == nullptr) {
     return;
   }
@@ -812,17 +1272,21 @@ void ClipboardPanel::doLayout(Renderer& renderer, float width, float height) {
   if (m_listAdapter != nullptr) {
     m_listAdapter->setRenderer(&renderer);
   }
-
-  const float rowHeight = listRowHeight(renderer, contentScale());
-  if (std::abs(rowHeight - m_listRowHeight) >= 0.5f) {
-    m_listRowHeight = rowHeight;
-    m_listGrid->setCellHeight(rowHeight);
+  if (m_gifAdapter != nullptr) {
+    m_gifAdapter->setRenderer(&renderer);
+  }
+  if (m_emojiAdapter != nullptr) {
+    m_emojiAdapter->setRenderer(&renderer);
   }
 
-  // Flex layout handles all sizing: sidebar title is measured automatically,
-  // listGrid fills remaining sidebar height (flexGrow), preview fills
-  // remaining root width (flexGrow), previewScroll fills remaining preview
-  // height (flexGrow). Stretch alignment propagates cross-axis sizes.
+  if (m_tabMode == ClipboardTabMode::History) {
+    const float rowHeight = listRowHeight(renderer, contentScale());
+    if (std::abs(rowHeight - m_listRowHeight) >= 0.5f) {
+      m_listRowHeight = rowHeight;
+      m_listGrid->setCellHeight(rowHeight);
+    }
+  }
+
   m_rootLayout->setSize(width, height);
   m_rootLayout->layout(renderer);
 
@@ -846,36 +1310,36 @@ void ClipboardPanel::doLayout(Renderer& renderer, float width, float height) {
 void ClipboardPanel::doUpdate(Renderer& renderer) {
   updatePreviewActions();
 
-  if (m_clipboard == nullptr || m_lastWidth <= 0.0f) {
+  if (m_lastWidth <= 0.0f) {
     return;
   }
 
-  if (m_lastChangeSerial != m_clipboard->changeSerial()) {
-    // The history moved underneath us — an IPC clear, another app's copy, a trim. A pending
-    // confirmation was armed against contents that are no longer on screen.
-    resetClearConfirmation();
-    resetDeleteConfirmation();
-    applyFilter();
-    if (m_filteredIndices.empty()) {
-      m_selectedIndex = 0;
-    } else if (m_selectedIndex >= m_filteredIndices.size()) {
-      m_selectedIndex = m_filteredIndices.size() - 1;
-    }
+  if (m_tabMode == ClipboardTabMode::History && m_clipboard != nullptr) {
+    if (m_lastChangeSerial != m_clipboard->changeSerial()) {
+      resetClearConfirmation();
+      resetDeleteConfirmation();
+      applyFilter();
+      if (m_filteredIndices.empty()) {
+        m_selectedIndex = 0;
+      } else if (m_selectedIndex >= m_filteredIndices.size()) {
+        m_selectedIndex = m_filteredIndices.size() - 1;
+      }
 
-    m_lastChangeSerial = m_clipboard->changeSerial();
-    updateListState();
-    if (m_listGrid != nullptr) {
-      m_listGrid->notifyDataChanged();
-      m_listGrid->setSelectedIndex(
-          m_filteredIndices.empty() ? std::nullopt : std::optional<std::size_t>(m_selectedIndex)
-      );
-    }
+      m_lastChangeSerial = m_clipboard->changeSerial();
+      updateListState();
+      if (m_listGrid != nullptr) {
+        m_listGrid->notifyDataChanged();
+        m_listGrid->setSelectedIndex(
+            m_filteredIndices.empty() ? std::nullopt : std::optional<std::size_t>(m_selectedIndex)
+        );
+      }
 
-    schedulePreviewPayloadRefresh(false);
-    const float previewWidth =
-        m_previewScrollView != nullptr ? m_previewScrollView->contentViewportWidth() : m_lastWidth;
-    const float previewHeight = m_previewScrollView != nullptr ? m_previewScrollView->height() : m_lastHeight;
-    rebuildPreview(renderer, previewWidth, previewHeight);
+      schedulePreviewPayloadRefresh(false);
+      const float previewWidth =
+          m_previewScrollView != nullptr ? m_previewScrollView->contentViewportWidth() : m_lastWidth;
+      const float previewHeight = m_previewScrollView != nullptr ? m_previewScrollView->height() : m_lastHeight;
+      rebuildPreview(renderer, previewWidth, previewHeight);
+    }
   }
 }
 
@@ -893,17 +1357,24 @@ void ClipboardPanel::onOpen(std::string_view /*context*/) {
   if (m_filterInput != nullptr) {
     m_filterInput->setValue("");
   }
-  applyFilter();
-  updateListState();
-  if (m_listGrid != nullptr) {
-    m_listGrid->notifyDataChanged();
-    m_listGrid->setSelectedIndex(
-        m_filteredIndices.empty() ? std::nullopt : std::optional<std::size_t>(m_selectedIndex)
-    );
-    m_listGrid->scrollView().setScrollOffset(0.0f);
+
+  if (m_tabMode == ClipboardTabMode::History) {
+    applyFilter();
+    updateListState();
+    if (m_listGrid != nullptr) {
+      m_listGrid->notifyDataChanged();
+      m_listGrid->setSelectedIndex(
+          m_filteredIndices.empty() ? std::nullopt : std::optional<std::size_t>(m_selectedIndex)
+      );
+      m_listGrid->scrollView().setScrollOffset(0.0f);
+    }
+    m_lastChangeSerial = m_clipboard != nullptr ? m_clipboard->changeSerial() : 0;
+    schedulePreviewPayloadRefresh(false);
+  } else if (m_tabMode == ClipboardTabMode::Gifs) {
+    fetchTrendingGifs();
+  } else if (m_tabMode == ClipboardTabMode::Emojis) {
+    searchEmojis("");
   }
-  m_lastChangeSerial = m_clipboard != nullptr ? m_clipboard->changeSerial() : 0;
-  schedulePreviewPayloadRefresh(false);
 }
 
 void ClipboardPanel::onClose() {
@@ -913,11 +1384,14 @@ void ClipboardPanel::onClose() {
     m_listGrid->setAdapter(nullptr);
   }
   m_listAdapter.reset();
+  m_gifAdapter.reset();
+  m_emojiAdapter.reset();
   m_rootLayout = nullptr;
   m_focusArea = nullptr;
   m_sidebar = nullptr;
   m_sidebarHeaderRow = nullptr;
   m_sidebarTitle = nullptr;
+  m_tabSegmented = nullptr;
   m_clearHistoryButton = nullptr;
   m_clearKeepPinnedButton = nullptr;
   m_clearConfirmPanel = nullptr;
@@ -939,6 +1413,7 @@ void ClipboardPanel::onClose() {
   m_previewScrollView = nullptr;
   m_previewContent = nullptr;
   m_previewImage = nullptr;
+  m_previewEmojiLabel = nullptr;
   m_previewPayloadDebounceTimer.stop();
   m_filterDebounceTimer.stop();
   m_pendingFilterQuery.clear();
@@ -984,6 +1459,15 @@ void ClipboardPanel::onPanelCardOpacityChanged(float opacity) {
 }
 
 void ClipboardPanel::schedulePreviewPayloadRefresh(bool debounced) {
+  if (m_tabMode != ClipboardTabMode::History) {
+    m_previewPayloadDebounceTimer.stop();
+    m_previewPayloadIndex = static_cast<std::size_t>(-1);
+    m_pendingPreviewPayloadIndex = static_cast<std::size_t>(-1);
+    m_lastPreviewWidth = -1.0f;
+    m_lastPreviewHeight = -1.0f;
+    return;
+  }
+
   const std::size_t historyIndex = selectedHistoryIndex();
   if (m_clipboard == nullptr || historyIndex == static_cast<std::size_t>(-1)) {
     m_previewPayloadDebounceTimer.stop();
@@ -1019,53 +1503,93 @@ void ClipboardPanel::schedulePreviewPayloadRefresh(bool debounced) {
 }
 
 void ClipboardPanel::updateListState() {
-  const auto& history = m_clipboard != nullptr ? m_clipboard->history() : std::deque<ClipboardEntry>{};
-  const bool empty = history.empty() || m_filteredIndices.empty();
-  const bool hasHistory = !history.empty();
-  const bool hasPinned = std::ranges::any_of(history, [](const ClipboardEntry& entry) { return entry.pinned; });
-  const bool hasUnpinned = std::ranges::any_of(history, [](const ClipboardEntry& entry) { return !entry.pinned; });
-  const bool showKeepPinnedChoice = hasPinned && hasUnpinned;
-  if (!hasHistory) {
-    resetClearConfirmation();
-  }
-
-  if (m_clearHistoryButton != nullptr) {
-    m_clearHistoryButton->setVisible(hasHistory);
-    m_clearHistoryButton->setParticipatesInLayout(hasHistory);
-    m_clearHistoryButton->setGlyph(m_clearConfirm ? "warning" : "trash");
-  }
-  if (m_clearConfirmPanel != nullptr) {
-    m_clearConfirmPanel->setVisible(hasHistory && m_clearConfirm);
-    m_clearConfirmPanel->setParticipatesInLayout(hasHistory && m_clearConfirm);
-  }
-  if (m_clearKeepPinnedButton != nullptr) {
-    const bool showKeepPinned = showKeepPinnedChoice && m_clearConfirm;
-    m_clearKeepPinnedButton->setVisible(showKeepPinned);
-    m_clearKeepPinnedButton->setParticipatesInLayout(showKeepPinned);
-    m_clearKeepPinnedButton->setEnabled(hasUnpinned);
-  }
-  if (m_clearConfirmDesc != nullptr) {
-    if (!hasPinned) {
-      m_clearConfirmDesc->setText(i18n::tr("clipboard.confirm.clear-desc-no-pinned"));
-    } else if (!hasUnpinned) {
-      m_clearConfirmDesc->setText(i18n::tr("clipboard.confirm.clear-desc-all-pinned"));
-    } else {
-      m_clearConfirmDesc->setText(i18n::tr("clipboard.confirm.clear-desc"));
+  if (m_tabMode == ClipboardTabMode::History) {
+    const auto& history = m_clipboard != nullptr ? m_clipboard->history() : std::deque<ClipboardEntry>{};
+    const bool empty = history.empty() || m_filteredIndices.empty();
+    const bool hasHistory = !history.empty();
+    const bool hasPinned = std::ranges::any_of(history, [](const ClipboardEntry& entry) { return entry.pinned; });
+    const bool hasUnpinned = std::ranges::any_of(history, [](const ClipboardEntry& entry) { return !entry.pinned; });
+    const bool showKeepPinnedChoice = hasPinned && hasUnpinned;
+    if (!hasHistory) {
+      resetClearConfirmation();
     }
-  }
 
-  if (m_listEmptyLabel != nullptr) {
-    m_listEmptyLabel->setText(
-        history.empty()             ? i18n::tr("clipboard.empty.history-title")
-            : m_filterQuery.empty() ? i18n::tr("clipboard.empty.history-title")
-                                    : i18n::tr("clipboard.empty.no-matches-title")
-    );
-    m_listEmptyLabel->setVisible(empty);
-    m_listEmptyLabel->setParticipatesInLayout(empty);
-  }
-  if (m_listGrid != nullptr) {
-    m_listGrid->setVisible(!empty);
-    m_listGrid->setParticipatesInLayout(!empty);
+    if (m_clearHistoryButton != nullptr) {
+      m_clearHistoryButton->setVisible(hasHistory);
+      m_clearHistoryButton->setParticipatesInLayout(hasHistory);
+      m_clearHistoryButton->setGlyph(m_clearConfirm ? "warning" : "trash");
+    }
+    if (m_clearConfirmPanel != nullptr) {
+      m_clearConfirmPanel->setVisible(hasHistory && m_clearConfirm);
+      m_clearConfirmPanel->setParticipatesInLayout(hasHistory && m_clearConfirm);
+    }
+    if (m_clearKeepPinnedButton != nullptr) {
+      const bool showKeepPinned = showKeepPinnedChoice && m_clearConfirm;
+      m_clearKeepPinnedButton->setVisible(showKeepPinned);
+      m_clearKeepPinnedButton->setParticipatesInLayout(showKeepPinned);
+      m_clearKeepPinnedButton->setEnabled(hasUnpinned);
+    }
+    if (m_clearConfirmDesc != nullptr) {
+      if (!hasPinned) {
+        m_clearConfirmDesc->setText(i18n::tr("clipboard.confirm.clear-desc-no-pinned"));
+      } else if (!hasUnpinned) {
+        m_clearConfirmDesc->setText(i18n::tr("clipboard.confirm.clear-desc-all-pinned"));
+      } else {
+        m_clearConfirmDesc->setText(i18n::tr("clipboard.confirm.clear-desc"));
+      }
+    }
+
+    if (m_listEmptyLabel != nullptr) {
+      m_listEmptyLabel->setText(
+          history.empty()             ? i18n::tr("clipboard.empty.history-title")
+              : m_filterQuery.empty() ? i18n::tr("clipboard.empty.history-title")
+                                      : i18n::tr("clipboard.empty.no-matches-title")
+      );
+      m_listEmptyLabel->setVisible(empty);
+      m_listEmptyLabel->setParticipatesInLayout(empty);
+    }
+    if (m_listGrid != nullptr) {
+      m_listGrid->setVisible(!empty);
+      m_listGrid->setParticipatesInLayout(!empty);
+    }
+  } else if (m_tabMode == ClipboardTabMode::Gifs) {
+    const bool empty = m_gifResults.empty();
+    if (m_clearHistoryButton != nullptr) {
+      m_clearHistoryButton->setVisible(false);
+      m_clearHistoryButton->setParticipatesInLayout(false);
+    }
+    if (m_clearConfirmPanel != nullptr) {
+      m_clearConfirmPanel->setVisible(false);
+      m_clearConfirmPanel->setParticipatesInLayout(false);
+    }
+    if (m_listEmptyLabel != nullptr) {
+      m_listEmptyLabel->setText(m_isLoadingGifs ? "Loading Tenor GIFs..." : "No GIFs found");
+      m_listEmptyLabel->setVisible(empty);
+      m_listEmptyLabel->setParticipatesInLayout(empty);
+    }
+    if (m_listGrid != nullptr) {
+      m_listGrid->setVisible(!empty);
+      m_listGrid->setParticipatesInLayout(!empty);
+    }
+  } else if (m_tabMode == ClipboardTabMode::Emojis) {
+    const bool empty = m_emojiIndices.empty();
+    if (m_clearHistoryButton != nullptr) {
+      m_clearHistoryButton->setVisible(false);
+      m_clearHistoryButton->setParticipatesInLayout(false);
+    }
+    if (m_clearConfirmPanel != nullptr) {
+      m_clearConfirmPanel->setVisible(false);
+      m_clearConfirmPanel->setParticipatesInLayout(false);
+    }
+    if (m_listEmptyLabel != nullptr) {
+      m_listEmptyLabel->setText("No emojis found");
+      m_listEmptyLabel->setVisible(empty);
+      m_listEmptyLabel->setParticipatesInLayout(empty);
+    }
+    if (m_listGrid != nullptr) {
+      m_listGrid->setVisible(!empty);
+      m_listGrid->setParticipatesInLayout(!empty);
+    }
   }
 }
 
@@ -1075,18 +1599,24 @@ void ClipboardPanel::updatePreviewActions() {
   bool pinned = false;
   bool deleteConfirmActive = false;
 
-  if (m_clipboard != nullptr) {
-    const std::size_t historyIndex = selectedHistoryIndex();
-    const auto& history = m_clipboard->history();
-    if (historyIndex != static_cast<std::size_t>(-1) && historyIndex < history.size()) {
-      hasSelection = true;
-      pinned = history[historyIndex].pinned;
-      deleteConfirmActive =
-          !m_deleteConfirmStorageId.empty() && m_deleteConfirmStorageId == history[historyIndex].storageId;
-      showImageAction = m_config != nullptr
-          && !StringUtils::trim(m_config->config().shell.clipboardImageActionCommand).empty()
-          && history[historyIndex].isImage();
+  if (m_tabMode == ClipboardTabMode::History) {
+    if (m_clipboard != nullptr) {
+      const std::size_t historyIndex = selectedHistoryIndex();
+      const auto& history = m_clipboard->history();
+      if (historyIndex != static_cast<std::size_t>(-1) && historyIndex < history.size()) {
+        hasSelection = true;
+        pinned = history[historyIndex].pinned;
+        deleteConfirmActive =
+            !m_deleteConfirmStorageId.empty() && m_deleteConfirmStorageId == history[historyIndex].storageId;
+        showImageAction = m_config != nullptr
+            && !StringUtils::trim(m_config->config().shell.clipboardImageActionCommand).empty()
+            && history[historyIndex].isImage();
+      }
     }
+  } else if (m_tabMode == ClipboardTabMode::Gifs) {
+    hasSelection = !m_gifResults.empty() && m_selectedIndex < m_gifResults.size();
+  } else if (m_tabMode == ClipboardTabMode::Emojis) {
+    hasSelection = !m_emojiIndices.empty() && m_selectedIndex < m_emojiIndices.size();
   }
 
   if (m_copyButton != nullptr) {
@@ -1095,13 +1625,15 @@ void ClipboardPanel::updatePreviewActions() {
   }
 
   if (m_deleteEntryButton != nullptr) {
-    m_deleteEntryButton->setVisible(hasSelection);
-    m_deleteEntryButton->setParticipatesInLayout(hasSelection);
+    const bool showDelete = (m_tabMode == ClipboardTabMode::History) && hasSelection;
+    m_deleteEntryButton->setVisible(showDelete);
+    m_deleteEntryButton->setParticipatesInLayout(showDelete);
     m_deleteEntryButton->setGlyph(deleteConfirmActive ? "warning" : "trash");
   }
   if (m_deleteConfirmPanel != nullptr) {
-    m_deleteConfirmPanel->setVisible(hasSelection && deleteConfirmActive);
-    m_deleteConfirmPanel->setParticipatesInLayout(hasSelection && deleteConfirmActive);
+    const bool showDeleteConfirm = (m_tabMode == ClipboardTabMode::History) && hasSelection && deleteConfirmActive;
+    m_deleteConfirmPanel->setVisible(showDeleteConfirm);
+    m_deleteConfirmPanel->setParticipatesInLayout(showDeleteConfirm);
   }
 
   if (m_imageActionButton != nullptr) {
@@ -1110,8 +1642,9 @@ void ClipboardPanel::updatePreviewActions() {
   }
 
   if (m_pinButton != nullptr) {
-    m_pinButton->setVisible(hasSelection);
-    m_pinButton->setParticipatesInLayout(hasSelection);
+    const bool showPin = (m_tabMode == ClipboardTabMode::History) && hasSelection;
+    m_pinButton->setVisible(showPin);
+    m_pinButton->setParticipatesInLayout(showPin);
     m_pinButton->setGlyph(pinned ? "unpin" : "pin");
     m_pinButton->setVariant(pinned ? ButtonVariant::Primary : ButtonVariant::Default);
   }
@@ -1129,6 +1662,116 @@ void ClipboardPanel::rebuildPreview(Renderer& renderer, float width, float heigh
     m_previewContent->removeChild(m_previewContent->children().front().get());
   }
   m_previewImage = nullptr;
+  m_previewEmojiLabel = nullptr;
+
+  if (m_tabMode == ClipboardTabMode::Gifs) {
+    if (m_gifResults.empty() || m_selectedIndex >= m_gifResults.size()) {
+      m_previewTitle->setText("Tenor GIFs");
+      m_previewMeta->setText(m_isLoadingGifs ? "Loading..." : "No selection");
+      return;
+    }
+
+    const auto& item = m_gifResults[m_selectedIndex];
+    m_previewTitle->setText(item.title.empty() ? "GIF" : item.title);
+    m_previewTitle->setMaxWidth(width);
+    m_previewMeta->setText(
+        std::to_string(static_cast<int>(item.width)) + "x" + std::to_string(static_cast<int>(item.height))
+        + " • Tenor GIF"
+    );
+    m_previewMeta->setMaxWidth(width);
+
+    const float scale = contentScale();
+    const float imageHeight =
+        std::min(kPreviewImageHeight * scale, std::max(180.0f * scale, height - Style::spaceMd * scale));
+    auto image = ui::image({
+        .fit = ImageFit::Contain,
+        .width = width,
+        .height = imageHeight,
+    });
+    const int previewTargetSize = static_cast<int>(std::ceil(std::max(width, imageHeight)));
+    image->setAsyncReadyCallback([]() { PanelManager::instance().refresh(); });
+
+    if (m_tenor != nullptr && !item.previewUrl.empty()) {
+      const auto path = m_tenor->localPathForUrl(item.previewUrl);
+      std::error_code ec;
+      if (std::filesystem::exists(path, ec) && std::filesystem::file_size(path, ec) > 0) {
+        (void)image->setSourceFileAsync(renderer, *m_asyncTextures, path.string(), previewTargetSize);
+      } else {
+        m_tenor->ensureLocalPreview(
+            const_cast<TenorMediaItem&>(item),
+            [this, &renderer, previewTargetSize](std::optional<std::filesystem::path> p) {
+              if (p.has_value() && m_previewImage != nullptr) {
+                (void)m_previewImage->setSourceFileAsync(renderer, *m_asyncTextures, p->string(), previewTargetSize);
+                PanelManager::instance().refresh();
+              }
+            }
+        );
+      }
+    }
+    m_previewImage = image.get();
+    m_previewContent->addChild(std::move(image));
+
+    m_previewContent->layout(renderer);
+    m_lastPreviewWidth = width;
+    m_lastPreviewHeight = height;
+    return;
+  }
+
+  if (m_tabMode == ClipboardTabMode::Emojis) {
+    if (m_emojiIndices.empty() || m_selectedIndex >= m_emojiIndices.size()) {
+      m_previewTitle->setText("Emojis");
+      m_previewMeta->setText("No selection");
+      return;
+    }
+
+    const auto* item = EmojiStore::instance().get(m_emojiIndices[m_selectedIndex]);
+    if (item == nullptr) {
+      return;
+    }
+
+    m_previewTitle->setText(item->name);
+    m_previewTitle->setMaxWidth(width);
+    m_previewMeta->setText("Category: " + item->category);
+    m_previewMeta->setMaxWidth(width);
+
+    const float scale = contentScale();
+    auto emojiBox = ui::box({
+        .fill = colorSpecFromRole(ColorRole::SurfaceVariant, panelCardOpacity()),
+        .radius = Style::scaledRadiusMd(scale),
+        .width = width,
+        .height = 140.0f * scale,
+    });
+
+    auto emojiLabel = ui::label({
+        .text = item->emoji,
+        .fontSize = 64.0f * scale,
+        .baselineMode = LabelBaselineMode::TextFixedHeight,
+    });
+    emojiLabel->setPosition(std::max(0.0f, (width - 64.0f * scale) * 0.5f), std::max(0.0f, (140.0f * scale - 64.0f * scale) * 0.5f));
+    emojiBox->addChild(std::move(emojiLabel));
+    m_previewContent->addChild(std::move(emojiBox));
+
+    if (!item->keywords.empty()) {
+      std::string kwString = "Keywords: ";
+      for (std::size_t i = 0; i < item->keywords.size(); ++i) {
+        if (i > 0) kwString += ", ";
+        kwString += item->keywords[i];
+      }
+      m_previewContent->addChild(
+          ui::label({
+              .text = kwString,
+              .fontSize = Style::fontSizeCaption * scale,
+              .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
+              .maxWidth = width,
+          })
+      );
+    }
+
+    m_previewContent->layout(renderer);
+    m_lastPreviewWidth = width;
+    m_lastPreviewHeight = height;
+    return;
+  }
 
   const auto& history = m_clipboard != nullptr ? m_clipboard->history() : std::deque<ClipboardEntry>{};
   const std::size_t historyIndex = selectedHistoryIndex();
@@ -1168,8 +1811,7 @@ void ClipboardPanel::rebuildPreview(Renderer& renderer, float width, float heigh
     return;
   }
 
-  if (m_clipboard != nullptr
-      && m_previewPayloadIndex != static_cast<std::size_t>(-1)
+  if (m_clipboard != nullptr && m_previewPayloadIndex != static_cast<std::size_t>(-1)
       && m_previewPayloadIndex != historyIndex) {
     m_clipboard->evictEntryPayload(m_previewPayloadIndex);
   }
@@ -1221,10 +1863,6 @@ void ClipboardPanel::rebuildPreview(Renderer& renderer, float width, float heigh
       text.resize(kMaxPreviewChars);
     }
 
-    // Expand tabs to 4 spaces once up front; Pango's natural wrapping then
-    // handles everything else — newlines become paragraph breaks, each
-    // paragraph's leading whitespace stays on its first line, continuations
-    // have no indent, and the whole layout ellipsizes at kMaxPreviewLines.
     std::string expanded;
     expanded.reserve(text.size());
     for (char ch : text) {
@@ -1283,7 +1921,6 @@ void ClipboardPanel::applyFilter() {
   }
   const auto& history = m_clipboard->history();
 
-  // Case-insensitive substring match on the entry title.
   std::string needle;
   needle.reserve(m_filterQuery.size());
   for (char ch : m_filterQuery) {
@@ -1312,32 +1949,41 @@ void ClipboardPanel::onFilterChanged(const std::string& text) {
   }
   m_pendingFilterQuery = text;
 
-  auto commit = [this]() {
+  if (m_tabMode == ClipboardTabMode::Emojis) {
+    m_filterQuery = text;
+    searchEmojis(text);
+    return;
+  }
+
+  const auto interval = (m_tabMode == ClipboardTabMode::Gifs) ? kGifSearchDebounceInterval : kFilterDebounceInterval;
+
+  m_filterDebounceTimer.start(interval, [this]() {
     if (m_pendingFilterQuery == m_filterQuery) {
       return;
     }
     m_filterQuery = m_pendingFilterQuery;
-    applyFilter();
     m_selectedIndex = 0;
-    updateListState();
-    if (m_listGrid != nullptr) {
-      m_listGrid->notifyDataChanged();
-      m_listGrid->setSelectedIndex(
-          m_filteredIndices.empty() ? std::nullopt : std::optional<std::size_t>(m_selectedIndex)
-      );
+
+    if (m_tabMode == ClipboardTabMode::History) {
+      applyFilter();
+      updateListState();
+      if (m_listGrid != nullptr) {
+        m_listGrid->notifyDataChanged();
+        m_listGrid->setSelectedIndex(
+            m_filteredIndices.empty() ? std::nullopt : std::optional<std::size_t>(m_selectedIndex)
+        );
+      }
+      schedulePreviewPayloadRefresh(true);
+    } else if (m_tabMode == ClipboardTabMode::Gifs) {
+      searchGifs(m_filterQuery);
     }
-    schedulePreviewPayloadRefresh(true);
+
     m_pendingScrollToSelected = true;
     PanelManager::instance().refresh();
-  };
-
-  m_filterDebounceTimer.start(kFilterDebounceInterval, commit);
+  });
 }
 
 void ClipboardPanel::selectIndex(std::size_t index) {
-  if (m_clipboard == nullptr || index >= m_filteredIndices.size()) {
-    return;
-  }
   if (m_selectedIndex == index) {
     return;
   }
@@ -1346,13 +1992,20 @@ void ClipboardPanel::selectIndex(std::size_t index) {
   if (m_listGrid != nullptr) {
     m_listGrid->setSelectedIndex(index);
   }
-  schedulePreviewPayloadRefresh(true);
+
+  if (m_tabMode == ClipboardTabMode::History) {
+    schedulePreviewPayloadRefresh(true);
+  } else {
+    m_lastPreviewWidth = -1.0f;
+    m_lastPreviewHeight = -1.0f;
+  }
+
   m_pendingScrollToSelected = true;
   PanelManager::instance().refresh();
 }
 
 void ClipboardPanel::requestDeleteSelectedEntry() {
-  if (m_clipboard == nullptr) {
+  if (m_tabMode != ClipboardTabMode::History || m_clipboard == nullptr) {
     return;
   }
   const std::size_t historyIndex = selectedHistoryIndex();
@@ -1463,7 +2116,7 @@ void ClipboardPanel::selectByStorageId(std::string storageId) {
 }
 
 void ClipboardPanel::togglePinSelected() {
-  if (m_clipboard == nullptr) {
+  if (m_tabMode != ClipboardTabMode::History || m_clipboard == nullptr) {
     return;
   }
   const std::size_t historyIndex = selectedHistoryIndex();
@@ -1481,16 +2134,13 @@ void ClipboardPanel::togglePinSelected() {
     return;
   }
 
-  // The toggled entry moved within the deque; keep it selected by locating it
-  // again via its stable storage id.
   selectByStorageId(storageId);
-
   m_pendingScrollToSelected = true;
   PanelManager::instance().refresh();
 }
 
 void ClipboardPanel::requestClearUnpinnedHistory() {
-  if (m_clipboard == nullptr) {
+  if (m_tabMode != ClipboardTabMode::History || m_clipboard == nullptr) {
     return;
   }
 
@@ -1588,7 +2238,7 @@ void ClipboardPanel::resetDeleteConfirmation() { m_deleteConfirmStorageId.clear(
 void ClipboardPanel::resetClearConfirmation() { m_clearConfirm = false; }
 
 void ClipboardPanel::runImageAction() {
-  if (m_clipboard == nullptr || m_config == nullptr) {
+  if (m_tabMode != ClipboardTabMode::History || m_clipboard == nullptr || m_config == nullptr) {
     return;
   }
 
@@ -1622,40 +2272,100 @@ void ClipboardPanel::runImageAction() {
 }
 
 void ClipboardPanel::activateSelected() {
-  if (m_clipboard == nullptr) {
-    return;
-  }
-  const std::size_t historyIndex = selectedHistoryIndex();
-  if (historyIndex == static_cast<std::size_t>(-1)) {
-    return;
-  }
-  if (!m_clipboard->ensureEntryLoaded(historyIndex)) {
-    return;
-  }
-  const ClipboardEntry entry = m_clipboard->history()[historyIndex];
-  // Pinned entries already sit at the top; don't reorder them or jump the
-  // selection back to the front when they are actioned — just copy.
-  const bool wasPinned = entry.pinned;
-  const bool promoted = wasPinned ? false : m_clipboard->promoteEntry(historyIndex);
-  const bool copied = m_clipboard->copyEntry(entry);
-  if (copied || promoted) {
-    if (!wasPinned) {
-      selectByStorageId(entry.storageId);
+  if (m_tabMode == ClipboardTabMode::History) {
+    if (m_clipboard == nullptr) {
+      return;
     }
-    PanelManager::instance().refresh();
-    if (m_activateCallback) {
-      m_activateCallback(entry);
+    const std::size_t historyIndex = selectedHistoryIndex();
+    if (historyIndex == static_cast<std::size_t>(-1)) {
+      return;
+    }
+    if (!m_clipboard->ensureEntryLoaded(historyIndex)) {
+      return;
+    }
+    const ClipboardEntry entry = m_clipboard->history()[historyIndex];
+    const bool wasPinned = entry.pinned;
+    const bool promoted = wasPinned ? false : m_clipboard->promoteEntry(historyIndex);
+    const bool copied = m_clipboard->copyEntry(entry);
+    if (copied || promoted) {
+      if (!wasPinned) {
+        selectByStorageId(entry.storageId);
+      }
+      PanelManager::instance().refresh();
+      if (m_activateCallback) {
+        m_activateCallback(entry);
+      }
+    }
+    return;
+  }
+
+  if (m_tabMode == ClipboardTabMode::Gifs) {
+    if (m_gifResults.empty() || m_selectedIndex >= m_gifResults.size() || m_clipboard == nullptr) {
+      return;
+    }
+    const auto item = m_gifResults[m_selectedIndex];
+    if (m_tenor != nullptr) {
+      m_tenor->fetchMediaBytes(item.fullUrl, [this, item](std::vector<std::uint8_t> bytes) {
+        if (!bytes.empty() && m_clipboard != nullptr) {
+          m_clipboard->copyImageGif(std::move(bytes));
+          ClipboardEntry entry;
+          entry.dataMimeType = "image/gif";
+          entry.textPreview = item.title;
+          PanelManager::instance().refresh();
+          if (m_activateCallback) {
+            m_activateCallback(entry);
+          } else {
+            PanelManager::instance().closePanel(false);
+          }
+        }
+      });
+    }
+    return;
+  }
+
+  if (m_tabMode == ClipboardTabMode::Emojis) {
+    if (m_emojiIndices.empty() || m_selectedIndex >= m_emojiIndices.size() || m_clipboard == nullptr) {
+      return;
+    }
+    const auto* item = EmojiStore::instance().get(m_emojiIndices[m_selectedIndex]);
+    if (item != nullptr && m_clipboard != nullptr) {
+      m_clipboard->copyText(item->emoji);
+      ClipboardEntry entry;
+      entry.dataMimeType = "text/plain";
+      entry.textPreview = item->emoji;
+      PanelManager::instance().refresh();
+      if (m_activateCallback) {
+        m_activateCallback(entry);
+      } else {
+        PanelManager::instance().closePanel(false);
+      }
     }
   }
 }
 
 bool ClipboardPanel::handleKeyEvent(std::uint32_t sym, std::uint32_t modifiers) {
-  if (m_clipboard == nullptr || m_filteredIndices.empty()) {
+  // Tab / Shift+Tab cycles between modes
+  if (KeySymbol::isTab(sym)) {
+    const auto current = static_cast<int>(m_tabMode);
+    const bool isShift = (modifiers & KeyMod::Shift) != 0 || (sym == XKB_KEY_ISO_Left_Tab);
+    const auto next = isShift ? (current + 2) % 3 : (current + 1) % 3;
+    if (m_tabSegmented != nullptr) {
+      m_tabSegmented->setSelectedIndex(static_cast<std::size_t>(next));
+    }
+    setTabMode(static_cast<ClipboardTabMode>(next));
+    return true;
+  }
+
+  const std::size_t totalItems = (m_tabMode == ClipboardTabMode::History)  ? m_filteredIndices.size()
+      : (m_tabMode == ClipboardTabMode::Gifs)                              ? m_gifResults.size()
+                                                                           : m_emojiIndices.size();
+
+  if (totalItems == 0) {
     return false;
   }
 
-  const auto moveSelection = [this](int delta) {
-    const int last = static_cast<int>(m_filteredIndices.size() - 1);
+  const auto moveSelection = [this, totalItems](int delta) {
+    const int last = static_cast<int>(totalItems - 1);
     const int next = std::clamp(static_cast<int>(m_selectedIndex) + delta, 0, last);
     selectIndex(static_cast<std::size_t>(next));
   };
@@ -1672,14 +2382,27 @@ bool ClipboardPanel::handleKeyEvent(std::uint32_t sym, std::uint32_t modifiers) 
     return true;
   }
 
+  const int cols = m_listGrid != nullptr ? std::max(1, static_cast<int>(m_listGrid->layoutColumnCount())) : 1;
+
   if (KeybindMatcher::matches(KeybindAction::Up, sym, modifiers)) {
-    moveSelection(-1);
+    moveSelection(-cols);
     return true;
   }
 
   if (KeybindMatcher::matches(KeybindAction::Down, sym, modifiers)) {
-    moveSelection(1);
+    moveSelection(cols);
     return true;
+  }
+
+  if (cols > 1) {
+    if (KeybindMatcher::matches(KeybindAction::Left, sym, modifiers)) {
+      moveSelection(-1);
+      return true;
+    }
+    if (KeybindMatcher::matches(KeybindAction::Right, sym, modifiers)) {
+      moveSelection(1);
+      return true;
+    }
   }
 
   if (KeybindMatcher::matches(KeybindAction::Validate, sym, modifiers)) {
@@ -1687,7 +2410,7 @@ bool ClipboardPanel::handleKeyEvent(std::uint32_t sym, std::uint32_t modifiers) 
     return true;
   }
 
-  if (KeybindMatcher::matches(KeybindAction::Delete, sym, modifiers)) {
+  if (m_tabMode == ClipboardTabMode::History && KeybindMatcher::matches(KeybindAction::Delete, sym, modifiers)) {
     const std::size_t historyIndex = selectedHistoryIndex();
     const auto& history = m_clipboard->history();
     if (historyIndex < history.size() && m_deleteConfirmStorageId == history[historyIndex].storageId) {
@@ -1702,7 +2425,11 @@ bool ClipboardPanel::handleKeyEvent(std::uint32_t sym, std::uint32_t modifiers) 
 }
 
 void ClipboardPanel::scrollToSelected() {
-  if (m_listGrid == nullptr || m_selectedIndex >= m_filteredIndices.size()) {
+  const std::size_t totalItems = (m_tabMode == ClipboardTabMode::History)  ? m_filteredIndices.size()
+      : (m_tabMode == ClipboardTabMode::Gifs)                              ? m_gifResults.size()
+                                                                           : m_emojiIndices.size();
+
+  if (m_listGrid == nullptr || m_selectedIndex >= totalItems) {
     return;
   }
   m_listGrid->scrollToIndex(m_selectedIndex);
