@@ -1,7 +1,8 @@
 #include "config/config_service.h"
 #include "core/deferred_call.h"
+#include "core/toml.h"
 #include "scripting/plugin_manager.h"
-#include "scripting/plugin_registry.h"
+#include "scripting/plugin_script_watcher.h"
 #include "scripting/plugin_service_host.h"
 #include "scripting/plugin_state_store.h"
 #include "scripting/script_api_context.h"
@@ -10,7 +11,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -244,6 +244,191 @@ int main() {
   ::setenv("NOCTALIA_CONFIG_HOME", (root / "config").c_str(), 1);
   ::setenv("NOCTALIA_STATE_HOME", (root / "state").c_str(), 1);
   ::setenv("NOCTALIA_DATA_HOME", (root / "data").c_str(), 1);
+  const auto modulePluginDir = root / "module-plugin";
+  ok = expect(
+           writeText(modulePluginDir / "main.luau", "return true\n")
+               && writeText(modulePluginDir / "modules/value.luau", "return 42\n")
+               && writeText(modulePluginDir / "sibling.luau", "return 'plugin-root'\n")
+               && writeText(modulePluginDir / "modules/sibling.luau", "return 'module-dir'\n")
+               && writeText(
+                   modulePluginDir / "modules/counter.luau",
+                   "moduleRuns = (moduleRuns or 0) + 1\n"
+                   "local value = require('./value.luau')\n"
+                   "local M = { runs = moduleRuns, value = value, ownG = _G }\n"
+                   "function M.deferredSibling()\n"
+                   "  return require('./sibling.luau')\n"
+                   "end\n"
+                   "return M\n"
+               )
+               && writeText(modulePluginDir / "modules/lazy.luau", "return 'lazy'\n")
+               && writeText(modulePluginDir / "modules/cycle_a.luau", "return require('./cycle_b.luau')\n")
+               && writeText(modulePluginDir / "modules/cycle_b.luau", "return require('./cycle_a.luau')\n"),
+           "failed to create require test modules"
+       )
+      && ok;
+
+  // The runtime reports canonical paths; compare against the same form so a
+  // symlinked temp dir does not fail the expectations below.
+  std::error_code moduleDirEc;
+  const auto canonicalModuleDir = std::filesystem::canonical(modulePluginDir, moduleDirEc);
+  ok = expect(!moduleDirEc, "failed to canonicalize the module fixture directory") && ok;
+
+  {
+    std::vector<std::filesystem::path> modulePaths;
+    scripting::ScriptRuntime runtime("test/require:service", {}, api, modulePluginDir);
+    const auto subscription = runtime.subscribe([&](const scripting::ScriptResult& result) {
+      if (result.modulePathsKnown) {
+        modulePaths = result.modulePaths;
+      }
+    });
+    runtime.start(
+        (modulePluginDir / "main.luau").string(),
+        "local first = require('./modules/counter.luau')\n"
+        // Same file by a non-normalized spelling: one cache slot, one dependency.
+        "local second = require('./modules/../modules/counter.luau')\n"
+        "noctalia.state.set('value', first.value)\n"
+        "noctalia.state.set('cached', first == second and first.runs == 1)\n"
+        "noctalia.state.set('globals_isolated', moduleGlobal == nil and moduleRuns == nil)\n"
+        "noctalia.state.set('own_globals', first.ownG ~= _G)\n"
+        // Resolves against the module's own directory even though it runs from here.
+        "noctalia.state.set('deferred_base', first.deferredSibling())\n",
+        {}
+    );
+    ok = expect(
+             drainUntil([&] { return waitForState("test/require", "deferred_base") && modulePaths.size() == 3; }),
+             "required modules did not finish loading"
+         )
+        && ok;
+    ok = expect(
+             scripting::PluginStateStore::instance().get("test/require", "value") == "42"
+                 && scripting::PluginStateStore::instance().get("test/require", "cached") == "true",
+             "require did not resolve relatively or cache by canonical path"
+         )
+        && ok;
+    ok = expect(
+             scripting::PluginStateStore::instance().get("test/require", "globals_isolated") == "true"
+                 && scripting::PluginStateStore::instance().get("test/require", "own_globals") == "true",
+             "a module shared globals with the entry"
+         )
+        && ok;
+    ok = expect(
+             scripting::PluginStateStore::instance().get("test/require", "deferred_base") == R"("module-dir")",
+             "a deferred require resolved against the entry instead of its own module directory"
+         )
+        && ok;
+    ok = expect(
+             std::ranges::contains(modulePaths, canonicalModuleDir / "modules/counter.luau")
+                 && std::ranges::contains(modulePaths, canonicalModuleDir / "modules/value.luau")
+                 && std::ranges::contains(modulePaths, canonicalModuleDir / "modules/sibling.luau"),
+             "require did not report its module dependencies"
+         )
+        && ok;
+    runtime.unsubscribe(subscription);
+  }
+
+  {
+    // A module first required inside a callback still joins the watched set.
+    std::vector<std::filesystem::path> modulePaths;
+    bool publishedEmptySet = false;
+    scripting::ScriptRuntime runtime("test/require-lazy:service", {}, api, modulePluginDir);
+    const auto subscription = runtime.subscribe([&](const scripting::ScriptResult& result) {
+      if (result.modulePathsKnown) {
+        publishedEmptySet = publishedEmptySet || result.modulePaths.empty();
+        modulePaths = result.modulePaths;
+      }
+    });
+    runtime.start(
+        (modulePluginDir / "lazy-main.luau").string(),
+        "function onIpc()\n"
+        "  noctalia.state.set('lazy', require('./modules/lazy.luau'))\n"
+        "end\n",
+        {}
+    );
+    ok = expect(drainUntil([&] { return publishedEmptySet; }), "a module-free load did not publish an empty set") && ok;
+    (void)runtime.enqueueCall("onIpc", {});
+    ok = expect(
+             drainUntil([&] {
+               return modulePaths.size() == 1 && modulePaths.front() == canonicalModuleDir / "modules/lazy.luau";
+             }),
+             "a module required inside a callback was never reported as a dependency"
+         )
+        && ok;
+    runtime.unsubscribe(subscription);
+  }
+
+  {
+    // A require that fails must not be cached, reported, or watched.
+    std::vector<std::filesystem::path> modulePaths;
+    bool sawResult = false;
+    scripting::ScriptRuntime runtime("test/require-missing:service", {}, api, modulePluginDir);
+    const auto subscription = runtime.subscribe([&](const scripting::ScriptResult& result) {
+      sawResult = true;
+      if (result.modulePathsKnown) {
+        modulePaths = result.modulePaths;
+      }
+    });
+    runtime.start(
+        (modulePluginDir / "missing-main.luau").string(),
+        "local ok, err = pcall(function() require('./modules/absent.luau') end)\n"
+        "noctalia.state.set('missing_failed', ok == false)\n"
+        "noctalia.state.set('missing_message', string.find(err, 'cannot open') ~= nil)\n"
+        "local ok2, err2 = pcall(function() require('modules/value.luau') end)\n"
+        "noctalia.state.set('shape_message', string.find(err2, 'must be relative') ~= nil)\n",
+        {}
+    );
+    ok = expect(
+             drainUntil([&] { return sawResult && waitForState("test/require-missing", "shape_message"); }),
+             "the failing-require script did not finish"
+         )
+        && ok;
+    ok = expect(
+             scripting::PluginStateStore::instance().get("test/require-missing", "missing_failed") == "true"
+                 && scripting::PluginStateStore::instance().get("test/require-missing", "missing_message") == "true"
+                 && scripting::PluginStateStore::instance().get("test/require-missing", "shape_message") == "true",
+             "a bad require did not report a usable error"
+         )
+        && ok;
+    ok = expect(modulePaths.empty(), "a module that failed to load entered the watched dependency set") && ok;
+    runtime.unsubscribe(subscription);
+  }
+
+  {
+    std::string cycleError;
+    scripting::ScriptRuntime runtime("test/require-cycle:service", {}, api, modulePluginDir);
+    const auto subscription = runtime.subscribe([&](const scripting::ScriptResult& result) {
+      if (!result.ok) {
+        cycleError = result.error;
+      }
+    });
+    runtime.start((modulePluginDir / "cycle-main.luau").string(), "require('./modules/cycle_a.luau')\n", {});
+    ok = expect(
+             drainUntil([&] { return cycleError.contains("circular require"); }),
+             "a circular require did not surface its import chain to subscribers"
+         )
+        && ok;
+    ok = expect(
+             cycleError.contains("cycle_a.luau") && cycleError.contains("cycle_b.luau"),
+             "the circular require chain did not name both modules"
+         )
+        && ok;
+    runtime.unsubscribe(subscription);
+  }
+
+  {
+    FileWatcher watcher;
+    scripting::PluginScriptWatcher scriptWatcher;
+    int reloads = 0;
+    scriptWatcher.start(&watcher, modulePluginDir / "main.luau", [&] { ++reloads; });
+    const std::vector<std::filesystem::path> modulePaths{modulePluginDir / "modules/value.luau"};
+    scriptWatcher.setModulePaths(modulePaths);
+    ok = expect(writeText(modulePaths.front(), "return 43\n"), "failed to modify watched module") && ok;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (reloads == 0 && std::chrono::steady_clock::now() < deadline) {
+      watcher.dispatch();
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ok = expect(reloads == 1, "editing a required module did not trigger script reload") && ok;
+  }
 
   struct SoundLoadRequest {
     std::uint64_t ownerId = 0;
@@ -522,7 +707,7 @@ int main() {
                root / "path-plugins/plugin/plugin.toml",
                "id = \"test/plugin\"\n"
                "name = \"Lifecycle test\"\n"
-               "version = \"1\"\n"
+               "version = \"1.0.0\"\n"
                "plugin_api = 17\n"
            ),
            "failed to create local plugin fixture"
@@ -533,7 +718,7 @@ int main() {
                root / "path-plugins/api16/plugin.toml",
                "id = \"test/api16\"\n"
                "name = \"API 16 service\"\n"
-               "version = \"1\"\n"
+               "version = \"1.0.0\"\n"
                "plugin_api = 16\n"
                "[[service]]\n"
                "id = \"service\"\n"
@@ -550,7 +735,7 @@ int main() {
                    root / "path-plugins/api17/plugin.toml",
                    "id = \"test/api17\"\n"
                    "name = \"API 17 service\"\n"
-                   "version = \"1\"\n"
+                   "version = \"1.0.0\"\n"
                    "plugin_api = 17\n"
                    "[[service]]\n"
                    "id = \"service\"\n"
@@ -577,6 +762,11 @@ int main() {
     );
     scripting::PluginManager manager(config);
     manager.refresh();
+    // The plugin store reads install state straight off disk, so a plugin whose files
+    // never landed must not report as materialized.
+    ok = expect(manager.isMaterialized("test/plugin"), "path-source plugin on disk should report materialized") && ok;
+    ok = expect(!manager.isMaterialized("test/absent"), "missing plugin should not report materialized") && ok;
+    ok = expect(!manager.isMaterialized("not-an-id"), "invalid plugin id should not report materialized") && ok;
     config.addReloadCallback([&]() { manager.refresh(); });
     scripting::PluginServiceHost host(api, nullptr, nullptr, nullptr);
     host.start(config.config().plugins.pluginSettings);
@@ -703,6 +893,80 @@ int main() {
                    && scripting::PluginStateStore::instance().get("test/api17", "enabled").has_value();
              }),
              "manager enable did not deliver onEnable to the API 17 service after refresh"
+         )
+        && ok;
+  }
+
+  struct WallpaperMaskRequest {
+    std::uint64_t ownerId = 0;
+    std::string outputName;
+    std::string path;
+    std::string wallpaperPath;
+  };
+  std::vector<WallpaperMaskRequest> wallpaperMaskRequests;
+  std::vector<std::uint64_t> clearedWallpaperMaskOwners;
+  api.setWallpaperPaths({{"DP-1", "/wallpapers/current.png"}});
+  api.setConfigSnapshot(std::make_shared<const toml::table>(toml::parse("[shell]\noffline_mode = true")));
+  api.setWallpaperMaskHook([&](std::uint64_t ownerId, const std::string& outputName, const std::string& path,
+                               const std::string& wallpaperPath) {
+    wallpaperMaskRequests.push_back({
+        .ownerId = ownerId,
+        .outputName = outputName,
+        .path = path,
+        .wallpaperPath = wallpaperPath,
+    });
+  });
+  api.setClearWallpaperMasksHook([&](std::uint64_t ownerId) { clearedWallpaperMaskOwners.push_back(ownerId); });
+  const auto maskPluginDir = root / "wallpaper-mask-plugin";
+  {
+    scripting::ScriptRuntime runtime("test/wallpaper-mask:service", {}, api, maskPluginDir);
+    runtime.start(
+        "=wallpaper-mask",
+        "assert(noctalia.getSetting('shell.offline_mode'))\n"
+        "assert(noctalia.wallpaperPath('DP-1') == '/wallpapers/current.png')\n"
+        "assert(noctalia.wallpaperPath('missing') == nil)\n"
+        "noctalia.setWallpaperMask('DP-1', {\n"
+        "  path = 'cache/mask.png',\n"
+        "  wallpaperPath = '/wallpapers/current.png',\n"
+        "})\n"
+        "noctalia.setWallpaperMask('DP-1', nil)\n",
+        {}
+    );
+    ok = expect(
+             drainUntil([&] { return wallpaperMaskRequests.size() == 2; }),
+             "wallpaper mask side effects were not delivered"
+         )
+        && ok;
+    if (wallpaperMaskRequests.size() == 2) {
+      const auto& setRequest = wallpaperMaskRequests[0];
+      const auto& clearRequest = wallpaperMaskRequests[1];
+      ok = expect(
+               setRequest.ownerId != 0
+                   && setRequest.outputName == "DP-1"
+                   && setRequest.path == (maskPluginDir / "cache/mask.png").string()
+                   && setRequest.wallpaperPath == "/wallpapers/current.png",
+               "wallpaper mask binding returned the wrong set request"
+           )
+          && ok;
+      ok = expect(
+               clearRequest.ownerId == setRequest.ownerId
+                   && clearRequest.outputName == "DP-1"
+                   && clearRequest.path.empty()
+                   && clearRequest.wallpaperPath.empty(),
+               "wallpaper mask binding returned the wrong clear request"
+           )
+          && ok;
+    }
+  }
+  ok = expect(
+           drainUntil([&] { return clearedWallpaperMaskOwners.size() == 1; }),
+           "wallpaper mask runtime did not clear its owned masks"
+       )
+      && ok;
+  if (!wallpaperMaskRequests.empty() && !clearedWallpaperMaskOwners.empty()) {
+    ok = expect(
+             clearedWallpaperMaskOwners.front() == wallpaperMaskRequests.front().ownerId,
+             "wallpaper mask cleanup used the wrong runtime owner"
          )
         && ok;
   }

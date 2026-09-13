@@ -10,9 +10,11 @@
 #include "ui/style.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 using namespace control_center;
@@ -20,6 +22,9 @@ using namespace control_center;
 namespace {
 
   constexpr float kRowMinHeight = Style::controlHeightLg;
+
+  // Bounds an explicit Rescan: BlueZ discovery is stopped again when this window elapses.
+  constexpr auto kDiscoveryTimeout = std::chrono::seconds(10);
 
   const char* glyphFor(BluetoothDeviceKind kind) {
     switch (kind) {
@@ -115,7 +120,7 @@ namespace {
 
   std::unique_ptr<Flex> makeMetricPill(const char* glyphName, std::string text, float scale, Label** valueOut) {
     return ui::row(
-        {.align = FlexAlign::Center, .gap = Style::spaceXs * 0.5f * scale},
+        {.align = FlexAlign::Center, .gap = Style::spaceXs * 0.5F * scale},
         ui::glyph({
             .glyph = glyphName,
             .glyphSize = Style::fontSizeCaption * scale,
@@ -156,7 +161,7 @@ public:
             .fontSize = Style::fontSizeBody * scale,
             .fontWeight = m_device.connected ? FontWeight::Bold : FontWeight::Normal,
             .color = colorSpecFromRole(ColorRole::OnSurface),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
         })
     );
     header->setPadding(Style::spaceSm * scale, Style::spaceMd * scale);
@@ -270,7 +275,7 @@ public:
                   .text = i18n::tr("control-center.bluetooth.auto-reconnect"),
                   .fontSize = Style::fontSizeCaption * scale,
                   .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
-                  .flexGrow = 1.0f,
+                  .flexGrow = 1.0F,
               }),
               ui::toggle({
                   .checkedImmediate = m_device.trusted,
@@ -293,7 +298,7 @@ public:
                 .text = i18n::tr("control-center.bluetooth.address"),
                 .fontSize = Style::fontSizeCaption * scale,
                 .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
-                .flexGrow = 1.0f,
+                .flexGrow = 1.0F,
             }),
             ui::label(
                 {.text = m_device.address,
@@ -389,7 +394,7 @@ std::unique_ptr<Flex> BluetoothTab::create() {
           .out = &m_pairingInput,
           .placeholder = i18n::tr("control-center.bluetooth.enter-code"),
           .surfaceOpacity = panelCardOpacity(),
-          .flexGrow = 1.0f,
+          .flexGrow = 1.0F,
           .onSubmit = [this](const std::string& value) {
             if (m_agent == nullptr) {
               return;
@@ -443,6 +448,10 @@ std::unique_ptr<Flex> BluetoothTab::create() {
                     }
                   }
                   break;
+                case BluetoothPairingKind::DisplayPasskey:
+                  // Informational only: the code is typed on the device, and there is no
+                  // Agent1 reply to send. Do not fall through to the canceling default.
+                  break;
                 default:
                   m_agent->cancelPending();
                   break;
@@ -468,10 +477,11 @@ std::unique_ptr<Flex> BluetoothTab::create() {
 
   auto listScroll = ui::scrollView({
       .out = &m_listScroll,
+      .contentScale = contentScale(),
       .scrollbarVisible = true,
-      .viewportPaddingH = 0.0f,
-      .viewportPaddingV = 0.0f,
-      .flexGrow = 1.0f,
+      .viewportPaddingH = 0.0F,
+      .viewportPaddingV = 0.0F,
+      .flexGrow = 1.0F,
       .configure = [](ScrollView& scrollView) {
         scrollView.clearFill();
         scrollView.clearBorder();
@@ -502,6 +512,7 @@ void BluetoothTab::doLayout(Renderer& renderer, float contentWidth, float bodyHe
 }
 
 void BluetoothTab::doUpdate(Renderer& renderer) {
+  syncDiscoveryLease();
   syncPairingCard();
   rebuildDeviceList(renderer);
   // A metric pill's text changes its width, so the list has to be laid out again.
@@ -512,12 +523,13 @@ void BluetoothTab::doUpdate(Renderer& renderer) {
 }
 
 void BluetoothTab::setActive(bool active) {
-  if (!active && m_service != nullptr && m_service->state().discovering) {
-    m_service->stopDiscovery();
+  if (!active) {
+    stopRequestedDiscovery();
   }
 }
 
 void BluetoothTab::onClose() {
+  stopRequestedDiscovery();
   m_rootLayout = nullptr;
   m_pairingCard = nullptr;
   m_pairingTitle = nullptr;
@@ -536,7 +548,47 @@ void BluetoothTab::onClose() {
   m_scanSpinner = nullptr;
   m_deviceRows.clear();
   m_lastStructureKey.clear();
-  m_lastListWidth = -1.0f;
+  m_lastListWidth = -1.0F;
+}
+
+void BluetoothTab::syncDiscoveryLease() {
+  if (m_discoveryLease == DiscoveryLease::None || m_service == nullptr) {
+    return;
+  }
+
+  const BluetoothState& s = m_service->state();
+  if (!s.adapterPresent || !s.powered) {
+    // A powered-down adapter cannot be discovering, so BlueZ already dropped the session.
+    releaseDiscoveryLease();
+    return;
+  }
+  if (m_discoveryLease == DiscoveryLease::Pending) {
+    // StartDiscovery is async; the lease is only confirmed once BlueZ reports Discovering.
+    if (s.discovering) {
+      m_discoveryLease = DiscoveryLease::Active;
+    }
+    return;
+  }
+  if (!s.discovering) {
+    // Discovery ended outside the tab: drop the lease so the next Rescan starts a new one.
+    releaseDiscoveryLease();
+  }
+}
+
+void BluetoothTab::releaseDiscoveryLease() {
+  m_discoveryLease = DiscoveryLease::None;
+  m_discoveryTimer.stop();
+}
+
+void BluetoothTab::stopRequestedDiscovery() {
+  if (m_discoveryLease == DiscoveryLease::None) {
+    return;
+  }
+
+  releaseDiscoveryLease();
+  if (m_service != nullptr) {
+    m_service->stopDiscovery();
+  }
 }
 
 void BluetoothTab::syncHeader() {
@@ -636,6 +688,11 @@ void BluetoothTab::syncPairingCard() {
   if (m_pairingInputRow != nullptr) {
     m_pairingInputRow->setVisible(needsInput);
   }
+  if (m_pairingAccept != nullptr) {
+    // DisplayPasskey has nothing to accept: the code is entered on the device and there
+    // is no Agent1 reply. Show only the Reject action so Accept cannot clear the card.
+    m_pairingAccept->setVisible(req.kind != BluetoothPairingKind::DisplayPasskey);
+  }
 }
 
 // Identity of the built list: which rows exist, in which order, and which controls
@@ -691,7 +748,7 @@ void BluetoothTab::rebuildDeviceList(Renderer& renderer) {
     return;
   }
   const float listWidth = m_listScroll->contentViewportWidth();
-  if (listWidth <= 0.0f) {
+  if (listWidth <= 0.0F) {
     return;
   }
   std::vector<BluetoothDeviceInfo> devices;
@@ -699,12 +756,26 @@ void BluetoothTab::rebuildDeviceList(Renderer& renderer) {
     devices = sortedDevices(m_service->devices());
   }
   const std::string nextKey = structureKey(devices);
-  if (listWidth == m_lastListWidth && nextKey == m_lastStructureKey) {
+  const bool structureChanged = nextKey != m_lastStructureKey;
+  if (listWidth == m_lastListWidth && !structureChanged) {
     return;
   }
   m_lastListWidth = listWidth;
   m_lastStructureKey = nextKey;
+
+  if (!structureChanged) {
+    m_list->layout(renderer);
+    return;
+  }
+
   const float scale = contentScale();
+
+  std::unordered_set<std::string> expandedPaths;
+  for (const auto& [path, row] : m_deviceRows) {
+    if (row->expanded()) {
+      expandedPaths.insert(path);
+    }
+  }
 
   m_powerToggle = nullptr;
   m_discoverableToggle = nullptr;
@@ -745,7 +816,7 @@ void BluetoothTab::rebuildDeviceList(Renderer& renderer) {
             .text = i18n::tr("control-center.bluetooth.bluetooth"),
             .fontSize = Style::fontSizeBody * scale,
             .color = colorSpecFromRole(ColorRole::OnSurface),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
         })
     );
 
@@ -772,8 +843,12 @@ void BluetoothTab::rebuildDeviceList(Renderer& renderer) {
               if (m_service == nullptr) {
                 return;
               }
-              m_service->stopDiscovery();
-              m_service->startDiscovery();
+              // Repeated clicks renew the scan window instead of restarting discovery.
+              if (m_discoveryLease == DiscoveryLease::None) {
+                m_discoveryLease = DiscoveryLease::Pending;
+                m_service->startDiscovery();
+              }
+              m_discoveryTimer.start(kDiscoveryTimeout, [this]() { stopRequestedDiscovery(); });
             },
         })
     );
@@ -804,7 +879,7 @@ void BluetoothTab::rebuildDeviceList(Renderer& renderer) {
             .text = i18n::tr("control-center.bluetooth.visible"),
             .fontSize = Style::fontSizeBody * scale,
             .color = colorSpecFromRole(ColorRole::OnSurface),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
         }),
         ui::toggle({
             .out = &m_discoverableToggle,
@@ -880,6 +955,7 @@ void BluetoothTab::rebuildDeviceList(Renderer& renderer) {
     auto row = std::make_unique<BluetoothDeviceRow>(device, m_service, scale);
     auto* rowPtr = row.get();
     bucketCard->addChild(std::move(row));
+    rowPtr->setExpandedImmediate(expandedPaths.contains(device.path));
     rowPtr->startConnectingSpinner();
     m_deviceRows.emplace(rowPtr->devicePath(), rowPtr);
   }

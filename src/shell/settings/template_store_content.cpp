@@ -3,6 +3,7 @@
 #include "config/config_service.h"
 #include "core/input/key_symbols.h"
 #include "core/input/keybind_matcher.h"
+#include "cursor-shape-v1-client-protocol.h"
 #include "i18n/i18n.h"
 #include "shell/settings/template_store_tile.h"
 #include "ui/builders.h"
@@ -369,7 +370,8 @@ namespace settings {
     toolbar->addChild(
         ui::button({
             .text = i18n::tr("settings.templates.store.categories"),
-            .glyph = m_categoryFiltersCollapsed ? std::string("chevron-right") : std::string("chevron-down"),
+            .glyph = m_categoryFiltersCollapsed ? std::string(Style::rtl() ? "chevron-left" : "chevron-right")
+                                                : std::string("chevron-down"),
             .fontSize = Style::fontSizeCaption * scale,
             .glyphSize = Style::fontSizeCaption * scale,
             .contentAlign = ButtonContentAlign::Start,
@@ -466,16 +468,18 @@ namespace settings {
     probe->bind("Mg", "category", false, false, false, {});
     const float cardHeight = std::ceil(probe->measure(renderer, LayoutConstraints{}).height);
     // Floor above checkbox+tight padding — two caption lines need more than controlHeightSm alone.
-    const float minCardHeight = (Style::controlHeightSm + Style::spaceSm * 2.0f) * scale;
+    const float minCardHeight = (Style::controlHeightSm + Style::spaceSm * 2.0F) * scale;
     auto grid = ui::virtualGridView({
         .out = &m_grid,
-        .minCellWidth = 152.0f * scale,
+        .contentScale = scale,
+        .minCellWidth = 152.0F * scale,
         .cellHeight = std::max(cardHeight, minCardHeight),
         .squareCells = false,
         .columnGap = Style::spaceSm * scale,
         .rowGap = Style::spaceSm * scale,
+        .itemCursorShape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER,
         .adapter = adapterPtr,
-        .flexGrow = 1.0f,
+        .flexGrow = 1.0F,
         .onSelectionChanged =
             [this](std::optional<std::size_t> index) {
               m_selectedTemplateId = index.has_value() && *index < m_filteredIndices.size()

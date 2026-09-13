@@ -11,17 +11,10 @@ namespace session_action {
           || action == "logout"
           || action == "suspend"
           || action == "lock_and_suspend"
+          || action == "hibernate"
+          || action == "lock_and_hibernate"
           || action == "reboot"
           || action == "shutdown";
-    }
-
-    [[nodiscard]] std::optional<SessionPanelActionConfig> defaultBuiltinAction(std::string_view action) {
-      for (const SessionPanelActionConfig& row : defaultSessionPanelActions()) {
-        if (row.action == action) {
-          return row;
-        }
-      }
-      return std::nullopt;
     }
 
   } // namespace
@@ -98,25 +91,13 @@ namespace session_action {
     if (ipcOrConfigAction == "lock-and-suspend") {
       return std::string_view{"lock_and_suspend"};
     }
+    if (ipcOrConfigAction == "lock-and-hibernate") {
+      return std::string_view{"lock_and_hibernate"};
+    }
     if (isBuiltinAction(ipcOrConfigAction)) {
       return ipcOrConfigAction;
     }
     return std::nullopt;
-  }
-
-  std::optional<SessionPanelActionConfig>
-  resolveConfiguredAction(const ShellSessionConfig& session, std::string_view action) {
-    if (!isBuiltinAction(action)) {
-      return std::nullopt;
-    }
-
-    for (const SessionPanelActionConfig& row : session.actions) {
-      if (row.action != action) {
-        continue;
-      }
-      return row;
-    }
-    return defaultBuiltinAction(action);
   }
 
 } // namespace session_action

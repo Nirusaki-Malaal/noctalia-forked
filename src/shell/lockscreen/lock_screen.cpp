@@ -12,8 +12,8 @@
 #include "ext-session-lock-v1-client-protocol.h"
 #include "i18n/i18n.h"
 #include "render/render_context.h"
-#include "shell/bar/widgets/keyboard_layout_widget.h"
 #include "shell/desktop/desktop_widget_layout.h"
+#include "shell/keyboard_layout_label.h"
 #include "shell/lockscreen/lock_surface.h"
 #include "ui/palette.h"
 #include "wayland/wayland_connection.h"
@@ -22,7 +22,6 @@
 #include <algorithm>
 #include <string>
 #include <thread>
-#include <unordered_map>
 
 namespace {
 
@@ -34,9 +33,16 @@ namespace {
     // through. With no wallpaper image and no configured fill color, paint an
     // opaque black background so the lock surface is always fully opaque.
     if (!config.fillColor) {
-      return rgba(0.0f, 0.0f, 0.0f, 1.0f);
+      return rgba(0.0F, 0.0F, 0.0F, 1.0F);
     }
     return resolveColorSpec(*config.fillColor);
+  }
+
+  // An output can only carry a lock surface once it is complete and has real geometry.
+  bool hasUsableOutput(const WaylandConnection& wayland) {
+    return std::ranges::any_of(wayland.outputs(), [](const WaylandOutput& output) {
+      return output.done && output.output != nullptr && output.hasUsableGeometry();
+    });
   }
 
   const ext_session_lock_v1_listener kSessionLockListener = {
@@ -81,12 +87,13 @@ bool LockScreen::initialize(
   return true;
 }
 
-void LockScreen::setSessionHooks(std::function<void()> onLocked, std::function<void()> onUnlocked) {
+void LockScreen::setSessionHooks(
+    std::function<void()> onLocked, std::function<void()> onUnlocked, std::function<void()> onLockAborted
+) {
   m_onSessionLocked = std::move(onLocked);
   m_onSessionUnlocked = std::move(onUnlocked);
+  m_onLockAborted = std::move(onLockAborted);
 }
-
-void LockScreen::setLockEngagedCallback(std::function<void()> callback) { m_onLockEngaged = std::move(callback); }
 
 void LockScreen::setLoginBoxServices(
     SessionActionRunner* sessionActions, MprisService* mpris, const WeatherService* weather, HttpClient* httpClient
@@ -117,7 +124,7 @@ bool LockScreen::lock() {
     kLog.warn("session lock protocol unavailable");
     return false;
   }
-  if (m_wayland->outputs().empty()) {
+  if (!hasUsableOutput(*m_wayland)) {
     m_lockDeferred = true;
     kLog.warn("no outputs available for lock screen; lock deferred until an output is connected");
     // No output can ever show a lock surface, so run any pending post-lock action (e.g. suspend)
@@ -160,9 +167,6 @@ bool LockScreen::lock() {
   }
   wl_display_flush(m_wayland->display());
   kLog.info("session lock requested");
-  if (m_onLockEngaged) {
-    m_onLockEngaged();
-  }
   return true;
 }
 
@@ -224,6 +228,15 @@ void LockScreen::requestUpdate() {
   for (auto& inst : m_instances) {
     if (inst.surface != nullptr) {
       inst.surface->requestUpdate();
+    }
+  }
+}
+
+void LockScreen::forceRepaintAfterResume() {
+  for (auto& inst : m_instances) {
+    if (inst.surface != nullptr) {
+      inst.surface->discardPendingFrameCallback();
+      inst.surface->requestRedraw();
     }
   }
 }
@@ -469,6 +482,7 @@ void LockScreen::handleLocked(void* data, ext_session_lock_v1* /*lock*/) {
 void LockScreen::handleFinished(void* data, ext_session_lock_v1* /*lock*/) {
   auto* self = static_cast<LockScreen*>(data);
   kLog.info("session lock finished by compositor");
+  const bool wasLockedInteractive = self->m_locked;
   self->m_pendingAfterLocked = {};
   self->invalidatePendingAuthentication();
   self->stopFingerprint();
@@ -488,8 +502,10 @@ void LockScreen::handleFinished(void* data, ext_session_lock_v1* /*lock*/) {
   self->m_statusIsError = false;
   self->m_desktopCaptures.clear();
   self->m_desktopCapturesPrimed = false;
-  if (self->m_onSessionUnlocked) {
+  if (wasLockedInteractive && self->m_onSessionUnlocked) {
     self->m_onSessionUnlocked();
+  } else if (!wasLockedInteractive && self->m_onLockAborted) {
+    self->m_onLockAborted();
   }
   self->clearInstances();
   self->m_pointerSurface = nullptr;
@@ -510,6 +526,16 @@ void LockScreen::syncInstances() {
     }
     return !exists;
   });
+
+  for (auto& instance : m_instances) {
+    const auto it = std::ranges::find(outputs, instance.outputName, &WaylandOutput::name);
+    if (it == outputs.end() || instance.surface == nullptr) {
+      continue;
+    }
+    instance.surface->syncOutputScale(
+        it->scale, it->configuredScaleNumerator > 0 ? static_cast<std::uint32_t>(it->configuredScaleNumerator) : 1U
+    );
+  }
 
   for (const auto& output : outputs) {
     if (!output.done || output.output == nullptr || !output.hasUsableGeometry()) {
@@ -532,14 +558,14 @@ bool LockScreen::shouldUseBlurredDesktop() const {
 }
 
 bool LockScreen::allSurfacesReady() const {
-  if (m_instances.empty()) {
-    return false;
-  }
   for (const auto& instance : m_instances) {
     if (instance.surface != nullptr && !instance.surface->firstFrameRendered()) {
       return false;
     }
   }
+
+  // With all outputs disconnected, no surface can ever render, so allow pending
+  // actions to run instead of waiting for the fallback timeout.
   return true;
 }
 
@@ -754,18 +780,12 @@ void LockScreen::applyIndicatorsToSurface(LockSurface& surface) const {
   if (m_compositorPlatform != nullptr) {
     hasMultipleLayouts = m_compositorPlatform->keyboardLayoutNames().size() > 1;
     switchable = m_compositorPlatform->hasKeyboardLayoutBackend();
-    std::string display = "short";
-    std::unordered_map<std::string, std::string> customLabels;
-    if (m_configService != nullptr) {
-      if (const auto widgetIt = m_configService->config().widgets.find("keyboard_layout");
-          widgetIt != m_configService->config().widgets.end()) {
-        display = widgetIt->second.getString("display", display);
-        customLabels = widgetIt->second.getStringMap("custom_labels");
-      }
-    }
-    layoutLabel = KeyboardLayoutWidget::resolveLayoutLabel(
-        m_compositorPlatform->currentKeyboardLayoutName(), KeyboardLayoutWidget::parseDisplayMode(display), customLabels
-    );
+    const std::string layoutName = m_compositorPlatform->currentKeyboardLayoutName();
+    layoutLabel = m_configService != nullptr
+        ? resolveKeyboardLayoutLabel(
+              layoutName, KeyboardLayoutDisplayMode::Short, m_configService->config().shell.keyboardLayout.customLabels
+          )
+        : formatKeyboardLayoutLabel(layoutName, KeyboardLayoutDisplayMode::Short);
   }
   surface.setKeyboardIndicators(capsLock, hasMultipleLayouts, switchable, std::move(layoutLabel));
 }
@@ -850,8 +870,11 @@ void LockScreen::tryAuthenticate() {
   // pam_fprintd from it: noctalia drives the reader itself over D-Bus and the
   // two can't share the sensor. See docs/fingerprint.md.
   const std::string pamService = "login";
-  std::thread([this, generation, password = std::move(password), authenticator, pamService]() mutable {
-    const auto result = authenticator.authenticateCurrentUser(password, pamService);
+  const std::string pamLanguage(i18n::Service::instance().language());
+  const std::string pamStartFailure = i18n::tr("auth.pam.start-failed");
+  std::thread([this, generation, password = std::move(password), authenticator, pamService, pamLanguage,
+               pamStartFailure]() mutable {
+    const auto result = authenticator.authenticateCurrentUser(password, pamService, pamLanguage, pamStartFailure);
     clearSensitiveString(password);
     DeferredCall::callLater([this, generation, result]() { handleAuthResult(generation, result); });
   }).detach();

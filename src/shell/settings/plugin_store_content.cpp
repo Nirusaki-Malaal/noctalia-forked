@@ -3,6 +3,7 @@
 #include "config/config_service.h"
 #include "core/input/key_symbols.h"
 #include "core/input/keybind_matcher.h"
+#include "cursor-shape-v1-client-protocol.h"
 #include "i18n/i18n.h"
 #include "scripting/plugin_api.h"
 #include "scripting/plugin_file_cache.h"
@@ -34,8 +35,8 @@ namespace settings {
 
   namespace {
 
-    constexpr float kSourceBadgeMaxWidth = 120.0f;
-    constexpr float kTagBadgeMaxWidth = 120.0f;
+    constexpr float kSourceBadgeMaxWidth = 120.0F;
+    constexpr float kTagBadgeMaxWidth = 120.0F;
 
     // Display label for a source filter value: official/community are localized badge names,
     // custom source names show verbatim.
@@ -76,7 +77,6 @@ namespace settings {
       void setContent(PluginStoreContent* content) { m_content = content; }
       void setFilteredIndices(const std::vector<std::size_t>* indices) { m_indices = indices; }
       void setCatalog(const std::vector<StoreCatalogEntry>* catalog) { m_catalog = catalog; }
-      void setOnDiskIds(const std::unordered_set<std::string>* ids) { m_onDiskIds = ids; }
       void setCallbacks(const PluginStoreCallbacks* callbacks) { m_callbacks = callbacks; }
       void setThumbnailPaths(const std::unordered_map<std::string, std::string>* paths) { m_thumbnailPaths = paths; }
       void setRenderer(Renderer* r) { m_renderer = r; }
@@ -92,7 +92,8 @@ namespace settings {
         }
         auto* t = static_cast<PluginStoreTile*>(&tile);
         const auto& storeEntry = (*m_catalog)[(*m_indices)[index]];
-        const bool onDisk = m_onDiskIds != nullptr && m_onDiskIds->contains(storeEntry.entry.id);
+        const bool onDisk =
+            m_callbacks != nullptr && m_callbacks->isInstalled && m_callbacks->isInstalled(storeEntry.entry.id);
         std::string thumbPath;
         if (m_thumbnailPaths != nullptr) {
           auto it = m_thumbnailPaths->find(storeEntry.entry.id);
@@ -114,7 +115,6 @@ namespace settings {
       PluginStoreContent* m_content = nullptr;
       const std::vector<std::size_t>* m_indices = nullptr;
       const std::vector<StoreCatalogEntry>* m_catalog = nullptr;
-      const std::unordered_set<std::string>* m_onDiskIds = nullptr;
       const PluginStoreCallbacks* m_callbacks = nullptr;
       const std::unordered_map<std::string, std::string>* m_thumbnailPaths = nullptr;
       Renderer* m_renderer = nullptr;
@@ -124,11 +124,11 @@ namespace settings {
   } // namespace
 
   PluginStoreContent::PluginStoreContent(
-      std::vector<StoreCatalogEntry> catalog, ConfigService* config, std::unordered_set<std::string> onDiskIds,
-      PluginStoreCallbacks callbacks, scripting::PluginFileCache* fileCache
+      std::vector<StoreCatalogEntry> catalog, ConfigService* config, PluginStoreCallbacks callbacks,
+      scripting::PluginFileCache* fileCache, ScrollViewState* scrollState
   )
-      : m_catalog(std::move(catalog)), m_config(config), m_onDiskIds(std::move(onDiskIds)),
-        m_callbacks(std::move(callbacks)), m_fileCache(fileCache) {
+      : m_catalog(std::move(catalog)), m_config(config), m_callbacks(std::move(callbacks)), m_fileCache(fileCache),
+        m_scrollState(scrollState) {
     if (m_config != nullptr) {
       if (const std::optional<std::string> sort = m_config->stateString("plugin_store", "sort")) {
         m_sortMode = sortModeFromState(*sort);
@@ -141,6 +141,19 @@ namespace settings {
   }
 
   PluginStoreContent::~PluginStoreContent() = default;
+
+  void PluginStoreContent::detachGrid() noexcept {
+    m_grid = nullptr;
+    m_countLabel = nullptr;
+    m_sortButton = nullptr;
+  }
+
+  void PluginStoreContent::requestRebuild() {
+    detachGrid();
+    if (m_onRebuildNeeded) {
+      m_onRebuildNeeded();
+    }
+  }
 
   void PluginStoreContent::setOnRebuildNeeded(std::function<void()> cb) { m_onRebuildNeeded = std::move(cb); }
 
@@ -397,6 +410,7 @@ namespace settings {
 
     body.addChild(
         ui::input({
+            .value = m_searchQuery,
             .placeholder = i18n::tr("settings.plugins.store.search-placeholder"),
             .fontSize = Style::fontSizeBody * scale,
             .onChange = [this](const std::string& text) {
@@ -439,7 +453,8 @@ namespace settings {
           ui::segmented({
               .options = allSources,
               .selectedIndex = selectedSourceIndex,
-              .fontSize = Style::fontSizeCaption * scale,
+              .fontSize = Style::fontSizeCaption,
+              .scale = scale,
               .compact = true,
               .onChange = [this](std::size_t i) {
                 m_selectedSource = i == 0 ? std::string{} : m_sources[i - 1];
@@ -452,9 +467,7 @@ namespace settings {
                 }
 
                 applyFilter();
-                if (m_onRebuildNeeded) {
-                  m_onRebuildNeeded();
-                }
+                requestRebuild();
               },
           })
       );
@@ -469,16 +482,15 @@ namespace settings {
       toolbar->addChild(
           ui::button({
               .text = i18n::tr("settings.plugins.store.categories"),
-              .glyph = m_tagFiltersCollapsed ? std::string("chevron-right") : std::string("chevron-down"),
+              .glyph = m_tagFiltersCollapsed ? std::string(Style::rtl() ? "chevron-left" : "chevron-right")
+                                             : std::string("chevron-down"),
               .fontSize = Style::fontSizeCaption * scale,
               .glyphSize = Style::fontSizeCaption * scale,
               .contentAlign = ButtonContentAlign::Start,
               .variant = ButtonVariant::Ghost,
               .onClick = [this]() {
                 m_tagFiltersCollapsed = !m_tagFiltersCollapsed;
-                if (m_onRebuildNeeded) {
-                  m_onRebuildNeeded();
-                }
+                requestRebuild();
               },
           })
       );
@@ -496,9 +508,7 @@ namespace settings {
               .onClick = [this, tag = std::move(tag)]() {
                 m_selectedTag = tag;
                 applyFilter();
-                if (m_onRebuildNeeded) {
-                  m_onRebuildNeeded();
-                }
+                requestRebuild();
               },
           });
           tagButtons.push_back(std::move(btn));
@@ -557,7 +567,6 @@ namespace settings {
     adapterPtr->setContent(this);
     adapterPtr->setFilteredIndices(&m_filteredIndices);
     adapterPtr->setCatalog(&m_catalog);
-    adapterPtr->setOnDiskIds(&m_onDiskIds);
     adapterPtr->setCallbacks(&m_callbacks);
     adapterPtr->setThumbnailPaths(&m_thumbnailPaths);
     adapterPtr->setRenderer(&renderer);
@@ -566,13 +575,16 @@ namespace settings {
 
     auto grid = ui::virtualGridView({
         .out = &m_grid,
-        .minCellWidth = 200.0f * scale,
-        .cellHeight = 215.0f * scale,
+        .state = m_scrollState,
+        .contentScale = scale,
+        .minCellWidth = 200.0F * scale,
+        .cellHeight = 215.0F * scale,
         .squareCells = false,
         .columnGap = Style::spaceSm * scale,
         .rowGap = Style::spaceSm * scale,
+        .itemCursorShape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER,
         .adapter = adapterPtr,
-        .flexGrow = 1.0f,
+        .flexGrow = 1.0F,
         .onSelectionChanged =
             [this](std::optional<std::size_t> index) {
               m_selectedPluginId = index.has_value() && *index < m_filteredIndices.size()
@@ -607,16 +619,17 @@ namespace settings {
     const auto& storeEntry = m_catalog[m_filteredIndices[*m_detailIndex]];
     const auto& entry = storeEntry.entry;
     const float scale = m_callbacks.scale;
-    const bool onDisk = m_onDiskIds.contains(entry.id);
+    const bool onDisk = m_callbacks.isInstalled && m_callbacks.isInstalled(entry.id);
     const bool enabling = m_callbacks.isEnabling && m_callbacks.isEnabling(entry.id);
 
     // The sheet hosts the store without an outer ScrollView, so the detail view scrolls its own
     // content (header + README can exceed the sheet height).
     auto scroll = ui::scrollView({
+        .contentScale = scale,
         .scrollbarVisible = true,
-        .viewportPaddingH = 0.0f,
-        .viewportPaddingV = 0.0f,
-        .flexGrow = 1.0f,
+        .viewportPaddingH = 0.0F,
+        .viewportPaddingV = 0.0F,
+        .flexGrow = 1.0F,
         .configure = [](ScrollView& sv) {
           sv.clearFill();
           sv.clearBorder();
@@ -629,7 +642,7 @@ namespace settings {
 
     auto header = ui::row({.align = FlexAlign::Stretch, .gap = Style::spaceMd * scale, .fillWidth = true});
 
-    auto pill = [&](const std::string& text, ColorRole fg, ColorRole bg, float bgAlpha, float maxWidth = 0.0f) {
+    auto pill = [&](const std::string& text, ColorRole fg, ColorRole bg, float bgAlpha, float maxWidth = 0.0F) {
       Label* label = nullptr;
       auto badge = ui::row(
           {.align = FlexAlign::Center,
@@ -644,9 +657,9 @@ namespace settings {
               .color = colorSpecFromRole(fg),
           })
       );
-      if (maxWidth > 0.0f) {
+      if (maxWidth > 0.0F) {
         badge->setMaxWidth(maxWidth * scale);
-        label->setMaxWidth((maxWidth - (Style::spaceXs * 2.0f)) * scale);
+        label->setMaxWidth((maxWidth - (Style::spaceXs * 2.0F)) * scale);
         label->setMaxLines(1);
         label->setEllipsize(TextEllipsize::End);
       }
@@ -659,10 +672,10 @@ namespace settings {
       auto img = ui::image({
           .fit = ImageFit::Contain,
           .radius = Style::scaledRadiusMd(scale),
-          .width = 320.0f * scale,
-          .height = 200.0f * scale,
+          .width = 320.0F * scale,
+          .height = 200.0F * scale,
       });
-      const int thumbTargetSize = static_cast<int>(std::ceil(320.0f * scale));
+      const int thumbTargetSize = static_cast<int>(std::ceil(320.0F * scale));
       if (textureCache != nullptr) {
         img->setSourceFileAsync(renderer, *textureCache, thumbIt->second, thumbTargetSize, true);
       } else {
@@ -673,10 +686,10 @@ namespace settings {
       header->addChild(
           ui::glyph({
               .glyph = entry.icon.empty() ? std::string("apps") : entry.icon,
-              .glyphSize = Style::fontSizeHeader * 2.0f * scale,
+              .glyphSize = Style::fontSizeHeader * 2.0F * scale,
               .color = colorSpecFromRole(ColorRole::Primary),
-              .width = 80.0f * scale,
-              .height = 80.0f * scale,
+              .width = 80.0F * scale,
+              .height = 80.0F * scale,
           })
       );
     }
@@ -684,7 +697,7 @@ namespace settings {
     // Right side: plugin info (name, author, tags, version/license/badges, description, action),
     // left-aligned and filling the space next to the thumbnail.
     auto info = ui::column(
-        {.align = FlexAlign::Start, .gap = Style::spaceXs * scale, .paddingV = Style::spaceSm * scale, .flexGrow = 1.0f}
+        {.align = FlexAlign::Start, .gap = Style::spaceXs * scale, .paddingV = Style::spaceSm * scale, .flexGrow = 1.0F}
     );
     auto title = ui::row({.align = FlexAlign::Center, .wrap = true, .gap = Style::spaceXs * scale, .fillWidth = true});
     title->addChild(
@@ -698,7 +711,7 @@ namespace settings {
         })
     );
     for (const auto& tag : entry.tags) {
-      title->addChild(pill(tag, ColorRole::OnSurfaceVariant, ColorRole::SurfaceVariant, 1.0f, kTagBadgeMaxWidth));
+      title->addChild(pill(tag, ColorRole::OnSurfaceVariant, ColorRole::SurfaceVariant, 1.0F, kTagBadgeMaxWidth));
     }
     info->addChild(std::move(title));
     auto meta = ui::row({.align = FlexAlign::Center, .wrap = true, .gap = Style::spaceXs * scale, .fillWidth = true});
@@ -738,20 +751,20 @@ namespace settings {
     }
     if (storeEntry.source == "official") {
       addMetaItem(pill(
-          i18n::tr("settings.badges.official"), ColorRole::Primary, ColorRole::Primary, 0.15f, kSourceBadgeMaxWidth
+          i18n::tr("settings.badges.official"), ColorRole::Primary, ColorRole::Primary, 0.15F, kSourceBadgeMaxWidth
       ));
     } else if (storeEntry.source == "community") {
       addMetaItem(pill(
-          i18n::tr("settings.badges.community"), ColorRole::Secondary, ColorRole::Secondary, 0.15f, kSourceBadgeMaxWidth
+          i18n::tr("settings.badges.community"), ColorRole::Secondary, ColorRole::Secondary, 0.15F, kSourceBadgeMaxWidth
       ));
     } else {
-      addMetaItem(pill(storeEntry.source, ColorRole::Tertiary, ColorRole::Tertiary, 0.15f, kSourceBadgeMaxWidth));
+      addMetaItem(pill(storeEntry.source, ColorRole::Tertiary, ColorRole::Tertiary, 0.15F, kSourceBadgeMaxWidth));
     }
     if (entry.deprecated) {
-      addMetaItem(pill(i18n::tr("settings.badges.deprecated"), ColorRole::Error, ColorRole::Error, 0.15f));
+      addMetaItem(pill(i18n::tr("settings.badges.deprecated"), ColorRole::Error, ColorRole::Error, 0.15F));
     }
     if (entry.heldBack) {
-      addMetaItem(pill(i18n::tr("settings.plugins.store.held-back"), ColorRole::Tertiary, ColorRole::Tertiary, 0.15f));
+      addMetaItem(pill(i18n::tr("settings.plugins.store.held-back"), ColorRole::Tertiary, ColorRole::Tertiary, 0.15F));
     }
     info->addChild(std::move(meta));
 
@@ -801,7 +814,7 @@ namespace settings {
     if (enabling) {
       info->addChild(
           ui::spinner({
-              .spinnerSize = Style::controlHeightSm * scale * 0.7f,
+              .spinnerSize = Style::controlHeightSm * scale * 0.7F,
               .spinning = true,
           })
       );
@@ -826,6 +839,22 @@ namespace settings {
                 }
               },
           })
+      );
+    } else {
+      info->addChild(
+          ui::row(
+              {.align = FlexAlign::Center, .gap = Style::spaceXs * scale},
+              ui::glyph({
+                  .glyph = "check",
+                  .glyphSize = Style::fontSizeCaption * scale,
+                  .color = colorSpecFromRole(ColorRole::Primary),
+              }),
+              ui::label({
+                  .text = i18n::tr("settings.plugins.store.installed"),
+                  .fontSize = Style::fontSizeCaption * scale,
+                  .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
+              })
+          )
       );
     }
     header->addChild(std::move(info));
@@ -859,38 +888,35 @@ namespace settings {
   }
 
   void PluginStoreContent::openDetail(std::size_t filteredIndex) {
+    if (filteredIndex >= m_filteredIndices.size()) {
+      return;
+    }
     m_detailIndex = filteredIndex;
     m_selectedPluginId = m_catalog[m_filteredIndices[filteredIndex]].entry.id;
     m_detailReadme.clear();
     m_detailReadmeLoading = false;
 
-    if (filteredIndex < m_filteredIndices.size()) {
-      const auto& storeEntry = m_catalog[m_filteredIndices[filteredIndex]];
-      if (m_fileCache != nullptr) {
-        m_detailReadmeLoading = true;
-        std::string path = m_fileCache->resolve(storeEntry.entry.id, storeEntry.sourceConfig, "README.md");
-        if (!path.empty()) {
-          std::ifstream f(path);
-          if (f.is_open()) {
-            m_detailReadme = std::string(std::istreambuf_iterator<char>(f), {});
-          }
-          m_detailReadmeLoading = false;
+    const auto& storeEntry = m_catalog[m_filteredIndices[filteredIndex]];
+    if (m_fileCache != nullptr) {
+      m_detailReadmeLoading = true;
+      std::string path = m_fileCache->resolve(storeEntry.entry.id, storeEntry.sourceConfig, "README.md");
+      if (!path.empty()) {
+        std::ifstream f(path);
+        if (f.is_open()) {
+          m_detailReadme = std::string(std::istreambuf_iterator<char>(f), {});
         }
+        m_detailReadmeLoading = false;
       }
     }
 
-    if (m_onRebuildNeeded) {
-      m_onRebuildNeeded();
-    }
+    requestRebuild();
   }
 
   void PluginStoreContent::closeDetail() {
     m_detailIndex.reset();
     m_detailReadme.clear();
     m_detailReadmeLoading = false;
-    if (m_onRebuildNeeded) {
-      m_onRebuildNeeded();
-    }
+    requestRebuild();
   }
 
   void PluginStoreContent::selectIndex(std::size_t index) {
@@ -960,7 +986,7 @@ namespace settings {
     }
     const auto& storeEntry = m_catalog[m_filteredIndices[*m_detailIndex]];
     const auto& entry = storeEntry.entry;
-    if (!entry.compatible || m_onDiskIds.contains(entry.id)) {
+    if (!entry.compatible || (m_callbacks.isInstalled && m_callbacks.isInstalled(entry.id))) {
       return false;
     }
     if (m_callbacks.isEnabling && m_callbacks.isEnabling(entry.id)) {
@@ -1031,13 +1057,6 @@ namespace settings {
     return false;
   }
 
-  void PluginStoreContent::updateOnDiskIds(std::unordered_set<std::string> ids) {
-    m_onDiskIds = std::move(ids);
-    if (m_grid != nullptr && !isDetailView()) {
-      m_grid->notifyDataChanged();
-    }
-  }
-
   void
   PluginStoreContent::onFileReady(const std::string& pluginId, const std::string& filename, const std::string& path) {
     if (filename == "thumbnail.webp") {
@@ -1053,9 +1072,7 @@ namespace settings {
           m_detailReadme = std::string(std::istreambuf_iterator<char>(f), {});
         }
         m_detailReadmeLoading = false;
-        if (m_onRebuildNeeded) {
-          m_onRebuildNeeded();
-        }
+        requestRebuild();
       }
     }
   }

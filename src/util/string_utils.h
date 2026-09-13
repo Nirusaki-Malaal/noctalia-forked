@@ -5,6 +5,7 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <format>
@@ -253,6 +254,22 @@ namespace StringUtils {
     return lhs.contains(rhs);
   }
 
+  // Whitespace-bounded search, so "DP-1" does not match inside "eDP-1".
+  [[nodiscard]] inline bool containsWholeToken(std::string_view haystack, std::string_view needle) {
+    if (haystack.empty() || needle.empty()) {
+      return false;
+    }
+    for (std::size_t pos = haystack.find(needle); pos != std::string_view::npos; pos = haystack.find(needle, pos + 1)) {
+      const bool startOk = pos == 0 || std::isspace(static_cast<unsigned char>(haystack[pos - 1])) != 0;
+      const std::size_t end = pos + needle.size();
+      const bool endOk = end == haystack.size() || std::isspace(static_cast<unsigned char>(haystack[end])) != 0;
+      if (startOk && endOk) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   [[nodiscard]] inline std::string trimLeadingBlankLines(std::string_view text) {
     if (text.empty()) {
       return {};
@@ -376,27 +393,63 @@ namespace StringUtils {
     return std::string(text.substr(0, end));
   }
 
-  // Strip HTML/Pango tags and unescape XML entities.
+  // Strip only the Freedesktop notification markup tags that this renderer does
+  // not support. Unknown or malformed angle-bracket text remains visible.
   [[nodiscard]] inline std::string sanitizeMarkup(std::string_view s) {
+    const auto tagEquals = [](std::string_view tag, std::string_view expected) {
+      if (tag.size() != expected.size()) {
+        return false;
+      }
+      for (std::size_t index = 0; index < tag.size(); ++index) {
+        if (std::tolower(static_cast<unsigned char>(tag[index]))
+            != std::tolower(static_cast<unsigned char>(expected[index]))) {
+          return false;
+        }
+      }
+      return true;
+    };
+    const auto tagStartsWith = [&tagEquals](std::string_view tag, std::string_view expected) {
+      return tag.size() >= expected.size() && tagEquals(tag.substr(0, expected.size()), expected);
+    };
+    const auto isMarkupTag = [&tagEquals, &tagStartsWith](std::string_view tag) {
+      tag = trimRightView(trimLeftView(tag));
+      return tagEquals(tag, "b")
+          || tagEquals(tag, "/b")
+          || tagEquals(tag, "i")
+          || tagEquals(tag, "/i")
+          || tagEquals(tag, "u")
+          || tagEquals(tag, "/u")
+          || tagEquals(tag, "br")
+          || tagEquals(tag, "br/")
+          || tagEquals(tag, "br /")
+          || tagEquals(tag, "/br")
+          || tagStartsWith(tag, "a href=")
+          || tagEquals(tag, "/a")
+          || tagStartsWith(tag, "img src=");
+    };
+
     std::string out;
     out.reserve(s.size());
 
     size_t i = 0;
     while (i < s.size()) {
       if (s[i] == '<') {
-        size_t close = s.find('>', i + 1);
+        const size_t close = s.find('>', i + 1);
         if (close != std::string_view::npos) {
-          auto tag = toLower(s.substr(i + 1, close - i - 1));
-          if (tag == "br" || tag == "br/" || tag == "br /") {
-            out += '\n';
+          const std::string_view tag = s.substr(i + 1, close - i - 1);
+          if (isMarkupTag(tag)) {
+            const std::string_view trimmedTag = trimRightView(trimLeftView(tag));
+            if (tagEquals(trimmedTag, "br") || tagEquals(trimmedTag, "br/") || tagEquals(trimmedTag, "br /")) {
+              out += '\n';
+            }
+            i = close + 1;
+            continue;
           }
-          i = close + 1;
-          continue;
         }
       }
 
       if (s[i] == '&') {
-        std::string_view rest = s.substr(i);
+        const std::string_view rest = s.substr(i);
         if (rest.starts_with("&lt;")) {
           out += '<';
           i += 4;

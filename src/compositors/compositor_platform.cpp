@@ -22,6 +22,10 @@
 #include "compositors/triad/triad_output_backend.h"
 #include "compositors/triad/triad_runtime.h"
 #include "compositors/triad/triad_workspace_backend.h"
+#include "compositors/umbriel/umbriel_keyboard_backend.h"
+#include "compositors/umbriel/umbriel_output_backend.h"
+#include "compositors/umbriel/umbriel_runtime.h"
+#include "compositors/umbriel/umbriel_workspace_backend.h"
 #include "compositors/workspace_alert_service.h"
 #include "core/log.h"
 #include "core/process/process.h"
@@ -61,6 +65,23 @@ namespace compositors {
 namespace {
 
   constexpr Logger kLog("compositor_platform");
+
+  [[nodiscard]] std::unordered_set<std::string>
+  windowIdsFromAssignments(const std::vector<WorkspaceWindowAssignment>& assignments) {
+    std::unordered_set<std::string> windowIds;
+    windowIds.reserve(assignments.size());
+    for (const auto& assignment : assignments) {
+      if (!assignment.windowId.empty()) {
+        windowIds.insert(assignment.windowId);
+      }
+    }
+    return windowIds;
+  }
+
+  void
+  retainToplevelsWithWindowIds(std::vector<ToplevelInfo>& windows, const std::unordered_set<std::string>& windowIds) {
+    std::erase_if(windows, [&](const ToplevelInfo& window) { return !windowIds.contains(window.identifier); });
+  }
 
   [[nodiscard]] const char* valueOrUnset(const char* value) {
     return value != nullptr && value[0] != '\0' ? value : "<unset>";
@@ -334,6 +355,12 @@ namespace {
           },
           true
       );
+    case compositors::CompositorKind::Umbriel:
+      return std::make_unique<LambdaOutputPowerBackend>(
+          [&runtime = runtimeRegistry.umbriel()](WaylandConnection& /*wayland*/, bool on) {
+            return compositors::umbriel::setOutputPower(runtime, on);
+          }
+      );
     case compositors::CompositorKind::Dwl:
     case compositors::CompositorKind::Labwc:
     case compositors::CompositorKind::Kde:
@@ -358,6 +385,7 @@ namespace {
     case compositors::CompositorKind::Labwc:
     case compositors::CompositorKind::Kde:
     case compositors::CompositorKind::Mango:
+    case compositors::CompositorKind::Umbriel:
     case compositors::CompositorKind::Unknown:
       break;
     }
@@ -371,6 +399,8 @@ namespace {
       return std::make_unique<TriadWorkspaceBackend>(runtimeRegistry.triad());
     case compositors::CompositorKind::Niri:
       return std::make_unique<NiriWorkspaceBackend>(runtimeRegistry.niri());
+    case compositors::CompositorKind::Umbriel:
+      return std::make_unique<UmbrielWorkspaceBackend>(runtimeRegistry.umbriel());
     case compositors::CompositorKind::Hyprland:
     case compositors::CompositorKind::Sway:
     case compositors::CompositorKind::Mango:
@@ -396,6 +426,8 @@ namespace {
       return std::make_unique<KeyboardLayoutBackendAdapter<SwayKeyboardBackend>>(runtimeRegistry.sway());
     case compositors::CompositorKind::Triad:
       return std::make_unique<KeyboardLayoutBackendAdapter<TriadKeyboardBackend>>(runtimeRegistry.triad());
+    case compositors::CompositorKind::Umbriel:
+      return std::make_unique<KeyboardLayoutBackendAdapter<UmbrielKeyboardBackend>>(runtimeRegistry.umbriel());
     case compositors::CompositorKind::Dwl:
     case compositors::CompositorKind::Labwc:
     case compositors::CompositorKind::Kde:
@@ -875,11 +907,59 @@ std::vector<ToplevelInfo> CompositorPlatform::windowsWithoutAppId(wl_output* out
   return windows;
 }
 
+std::vector<ToplevelInfo> CompositorPlatform::enrichedWindowsForApp(
+    const std::string& idLower, const std::string& wmClassLower, wl_output* outputFilter
+) const {
+  if (m_workspaceMetadataBackend != nullptr
+      && m_workspaceMetadataBackend->hasExactWindowIdentity()
+      && m_wayland.hasExtForeignToplevelList()) {
+    auto windows = m_wayland.extWindowsForApp(idLower, wmClassLower);
+    for (auto& w : windows) {
+      w.exactIdentity = true;
+    }
+    if (!windows.empty()) {
+      retainToplevelsWithWindowIds(windows, windowIdsFromAssignments(workspaceWindowAssignments(outputFilter)));
+    }
+    // Do not fall back to title/app-id matching while one side of the exact
+    // identity join is still pending. The ext `done` or IPC update will retry.
+    return windows;
+  }
+  return windowsForApp(idLower, wmClassLower, outputFilter);
+}
+
+std::vector<ToplevelInfo> CompositorPlatform::enrichedWindowsWithoutAppId(wl_output* outputFilter) const {
+  if (m_workspaceMetadataBackend != nullptr
+      && m_workspaceMetadataBackend->hasExactWindowIdentity()
+      && m_wayland.hasExtForeignToplevelList()) {
+    auto windows = m_wayland.extWindowsWithoutAppId();
+    for (auto& w : windows) {
+      w.exactIdentity = true;
+    }
+    if (!windows.empty()) {
+      retainToplevelsWithWindowIds(windows, windowIdsFromAssignments(workspaceWindowAssignments(outputFilter)));
+    }
+    return windows;
+  }
+  return windowsWithoutAppId(outputFilter);
+}
+
+bool CompositorPlatform::hasExactWindowIdentity() const noexcept {
+  return m_workspaceMetadataBackend != nullptr
+      && m_workspaceMetadataBackend->hasExactWindowIdentity()
+      && m_wayland.hasExtForeignToplevelList();
+}
+
 void CompositorPlatform::activateToplevel(zwlr_foreign_toplevel_handle_v1* handle) {
   m_wayland.activateToplevel(handle);
 }
 
 void CompositorPlatform::activateToplevelInfo(const ToplevelInfo& window) {
+  if (window.exactIdentity
+      && !window.identifier.empty()
+      && m_workspaceMetadataBackend != nullptr
+      && m_workspaceMetadataBackend->focusWindowById(window.identifier)) {
+    return;
+  }
   if (window.handle != nullptr) {
     activateToplevel(window.handle);
     return;
@@ -898,6 +978,10 @@ void CompositorPlatform::closeToplevel(zwlr_foreign_toplevel_handle_v1* handle) 
 void CompositorPlatform::closeToplevelInfo(const ToplevelInfo& window) {
   if (window.handle != nullptr) {
     closeToplevel(window.handle);
+    return;
+  }
+  if (window.exactIdentity && !window.identifier.empty() && m_workspaceMetadataBackend != nullptr) {
+    (void)m_workspaceMetadataBackend->closeWindowById(window.identifier);
     return;
   }
   if (compositors::isKde() && m_kwinActiveWindow != nullptr && m_kwinActiveWindow->isAvailable()) {
@@ -1338,12 +1422,12 @@ const char* CompositorPlatform::workspaceBackendName() const noexcept {
   return m_workspaces != nullptr ? m_workspaces->backendName() : "none";
 }
 
-void CompositorPlatform::focusCompositorWindow(const std::string& windowId) const {
+void CompositorPlatform::focusCompositorWindow(const std::string& windowId, bool warpPointer) const {
   if (compositors::isKde() && m_kwinActiveWindow != nullptr && m_kwinActiveWindow->isAvailable() && !windowId.empty()) {
-    m_kwinActiveWindow->activateWindow({}, {}, windowId);
+    m_kwinActiveWindow->activateWindow({}, {}, windowId, warpPointer);
     return;
   }
-  if (m_workspaceMetadataBackend != nullptr && m_workspaceMetadataBackend->focusWindowById(windowId)) {
+  if (m_workspaceMetadataBackend != nullptr && m_workspaceMetadataBackend->focusWindowById(windowId, warpPointer)) {
     return;
   }
   if (m_workspaces != nullptr) {
@@ -1480,6 +1564,12 @@ bool CompositorPlatform::requestSessionExit() const {
     break;
   case compositors::CompositorKind::Labwc:
     if (requestLabwcSessionExit()) {
+      return true;
+    }
+    break;
+  case compositors::CompositorKind::Umbriel:
+    // noctalia's session menu is its own confirmation, so bypass umbriel's.
+    if (m_runtimeRegistry->umbriel().requestAction("session-quit:skip-confirmation")) {
       return true;
     }
     break;

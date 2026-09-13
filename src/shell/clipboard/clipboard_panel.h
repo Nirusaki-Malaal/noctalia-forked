@@ -145,11 +145,11 @@ private:
   std::string m_deleteConfirmStorageId;
   std::uint64_t m_lastChangeSerial = 0;
   bool m_clearConfirm = false;
-  float m_lastWidth = 0.0f;
-  float m_lastHeight = 0.0f;
-  float m_lastPreviewWidth = -1.0f;
-  float m_lastPreviewHeight = -1.0f;
-  float m_listRowHeight = 0.0f;
+  float m_lastWidth = 0.0F;
+  float m_lastHeight = 0.0F;
+  float m_lastPreviewWidth = -1.0F;
+  float m_lastPreviewHeight = -1.0F;
+  float m_listRowHeight = 0.0F;
   bool m_pendingScrollToSelected = false;
   bool m_isLoadingGifs = false;
 };

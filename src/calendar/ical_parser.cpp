@@ -1,8 +1,11 @@
 #include "calendar/ical_parser.h"
 
+#include "calendar/event_link.h"
 #include "core/log.h"
+#include "render/core/color.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <ctime>
 #include <libical/ical.h>
@@ -190,6 +193,54 @@ namespace calendar {
       return std::ranges::contains(exclusions, occurrence);
     }
 
+    std::string extractComponentColor(icalcomponent* component) {
+      if (component == nullptr) {
+        return {};
+      }
+
+      auto parseColor = [](const char* val) -> std::string {
+        if (val == nullptr || *val == '\0') {
+          return {};
+        }
+        Color c;
+        if (tryParseCssColorWithNamedColors(val, c)) {
+          return formatRgbHex(c);
+        }
+        return {};
+      };
+
+      // 1. RFC 7986 COLOR property
+      if (icalproperty* prop = icalcomponent_get_first_property(component, ICAL_COLOR_PROPERTY); prop != nullptr) {
+        if (auto hex = parseColor(icalproperty_get_color(prop)); !hex.empty()) {
+          return hex;
+        }
+      }
+
+      const auto equalsIgnoreCase = [](std::string_view lhs, std::string_view rhs) {
+        return lhs.size() == rhs.size() && std::ranges::equal(lhs, rhs, [](char left, char right) {
+                 return std::tolower(static_cast<unsigned char>(left))
+                     == std::tolower(static_cast<unsigned char>(right));
+               });
+      };
+      for (icalproperty* prop = icalcomponent_get_first_property(component, ICAL_X_PROPERTY); prop != nullptr;
+           prop = icalcomponent_get_next_property(component, ICAL_X_PROPERTY)) {
+        const char* xname = icalproperty_get_x_name(prop);
+        if (xname == nullptr) {
+          continue;
+        }
+        std::string_view name(xname);
+        if (equalsIgnoreCase(name, "X-APPLE-CALENDAR-COLOR")
+            || equalsIgnoreCase(name, "X-COLOR")
+            || equalsIgnoreCase(name, "X-OUTLOOK-COLOR")) {
+          if (auto hex = parseColor(icalproperty_get_x(prop)); !hex.empty()) {
+            return hex;
+          }
+        }
+      }
+
+      return {};
+    }
+
     CalendarEvent baseEventFromComponent(icalcomponent* component) {
       CalendarEvent event;
       if (const char* uid = icalcomponent_get_uid(component); uid != nullptr) {
@@ -201,12 +252,20 @@ namespace calendar {
       if (const char* location = icalcomponent_get_location(component); location != nullptr) {
         event.location = location;
       }
+      std::string urlProperty;
+      if (icalproperty* url = icalcomponent_get_first_property(component, ICAL_URL_PROPERTY); url != nullptr) {
+        if (const char* value = icalproperty_get_url(url); value != nullptr) {
+          urlProperty = value;
+        }
+      }
+      event.url = resolveEventLink(event.location, urlProperty);
 
       const icaltimetype start = icalcomponent_get_dtstart(component);
       const icaltimetype end = icalcomponent_get_dtend(component);
       event.start = timePointFromICal(start);
       event.end = timePointFromICal(end);
       event.allDay = icaltime_is_date(start) != 0;
+      event.colorHex = extractComponentColor(component);
       return event;
     }
 
@@ -396,7 +455,18 @@ namespace calendar {
     std::string text{ics};
     ICalComponentPtr root{icalcomponent_new_from_string(text.c_str())};
     if (root == nullptr) {
-      return {};
+      // Not iCalendar text at all: HTML sign-in pages, proxy errors, and truncated feeds all land
+      // here. Reported as invalid so callers keep their last known events instead of persisting an
+      // empty calendar. A well-formed VCALENDAR with no VEVENTs still parses and reports Complete.
+      return {.status = ICalParseStatus::InvalidCalendar};
+    }
+
+    // libical recovers from content lines it cannot parse by replacing each one with an X-LIC-ERROR
+    // property instead of failing the whole document. That keeps one quirky line in an otherwise
+    // good feed from hiding every event in it, so a non-zero count alone is not a rejection.
+    const int unparseableLines = icalcomponent_count_errors(root.get());
+    if (unparseableLines > 0) {
+      kLog.debug("iCalendar input has {} unparseable line(s); skipping them", unparseableLines);
     }
 
     std::vector<icalcomponent*> components;
@@ -444,13 +514,16 @@ namespace calendar {
       };
       const ICalParseStatus status = expandRecurrences(component, componentStart, control, data);
       if (status != ICalParseStatus::Complete) {
-        if (status == ICalParseStatus::WorkBudgetExceeded) {
-          kLog.warn("iCalendar recurrence expansion exceeded the work limit");
-        }
         return {.events = std::move(events), .status = status};
       }
     }
 
+    if (events.empty() && unparseableLines > 0) {
+      // Damaged input that yielded nothing usable, as opposed to a calendar whose owner really has
+      // no events. Reported as invalid so callers keep their cached events rather than persisting
+      // an empty result.
+      return {.status = ICalParseStatus::InvalidCalendar};
+    }
     return {.events = std::move(events)};
   }
 

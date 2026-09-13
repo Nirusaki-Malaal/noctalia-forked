@@ -81,6 +81,10 @@ public:
       const noctalia::bar::WidgetActionBindings::ActionTable* barActions, std::string_view barContext,
       const noctalia::bar::WidgetActionDispatcher* dispatcher
   );
+  void applyCommonOptions(
+      const CommonWidgetOptions& options, FontWeight barFontWeight, const std::string& barFontFamily,
+      std::string_view logContext
+  );
   void setActionContext(IpcInvocationContext context) { m_actionContext = std::move(context); }
   [[nodiscard]] const noctalia::bar::WidgetActionBindings& gestureBindings() const noexcept {
     return m_gestureBindings;
@@ -93,6 +97,9 @@ public:
   void setPanelToggleCallback(PanelToggleCallback callback);
   void setContentScale(float scale) noexcept { m_contentScale = scale; }
   [[nodiscard]] float contentScale() const noexcept { return m_contentScale; }
+  void setFontScale(float scale) noexcept { m_fontScale = scale; }
+  [[nodiscard]] float fontScale() const noexcept { return m_contentScale * m_fontScale; }
+  [[nodiscard]] float fontScaleMultiplier() const noexcept { return m_fontScale; }
   void setLabelFontWeight(FontWeight fontWeight) noexcept { m_labelFontWeight = fontWeight; }
   [[nodiscard]] FontWeight labelFontWeight() const noexcept { return m_labelFontWeight; }
   void setLabelFontFamily(std::string family) noexcept { m_labelFontFamily = std::move(family); }
@@ -107,6 +114,9 @@ public:
   void setWidgetIconColor(std::optional<ColorSpec> color) noexcept { m_widgetIconColor = color; }
   void setNonInteractive(bool nonInteractive) noexcept;
   [[nodiscard]] bool nonInteractive() const noexcept { return m_nonInteractive; }
+  // Bar-owned: blocks all pointer input while the member is clipped out of a collapsed accordion.
+  void setBarPointerSuppressed(bool suppressed) noexcept;
+  [[nodiscard]] bool barPointerSuppressed() const noexcept { return m_barPointerSuppressed; }
   [[nodiscard]] const WidgetBarCapsuleSpec& barCapsuleSpec() const noexcept { return m_barCapsuleSpec; }
   void setBarCapsuleScene(Node* shell, Box* box) noexcept;
   [[nodiscard]] Node* barCapsuleShell() const noexcept { return m_capsuleShell; }
@@ -156,7 +166,8 @@ protected:
   virtual void doLayout(Renderer& renderer, float containerWidth, float containerHeight) = 0;
   virtual void doUpdate(Renderer& renderer) { (void)renderer; }
 
-  float m_contentScale = 1.0f;
+  float m_contentScale = 1.0F;
+  float m_fontScale = 1.0F;
   FontWeight m_labelFontWeight = FontWeight::Medium;
   std::string m_labelFontFamily; // empty = inherit renderer-global family
   std::string m_configName;
@@ -170,10 +181,11 @@ protected:
   std::optional<ColorSpec> m_widgetForeground;
   std::optional<ColorSpec> m_widgetIconColor;
   bool m_nonInteractive = false;
+  bool m_barPointerSuppressed = false;
   Node* m_capsuleShell = nullptr;
   Box* m_capsuleBox = nullptr;
   Box* m_hoverBox = nullptr;
-  float m_hoverProgress = 0.0f;
+  float m_hoverProgress = 0.0F;
 
 private:
   void installGestureHandlers();
@@ -181,6 +193,7 @@ private:
   // An enabled InputArea captures hover (and the highlight) even with no accepted buttons, so the
   // wrapper stays inert until something is actually bound to it.
   void updateGestureAreaEnabled() noexcept;
+  void syncOuterHitTestVisible() noexcept;
   // The wrapper carries no geometry or visibility of its own; it mirrors root(), which widgets
   // size in doLayout() and hide in doUpdate() (hide_when_no_media, hide_when_off, ...).
   void syncOuterFromRoot() noexcept;

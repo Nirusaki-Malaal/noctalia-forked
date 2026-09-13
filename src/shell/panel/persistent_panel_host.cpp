@@ -31,7 +31,10 @@ namespace {
 
 PersistentPanelHost::PersistentPanelHost() = default;
 
-PersistentPanelHost::~PersistentPanelHost() { closeAll(); }
+PersistentPanelHost::~PersistentPanelHost() {
+  m_panelClosedCallback = nullptr;
+  closeAll();
+}
 
 void PersistentPanelHost::initialize(
     CompositorPlatform& platform, ConfigService* config, RenderContext* renderContext
@@ -43,6 +46,10 @@ void PersistentPanelHost::initialize(
 
 void PersistentPanelHost::registerPanel(const std::string& id, std::unique_ptr<Panel> content) {
   m_panels[id] = std::move(content);
+}
+
+void PersistentPanelHost::setPanelClosedCallback(std::function<void()> callback) {
+  m_panelClosedCallback = std::move(callback);
 }
 
 void PersistentPanelHost::unregisterPanel(const std::string& id) {
@@ -64,6 +71,25 @@ void PersistentPanelHost::appendPanelIds(std::vector<std::string>& out) const {
 
 bool PersistentPanelHost::isOpen(std::string_view id) const noexcept {
   return std::ranges::any_of(m_instances, [&](const auto& instance) { return instance->id == id; });
+}
+
+std::optional<LayerPopupParentContext> PersistentPanelHost::popupParentContext(std::string_view id) const noexcept {
+  const auto it = std::ranges::find_if(m_instances, [&](const auto& instance) { return instance->id == id; });
+  if (it == m_instances.end() || (*it)->surface == nullptr) {
+    return std::nullopt;
+  }
+  const auto& instance = **it;
+  LayerPopupParentContext context{
+      .surface = instance.surface->wlSurface(),
+      .layerSurface = instance.surface->layerSurface(),
+      .output = instance.output,
+      .width = instance.surface->width(),
+      .height = instance.surface->height(),
+  };
+  if (context.surface == nullptr || context.layerSurface == nullptr || context.width == 0 || context.height == 0) {
+    return std::nullopt;
+  }
+  return context;
 }
 
 PersistentPanelHost::Instance* PersistentPanelHost::findInstance(std::string_view id) noexcept {
@@ -116,8 +142,8 @@ void PersistentPanelHost::open(const std::string& id, wl_output* output, std::st
 
   const bool fillWidth = panel->fillsWidth();
   const bool fillHeight = panel->fillsHeight();
-  auto panelWidth = static_cast<std::uint32_t>(std::max(1.0f, std::round(panel->preferredWidth())));
-  auto panelHeight = static_cast<std::uint32_t>(std::max(1.0f, std::round(panel->preferredHeight())));
+  auto panelWidth = static_cast<std::uint32_t>(std::max(1.0F, std::round(panel->preferredWidth())));
+  auto panelHeight = static_cast<std::uint32_t>(std::max(1.0F, std::round(panel->preferredHeight())));
   const auto padding = screenPadding();
   if (outputWidth > 0) {
     panelWidth = std::min(panelWidth, static_cast<std::uint32_t>(std::max(1, outputWidth - padding * 2)));
@@ -261,6 +287,7 @@ void PersistentPanelHost::destroyInstance(std::vector<std::unique_ptr<Instance>>
 
   instance->animations.cancelAll();
   instance->inputDispatcher.setSceneRoot(nullptr);
+  TooltipManager::instance().restoreBarTooltipsForPanel(instance->id);
   // Tooltips are xdg_popups parented to this surface; they must die before it.
   TooltipManager::instance().forceDestroy();
   if (instance->panel != nullptr) {
@@ -275,6 +302,9 @@ void PersistentPanelHost::destroyInstance(std::vector<std::unique_ptr<Instance>>
     m_platform->stopKeyRepeat();
   }
   kLog.debug("closed \"{}\"", instance->id);
+  if (m_panelClosedCallback) {
+    m_panelClosedCallback();
+  }
 }
 
 void PersistentPanelHost::toggle(const std::string& id, wl_output* output, std::string_view context) {
@@ -309,6 +339,9 @@ void PersistentPanelHost::buildScene(Instance& instance, std::uint32_t width, st
     auto bg = ui::box({});
     bg->setPanelStyle(m_config->config().shell.panel.borders);
     bg->setFill(colorSpecFromRole(ColorRole::Surface, backgroundOpacity));
+    if (m_config->config().shell.panel.borders) {
+      bg->setBorder(colorSpecFromRole(ColorRole::Outline, backgroundOpacity), Style::borderWidth);
+    }
     instance.bgNode = static_cast<Box*>(instance.sceneRoot->addChild(std::move(bg)));
   }
 
@@ -402,16 +435,17 @@ void PersistentPanelHost::layoutScene(Instance& instance, std::uint32_t width, s
     instance.bgNode->setSize(panelW, panelH);
   }
 
-  const float padding = instance.panel->hasDecoration() ? instance.panel->contentScale() * Style::panelPadding : 0.0f;
-  const float contentWidth = panelW - padding * 2.0f;
-  const float contentHeight = panelH - padding * 2.0f;
+  const float padding = instance.panel->hasDecoration() ? instance.panel->contentScale() * Style::panelPadding : 0.0F;
+  const float contentWidth = panelW - padding * 2.0F;
+  const float contentHeight = panelH - padding * 2.0F;
+  Renderer& renderer = instance.surface->renderTarget().renderer();
   {
     UiPhaseScope updatePhase(UiPhase::Update);
-    instance.panel->update(*m_renderContext);
+    instance.panel->update(renderer);
   }
   {
     UiPhaseScope layoutPhase(UiPhase::Layout);
-    instance.panel->layout(*m_renderContext, contentWidth, contentHeight);
+    instance.panel->layout(renderer, contentWidth, contentHeight);
   }
   if (instance.contentNode != nullptr) {
     instance.contentNode->setPosition(panelX + padding, panelY + padding);
@@ -430,6 +464,7 @@ void PersistentPanelHost::prepareFrame(Instance& instance, bool needsUpdate, boo
     return;
   }
   m_renderContext->makeCurrent(instance.surface->renderTarget());
+  Renderer& renderer = instance.surface->renderTarget().renderer();
 
   const auto width = instance.surface->width();
   const auto height = instance.surface->height();
@@ -445,7 +480,7 @@ void PersistentPanelHost::prepareFrame(Instance& instance, bool needsUpdate, boo
 
   if (needsUpdate) {
     UiPhaseScope updatePhase(UiPhase::Update);
-    instance.panel->update(*m_renderContext);
+    instance.panel->update(renderer);
   }
   if (needsLayout) {
     layoutScene(instance, width, height);
@@ -497,7 +532,8 @@ bool PersistentPanelHost::onPointerEvent(const PointerEvent& event) {
       return false;
     }
     instance->inputDispatcher.pointerButton(
-        static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, event.pressed
+        static_cast<float>(event.sx), static_cast<float>(event.sy), event.button, event.pressed, event.serial,
+        event.time, event.touch
     );
     break;
   case PointerEvent::Type::Axis:
@@ -584,6 +620,9 @@ void PersistentPanelHost::onConfigReloaded() {
     if (instance->bgNode != nullptr) {
       instance->bgNode->setPanelStyle(m_config->config().shell.panel.borders);
       instance->bgNode->setFill(colorSpecFromRole(ColorRole::Surface, backgroundOpacity));
+      if (m_config->config().shell.panel.borders) {
+        instance->bgNode->setBorder(colorSpecFromRole(ColorRole::Outline, backgroundOpacity), Style::borderWidth);
+      }
     }
     if (instance->surface != nullptr) {
       instance->surface->requestLayout();

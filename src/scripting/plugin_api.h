@@ -20,7 +20,17 @@ namespace scripting {
   inline constexpr std::uint32_t kPanelFrameTickPluginApiVersion = 18;
   inline constexpr std::uint32_t kFormatTimeTimezonePluginApiVersion = 19;
   inline constexpr std::uint32_t kSoundPluginApiVersion = 20;
-  inline constexpr std::uint32_t kCurrentPluginApiVersion = kSoundPluginApiVersion;
+  inline constexpr std::uint32_t kPluginUiPropsPluginApiVersion = 21;
+  inline constexpr std::uint32_t kModuleRequirePluginApiVersion = 22;
+  inline constexpr std::uint32_t kAsyncFileReadPluginApiVersion = 23;
+  inline constexpr std::uint32_t kDirectArgvPluginApiVersion = 24;
+  inline constexpr std::uint32_t kWallpaperMaskPluginApiVersion = 25;
+  inline constexpr std::uint32_t kGetSettingPluginApiVersion = 26;
+  inline constexpr std::uint32_t kInputFrameVisibilityPluginApiVersion = 27;
+  inline constexpr std::uint32_t kPanelContextMenuPluginApiVersion = 28;
+  inline constexpr std::uint32_t kGraphPointerTrackingPluginApiVersion = 29;
+  inline constexpr std::uint32_t kPanelLayerPluginApiVersion = 30;
+  inline constexpr std::uint32_t kCurrentPluginApiVersion = kPanelLayerPluginApiVersion;
 
   static_assert(kOldestSupportedPluginApiVersion <= kCurrentPluginApiVersion);
 

@@ -105,7 +105,7 @@ PluginWidget::PluginWidget(
     scripting::PluginRuntimeContext context, std::string barName, std::string outputName, bool enableScroll
 )
     : m_entryId(std::move(context.entryId)), m_sourcePath(std::move(context.sourcePath)),
-      m_pluginDir(m_sourcePath.parent_path()), m_barName(std::move(barName)), m_outputName(std::move(outputName)),
+      m_pluginDir(std::move(context.pluginDir)), m_barName(std::move(barName)), m_outputName(std::move(outputName)),
       m_scriptApi(context.scriptApi), m_settings(std::move(context.settings)), m_fileWatcher(context.fileWatcher),
       m_platform(context.platform), m_clipboard(context.clipboard), m_httpClient(context.httpClient),
       m_audioSpectrum(context.audioSpectrum), m_mpris(context.mpris), m_timerPhase(nextTimerPhase()),
@@ -186,7 +186,7 @@ void PluginWidget::create() {
     // Whole detent steps, so a wheel notch and a touchpad flick mean the same
     // thing to the script. Continuous sources report 0 until a detent accrues.
     const float steps = data.scrollSteps();
-    if (steps == 0.0f)
+    if (steps == 0.0F)
       return false;
     const char* axis = data.axis == WL_POINTER_AXIS_VERTICAL_SCROLL ? "vertical" : "horizontal";
     // The third argument is true only on the first step of a flick in that direction. A script
@@ -223,7 +223,7 @@ void PluginWidget::create() {
   flex->addChild(
       ui::label({
           .out = &m_label,
-          .fontSize = Style::fontSizeBody * m_contentScale,
+          .fontSize = Style::fontSizeBody * fontScale(),
           .fontWeight = labelFontWeight(),
           .fontFamily = labelFontFamily(),
           .visible = false,
@@ -245,7 +245,7 @@ void PluginWidget::create() {
   m_reconciler.setCallbackSink([this](const ui::UiTreeReconciler::ControlCallback& callback) {
     if (m_runtime != nullptr) {
       (void)m_runtime->enqueueCallStrings(
-          callback.fn, callback.arg1, callback.arg2, makeScriptSnapshot(), callback.coalesce
+          callback.fn, callback.arg1, callback.arg2, makeScriptSnapshot(), callback.coalesce, callback.coalesceKey
       );
     }
   });
@@ -281,6 +281,9 @@ void PluginWidget::create() {
     auto token = alive.lock();
     if (token == nullptr || !*token) {
       return;
+    }
+    if (result.modulePathsKnown) {
+      m_scriptWatcher.setModulePaths(result.modulePaths);
     }
     handleScriptResult(std::move(result));
   });
@@ -327,12 +330,16 @@ void PluginWidget::doLayout(Renderer& renderer, float containerWidth, float cont
   if (!m_flex)
     return;
 
+  const ColorSpec fallback = colorSpecFromRole(ColorRole::OnSurface);
+
   m_flex->setDirection(m_isVertical ? FlexDirection::Vertical : FlexDirection::Horizontal);
 
   if (m_tree.has_value() && m_uiHost != nullptr) {
     m_uiHost->setDirection(m_isVertical ? FlexDirection::Vertical : FlexDirection::Horizontal);
     m_reconciler.setScale(contentScale());
+    m_reconciler.setFontScale(fontScaleMultiplier());
     m_reconciler.setTextDefaults(labelFontFamily(), labelFontWeight());
+    m_reconciler.setColorDefaults(widgetForegroundOr(fallback), widgetIconColorOr(fallback));
     (void)m_reconciler.reconcile(*m_uiHost, *m_tree, renderer);
     m_uiHost->layout(renderer);
     if (m_area)
@@ -340,7 +347,7 @@ void PluginWidget::doLayout(Renderer& renderer, float containerWidth, float cont
     return;
   }
 
-  m_label->setColor(resolveScriptColor(m_textColor));
+  m_label->setColor(resolveScriptColor(m_textColor, widgetForegroundOr(fallback)));
   m_label->setFontWeight(labelFontWeight());
   m_label->setVisible(!m_label->text().empty());
   if (m_label->visible()) {
@@ -348,7 +355,7 @@ void PluginWidget::doLayout(Renderer& renderer, float containerWidth, float cont
   }
 
   if (m_glyphVisible) {
-    m_glyph->setColor(resolveScriptColor(m_glyphColor));
+    m_glyph->setColor(resolveScriptColor(m_glyphColor, widgetIconColorOr(fallback)));
     m_glyph->measure(renderer);
   }
 
@@ -381,8 +388,8 @@ void PluginWidget::luaSetGlyph(std::string_view name) {
   if (!m_imagePath.empty()) {
     m_imagePath.clear();
     m_resolvedImagePath.clear();
-    m_imageWidth = 0.0f;
-    m_imageHeight = 0.0f;
+    m_imageWidth = 0.0F;
+    m_imageHeight = 0.0F;
     m_imageWatch = false;
     m_imageForceReload = false;
     m_imageDirty = true;
@@ -409,8 +416,8 @@ void PluginWidget::luaSetImage(std::string_view path, bool watch, float width, f
 
   std::string nextPath(path);
   const bool nextWatch = watch && !nextPath.empty();
-  const float nextWidth = std::max(0.0f, width);
-  const float nextHeight = std::max(0.0f, height);
+  const float nextWidth = std::max(0.0F, width);
+  const float nextHeight = std::max(0.0F, height);
   const bool pathChanged = nextPath != m_imagePath;
   const bool watchChanged = nextWatch != m_imageWatch;
   const bool sizeChanged = nextWidth != m_imageWidth || nextHeight != m_imageHeight;
@@ -530,17 +537,19 @@ PluginWidget::dispatchIpc(std::string_view event, std::string_view payload, cons
   return DispatchResult::Handled;
 }
 
-ColorSpec PluginWidget::resolveScriptColor(const ScriptColorState& state) const noexcept {
-  const ColorSpec fallback = colorSpecFromRole(ColorRole::OnSurface);
+// `on_surface` from an imperative setColor/setGlyphColor means "host default", so the widget's
+// `color`/`icon_color` still applies; a `script` mode color or any other role is taken literally.
+// The declarative path has no such sentinel: `ui.label{color = "on_surface"}` stays on_surface.
+ColorSpec PluginWidget::resolveScriptColor(const ScriptColorState& state, const ColorSpec& defaultColor) noexcept {
   if (!state.color.has_value()) {
-    return widgetForegroundOr(fallback);
+    return defaultColor;
   }
   if (!state.color->role.has_value()
       || state.mode == ScriptColorMode::Script
       || *state.color->role != ColorRole::OnSurface) {
     return *state.color;
   }
-  return widgetForegroundOr(fallback);
+  return defaultColor;
 }
 
 PluginWidget::ScriptColorMode PluginWidget::scriptColorModeFromToken(std::string_view token) noexcept {
@@ -762,13 +771,13 @@ void PluginWidget::syncImage(Renderer& renderer) {
     return;
   }
 
-  const float logicalWidth = m_imageWidth > 0.0f ? m_imageWidth : Style::baseGlyphSize;
-  const float logicalHeight = m_imageHeight > 0.0f ? m_imageHeight : logicalWidth;
+  const float logicalWidth = m_imageWidth > 0.0F ? m_imageWidth : Style::baseGlyphSize;
+  const float logicalHeight = m_imageHeight > 0.0F ? m_imageHeight : logicalWidth;
   const float imageWidth = logicalWidth * m_contentScale;
   const float imageHeight = logicalHeight * m_contentScale;
   m_image->setSize(imageWidth, imageHeight);
 
-  const int imageTargetSize = std::max(1, static_cast<int>(std::round(std::max(imageWidth, imageHeight) * 3.0f)));
+  const int imageTargetSize = std::max(1, static_cast<int>(std::round(std::max(imageWidth, imageHeight) * 3.0F)));
   if (m_imageDirty) {
     const bool loaded = m_imageForceReload
         ? m_image->reloadSourceFile(renderer, m_resolvedImagePath.string(), imageTargetSize, true)
@@ -831,17 +840,10 @@ void PluginWidget::scheduleImageReloadRetry() {
 bool PluginWidget::shouldDeferUpdate() const { return m_updateDeferralCallback && m_updateDeferralCallback(); }
 
 void PluginWidget::setupScriptWatch() {
-  if (m_sourcePath.empty() || !m_fileWatcher)
-    return;
-  m_watchId = m_fileWatcher->watch(m_sourcePath, [this] { reloadScript(); }, FileWatcher::WatchTrigger::WriteCompleted);
+  m_scriptWatcher.start(m_fileWatcher, m_sourcePath, [this] { reloadScript(); });
 }
 
-void PluginWidget::teardownScriptWatch() {
-  if (m_watchId == 0 || !m_fileWatcher)
-    return;
-  m_fileWatcher->unwatch(m_watchId);
-  m_watchId = 0;
-}
+void PluginWidget::teardownScriptWatch() { m_scriptWatcher.stop(); }
 
 void PluginWidget::reloadScript() {
   std::string source = readFile(m_sourcePath);
@@ -858,8 +860,8 @@ void PluginWidget::reloadScript() {
   m_glyphVisible = false;
   m_imagePath.clear();
   m_resolvedImagePath.clear();
-  m_imageWidth = 0.0f;
-  m_imageHeight = 0.0f;
+  m_imageWidth = 0.0F;
+  m_imageHeight = 0.0F;
   m_textColor = {};
   m_glyphColor = {};
   m_updateIntervalMs = 250;

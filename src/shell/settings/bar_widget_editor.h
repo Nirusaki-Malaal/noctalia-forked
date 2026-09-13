@@ -2,10 +2,12 @@
 
 #include "shell/settings/settings_registry.h"
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class Button;
@@ -21,11 +23,10 @@ namespace settings {
   struct BarWidgetEditorContext {
     const Config& config;
     ConfigService* configService = nullptr;
-    float scale = 1.0f;
+    float scale = 1.0F;
     bool showAdvanced = false;
     bool showOverriddenOnly = false;
     std::vector<SelectOption> batteryDeviceOptions;
-    std::vector<std::string> keyboardLayoutNames;
     std::string& editingWidgetName;
     std::string& editingCapsuleGroupId;
     std::vector<std::string>& selectedLaneWidgets;
@@ -47,12 +48,18 @@ namespace settings {
     std::function<void(std::vector<std::string>, ConfigOverrideValue)> setOverride;
     std::function<void(std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>)> setOverrides;
     std::function<void(std::vector<std::string>)> clearOverride;
+    std::function<void(std::vector<std::vector<std::string>>)> clearOverrides;
+    // Reverts a lane and the capsule groups it holds to the config file.
+    std::function<void(std::vector<std::string>)> resetBarLane;
     std::function<void(std::string, std::string, std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>)>
         renameWidgetInstance;
     std::function<void()> closeHostedEditor;
     std::function<void(std::vector<std::string> laneListPath, std::string widgetName)> openWidgetInspector;
     std::function<void(std::vector<std::string> laneListPath, std::string groupId)> openCapsuleGroupInspector;
     std::function<std::unique_ptr<Button>(const std::vector<std::string>&)> makeResetButton;
+    // Reset-styled button (with the usual confirm step) that runs `action` instead of a plain clear.
+    std::function<std::unique_ptr<Button>(const std::vector<std::string>&, std::function<void()>)>
+        makeResetActionButton;
     std::function<void(Flex&, const SettingEntry&, std::unique_ptr<Node>)> makeRow;
     std::function<std::unique_ptr<Node>(bool, std::vector<std::string>, std::optional<bool> clearWhenValue)> makeToggle;
     std::function<std::unique_ptr<Node>(const SelectSetting&, std::vector<std::string>)> makeSelect;
@@ -71,6 +78,21 @@ namespace settings {
 
   [[nodiscard]] bool isBarWidgetListPath(const std::vector<std::string>& path);
   [[nodiscard]] bool isFirstBarWidgetListPath(const std::vector<std::string>& path);
+
+  // Lane selection tokens address a lane position as "<laneKey>#<index>".
+  struct LaneSelectionToken {
+    std::string_view laneKey;
+    std::size_t index = 0;
+  };
+
+  [[nodiscard]] std::string makeLaneSelectionToken(std::string_view laneKey, std::size_t index);
+  // nullopt unless `token` is well-formed; `laneKey` views into `token`.
+  [[nodiscard]] std::optional<LaneSelectionToken> parseLaneSelectionToken(std::string_view token);
+  // Drops the token addressing `removedIndex` in `laneKey` and shifts that lane's higher indices
+  // down one. Tokens for other lanes are left alone.
+  void reindexLaneSelectionAfterRemoval(
+      std::vector<std::string>& selection, std::string_view laneKey, std::size_t removedIndex
+  );
 
   void addBarWidgetLaneEditor(Flex& section, const SettingEntry& entry, const BarWidgetEditorContext& ctx);
 

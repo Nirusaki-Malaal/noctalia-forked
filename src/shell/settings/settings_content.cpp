@@ -30,6 +30,8 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -66,7 +68,6 @@ namespace settings {
         .showAdvanced = ctx.showAdvanced,
         .showOverriddenOnly = ctx.showOverriddenOnly,
         .batteryDeviceOptions = ctx.batteryDeviceOptions,
-        .keyboardLayoutNames = ctx.keyboardLayoutNames,
         .editingWidgetName = ctx.editingWidgetName,
         .editingCapsuleGroupId = ctx.editingCapsuleGroupId,
         .selectedLaneWidgets = ctx.selectedLaneWidgets,
@@ -89,11 +90,16 @@ namespace settings {
         .setOverride = ctx.setOverride,
         .setOverrides = ctx.setOverrides,
         .clearOverride = ctx.clearOverride,
+        .clearOverrides = ctx.clearOverrides,
+        .resetBarLane = ctx.resetBarLane,
         .renameWidgetInstance = ctx.renameWidgetInstance,
         .closeHostedEditor = ctx.closeHostedEditor,
         .openWidgetInspector = ctx.openWidgetInspectorEditor,
         .openCapsuleGroupInspector = ctx.openCapsuleGroupEditor,
         .makeResetButton = [&factory](const std::vector<std::string>& path) { return factory.makeResetButton(path); },
+        .makeResetActionButton = [&factory](
+                                     const std::vector<std::string>& path, std::function<void()> action
+                                 ) { return factory.makeResetButton(path, std::move(action)); },
         .makeRow = [&factory](
                        Flex& section, const SettingEntry& entry, std::unique_ptr<Node> control
                    ) { factory.makeRow(section, entry, std::move(control)); },
@@ -144,23 +150,26 @@ namespace settings {
     };
 
     const auto makeSection = [&](std::string_view title, SettingsSection sectionKey) -> Flex* {
-      auto section = ui::column(
-          {
-              .align = FlexAlign::Stretch,
-              .gap = Style::spaceSm * scale,
-              .padding = Style::spaceLg * scale,
-              .fill = clearColorSpec(),
-          },
-          ui::row(
-              {.align = FlexAlign::Center, .gap = Style::spaceSm * scale},
-              ui::glyph({
-                  .glyph = std::string(sectionGlyph(sectionKey)),
-                  .glyphSize = Style::fontSizeHeader * scale,
-                  .color = colorSpecFromRole(ColorRole::Primary),
-              }),
-              makeLabel(title, Style::fontSizeHeader * scale, colorSpecFromRole(ColorRole::Primary), FontWeight::Bold)
-          )
+      auto titleRow = ui::row(
+          {.align = FlexAlign::Center, .gap = Style::spaceSm * scale},
+          ui::glyph({
+              .glyph = std::string(sectionGlyph(sectionKey)),
+              .glyphSize = Style::fontSizeHeader * scale,
+              .color = colorSpecFromRole(ColorRole::Primary),
+          }),
+          makeLabel(title, Style::fontSizeHeader * scale, colorSpecFromRole(ColorRole::Primary), FontWeight::Bold)
       );
+      auto section = ui::column({
+          .align = FlexAlign::Stretch,
+          .gap = Style::spaceSm * scale,
+          .padding = Style::spaceLg * scale,
+          .fill = clearColorSpec(),
+      });
+      if (ctx.pageTitleRow != nullptr && ctx.searchQuery.empty() && ctx.pageTitleRow->children().empty()) {
+        ctx.pageTitleRow->addChild(std::move(titleRow));
+      } else {
+        section->addChild(std::move(titleRow));
+      }
       auto* raw = section.get();
       content.addChild(std::move(section));
       return raw;
@@ -175,7 +184,7 @@ namespace settings {
             ui::column(
                 {.align = FlexAlign::Stretch,
                  .gap = Style::spaceSm * scale,
-                 .configure = [scale](Flex& flex) { flex.setPadding(Style::spaceSm * scale, 0.0f, 0.0f, 0.0f); }},
+                 .configure = [scale](Flex& flex) { flex.setPadding(Style::spaceSm * scale, 0.0F, 0.0F, 0.0F); }},
                 ui::separator(),
                 makeLabel(title, Style::fontSizeBody * scale, colorSpecFromRole(ColorRole::Secondary), FontWeight::Bold)
             )
@@ -221,7 +230,7 @@ namespace settings {
     };
 
     const auto makeText = [&](const std::string& value, const std::string& placeholder, std::vector<std::string> path,
-                              float width = 0.0f) {
+                              float width = 0.0F) {
       return factory.makeText(value, placeholder, std::move(path), width);
     };
 
@@ -301,7 +310,7 @@ namespace settings {
            .wrap = true,
            .gap = Style::spaceMd * scale,
            .paddingV = Style::spaceXs * scale,
-           .paddingH = 0.0f,
+           .paddingH = 0.0F,
            .fillWidth = true}
       );
 
@@ -389,7 +398,7 @@ namespace settings {
 
       auto grid =
           ui::column({.align = FlexAlign::Stretch, .gap = Style::spaceSm * scale, .configure = [scale](Flex& flex) {
-                        flex.setPadding(Style::spaceMd * scale, 0.0f, 0.0f, 0.0f);
+                        flex.setPadding(Style::spaceMd * scale, 0.0F, 0.0F, 0.0F);
                       }});
       std::unique_ptr<Flex> row;
       std::size_t countInRow = 0;
@@ -399,7 +408,7 @@ namespace settings {
           return;
         }
         while (countInRow > 0 && countInRow < kTemplateCardsPerRow) {
-          row->addChild(ui::row({.fillWidth = true, .flexGrow = 1.0f}));
+          row->addChild(ui::row({.fillWidth = true, .flexGrow = 1.0F}));
           ++countInRow;
         }
         grid->addChild(std::move(row));
@@ -421,13 +430,13 @@ namespace settings {
         auto checkedState = std::make_shared<bool>(checked);
         const auto cardPaletteFor = [scale](bool active) {
           return Button::ButtonPalette{
-              .borderWidth = 1.0f * scale,
+              .borderWidth = 1.0F * scale,
               .normal =
                   Button::ButtonStateColors{
                       .bg = colorSpecFromRole(
-                          active ? ColorRole::Primary : ColorRole::SurfaceVariant, active ? 1.0f : 0.45f
+                          active ? ColorRole::Primary : ColorRole::SurfaceVariant, active ? 1.0F : 0.45F
                       ),
-                      .border = active ? colorSpecFromRole(ColorRole::Primary, 0.9f)
+                      .border = active ? colorSpecFromRole(ColorRole::Primary, 0.9F)
                                        : colorSpecFromRole(ColorRole::Outline, Style::disabledOutlineAlpha),
                       .label = colorSpecFromRole(active ? ColorRole::OnPrimary : ColorRole::OnSurface),
                   },
@@ -445,7 +454,7 @@ namespace settings {
                   },
               .disabled =
                   Button::ButtonStateColors{
-                      .bg = colorSpecFromRole(ColorRole::SurfaceVariant, 0.35f),
+                      .bg = colorSpecFromRole(ColorRole::SurfaceVariant, 0.35F),
                       .border = colorSpecFromRole(ColorRole::Outline, Style::disabledOutlineAlpha),
                       .label = colorSpecFromRole(ColorRole::OnSurfaceVariant),
                   },
@@ -461,7 +470,7 @@ namespace settings {
             .paddingH = Style::spaceSm * scale,
             .gap = Style::spaceXs * scale,
             .radius = Style::scaledRadiusMd(scale),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
         });
         card->addChild(
             ui::checkbox({
@@ -489,7 +498,7 @@ namespace settings {
             })
         );
 
-        auto text = ui::column({.align = FlexAlign::Start, .flexGrow = 1.0f});
+        auto text = ui::column({.align = FlexAlign::Start, .flexGrow = 1.0F});
         text->addChild(
             ui::label({
                 .out = &titleLabel,
@@ -507,7 +516,7 @@ namespace settings {
                   .text = option.description,
                   .fontSize = Style::fontSizeCaption * scale,
                   .color = colorSpecFromRole(
-                      checked ? ColorRole::OnPrimary : ColorRole::OnSurfaceVariant, checked ? 0.75f : 1.0f
+                      checked ? ColorRole::OnPrimary : ColorRole::OnSurfaceVariant, checked ? 0.75F : 1.0F
                   ),
                   .maxLines = 1,
               })
@@ -520,7 +529,7 @@ namespace settings {
           }
           if (categoryLabel != nullptr) {
             categoryLabel->setColor(
-                colorSpecFromRole(active ? ColorRole::OnPrimary : ColorRole::OnSurfaceVariant, active ? 0.75f : 1.0f)
+                colorSpecFromRole(active ? ColorRole::OnPrimary : ColorRole::OnSurfaceVariant, active ? 0.75F : 1.0F)
             );
           }
         };
@@ -529,7 +538,7 @@ namespace settings {
             titleLabel->setColor(colorSpecFromRole(active ? ColorRole::OnPrimary : ColorRole::OnHover));
           }
           if (categoryLabel != nullptr) {
-            categoryLabel->setColor(colorSpecFromRole(active ? ColorRole::OnPrimary : ColorRole::OnHover, 0.75f));
+            categoryLabel->setColor(colorSpecFromRole(active ? ColorRole::OnPrimary : ColorRole::OnHover, 0.75F));
           }
         };
         const auto syncPressedText = [titleLabel, categoryLabel]() {
@@ -537,7 +546,7 @@ namespace settings {
             titleLabel->setColor(colorSpecFromRole(ColorRole::OnPrimary));
           }
           if (categoryLabel != nullptr) {
-            categoryLabel->setColor(colorSpecFromRole(ColorRole::OnPrimary, 0.75f));
+            categoryLabel->setColor(colorSpecFromRole(ColorRole::OnPrimary, 0.75F));
           }
         };
         auto setTileActive = [selected, value, commit, checkedState, card, checkbox, cardPaletteFor,
@@ -593,7 +602,7 @@ namespace settings {
 
       auto block = makeCollectionBlock(entry, false, true, true, true, true, true);
       block->setClipChildren(true);
-      block->setMinWidth(0.0f);
+      block->setMinWidth(0.0F);
       block->setGap(Style::spaceXs * scale);
 
       auto list = ui::column({
@@ -604,7 +613,7 @@ namespace settings {
       });
 
       const auto configureGridRecorder = [](KeybindRecorder& recorder) {
-        recorder.setMinWidth(0.0f);
+        recorder.setMinWidth(0.0F);
         recorder.setFillWidth(true);
         recorder.setClipChildren(true);
       };
@@ -651,7 +660,7 @@ namespace settings {
             .scale = scale,
             .unsetPlaceholder = i18n::tr("settings.controls.keybind.unset-placeholder"),
             .recordingPlaceholder = i18n::tr("settings.controls.keybind.recording-placeholder"),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
             .onCommit =
                 [commitItems, items = keybinds.items, i](KeyChord chord) mutable {
                   if (i < items.size()) {
@@ -699,7 +708,7 @@ namespace settings {
             .scale = scale,
             .unsetPlaceholder = i18n::tr("settings.controls.keybind.add"),
             .recordingPlaceholder = i18n::tr("settings.controls.keybind.recording-placeholder"),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
             .onCommit =
                 [commitItems, items = keybinds.items](KeyChord chord) mutable {
                   items.push_back(chord);
@@ -813,7 +822,7 @@ namespace settings {
             .text = sessionActionRowSummary(kindOptions, (*state)[idx]),
             .fontSize = Style::fontSizeBody * scale,
             .color = colorSpecFromRole(ColorRole::OnSurface),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
         });
         if (ctx.registerSessionActionSummaryLabel) {
           ctx.registerSessionActionSummaryLabel(idx, summaryLabel);
@@ -946,7 +955,7 @@ namespace settings {
             .text = idleBehaviorRowSummary((*state)[idx]),
             .fontSize = Style::fontSizeBody * scale,
             .color = colorSpecFromRole(ColorRole::OnSurface),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
         });
         row->addChild(std::move(summary));
 
@@ -1071,7 +1080,7 @@ namespace settings {
             .text = notificationFilterRowSummary((*state)[idx]),
             .fontSize = Style::fontSizeBody * scale,
             .color = colorSpecFromRole(ColorRole::OnSurface),
-            .flexGrow = 1.0f,
+            .flexGrow = 1.0F,
         });
         row->addChild(std::move(summary));
 
@@ -1167,6 +1176,8 @@ namespace settings {
               return nullptr;
             } else if constexpr (std::is_same_v<T, ListSetting>) {
               return nullptr;
+            } else if constexpr (std::is_same_v<T, StringMapSetting>) {
+              return nullptr;
             } else if constexpr (std::is_same_v<T, ShortcutListSetting>) {
               return nullptr;
             } else if constexpr (std::is_same_v<T, KeybindListSetting>) {
@@ -1182,7 +1193,7 @@ namespace settings {
                 return ui::button({
                     .text = control.label,
                     .fontSize = Style::fontSizeBody * scale,
-                    .variant = control.destructive ? ButtonVariant::Destructive : ButtonVariant::Default,
+                    .variant = control.variant,
                     .minHeight = Style::controlHeight * scale,
                     .paddingV = Style::spaceSm * scale,
                     .paddingH = Style::spaceMd * scale,
@@ -1195,7 +1206,7 @@ namespace settings {
                   .glyph = control.glyph,
                   .fontSize = Style::fontSizeBody * scale,
                   .glyphSize = Style::fontSizeBody * scale,
-                  .variant = control.destructive ? ButtonVariant::Destructive : ButtonVariant::Default,
+                  .variant = control.variant,
                   .minHeight = Style::controlHeight * scale,
                   .paddingV = Style::spaceSm * scale,
                   .paddingH = Style::spaceMd * scale,
@@ -1215,6 +1226,7 @@ namespace settings {
     std::string activeSectionKey;
     std::string activeGroupKey;
     Flex* activeSection = nullptr;
+    Flex* activeGroupBody = nullptr;
     constexpr std::size_t kKeybindsPerRow = 2;
     Flex* activeKeybindRow = nullptr;
     std::size_t activeKeybindRowCount = 0;
@@ -1227,7 +1239,9 @@ namespace settings {
 
     BarWidgetEditorContext barWidgetEditorCtx = makeBarWidgetEditorContext(factory);
 
-    auto isEntryVisible = [&](const SettingEntry& e) -> bool { return !e.visibleWhen || e.visibleWhen(ctx.config); };
+    const auto isEntryVisible = [&](const SettingEntry& e) -> bool {
+      return !e.visibleWhen || e.visibleWhen(ctx.config);
+    };
 
     const std::string_view selectedBarName =
         ctx.selectedBar != nullptr ? std::string_view{ctx.selectedBar->name} : std::string_view{};
@@ -1240,34 +1254,81 @@ namespace settings {
     // Coalesce entries by (content section, group) so each group renders once even if its entries were
     // declared non-contiguously in the registry. See coalesceByGroupKey().
     const auto entryOrder = coalesceByGroupKey(registry.size(), [&](std::size_t i) {
-      return barSettingContentSectionKey(registry[i]) + '\x1f' + registry[i].group;
+      return barSettingContentSectionKey(registry[i]) + '\x1F' + registry[i].group;
     });
-
-    for (const std::size_t entryIndex : entryOrder) {
-      const auto& entry = registry[entryIndex];
+    const auto entryPassesFilters = [&](const SettingEntry& entry) -> bool {
       if (ctx.searchQuery.empty()
           && !ctx.selectedSection.empty()
           && ctx.selectedSection != "bar"
           && (!selectedSettingsSection.has_value() || entry.section != *selectedSettingsSection)) {
-        continue;
+        return false;
       }
       if (ctx.searchQuery.empty()
           && ctx.selectedSection == "bar"
           && !settingEntryMatchesBarNavigation(entry, selectedBarName, selectedMonitorMatch)) {
-        continue;
+        return false;
       }
       if (!ctx.showAdvanced && entry.advanced) {
-        continue;
+        return false;
       }
       if (!isEntryVisible(entry)) {
-        continue;
+        return false;
       }
       if (ctx.showOverriddenOnly
           && ctx.configService != nullptr
           && !settingEntryHasEffectiveOverride(entry, *ctx.configService)) {
-        continue;
+        return false;
       }
-      if (!matchesNormalizedSettingQuery(entry, normalizedSearchQuery)) {
+      return matchesNormalizedSettingQuery(entry, normalizedSearchQuery);
+    };
+
+    std::string pageKey;
+    std::vector<std::string> pageGroupKeys;
+    if (ctx.searchQuery.empty()) {
+      std::unordered_set<std::string> seenGroupKeys;
+      for (const std::size_t entryIndex : entryOrder) {
+        const auto& entry = registry[entryIndex];
+        if (!entryPassesFilters(entry) || entry.group.empty()) {
+          continue;
+        }
+        if (pageKey.empty()) {
+          pageKey = barSettingContentSectionKey(entry);
+        }
+        if (seenGroupKeys.insert(entry.group).second) {
+          pageGroupKeys.push_back(entry.group);
+        }
+      }
+    }
+    const bool collapsibleGroups = ctx.searchQuery.empty() && !pageGroupKeys.empty();
+    std::unordered_set<std::string>* expandedGroups = nullptr;
+    if (collapsibleGroups) {
+      auto [pageIt, fresh] = ctx.expandedGroupsByPage.try_emplace(pageKey);
+      if (fresh) {
+        pageIt->second.insert(pageGroupKeys.front());
+      }
+      expandedGroups = &pageIt->second;
+    }
+
+    std::unordered_map<std::string, Button*> pillByGroup;
+    if (collapsibleGroups && ctx.groupJumpRow != nullptr) {
+      for (const auto& group : pageGroupKeys) {
+        Button* pill = nullptr;
+        ctx.groupJumpRow->addChild(
+            ui::button({
+                .out = &pill,
+                .text = groupLabel(group),
+                .fontSize = Style::fontSizeCaption * scale,
+                .variant = expandedGroups->contains(group) ? ButtonVariant::Primary : ButtonVariant::Default,
+                .radius = Style::scaledRadiusMd(scale),
+            })
+        );
+        pillByGroup.emplace(group, pill);
+      }
+    }
+
+    for (const std::size_t entryIndex : entryOrder) {
+      const auto& entry = registry[entryIndex];
+      if (!entryPassesFilters(entry)) {
         continue;
       }
       // Cap only once a genuinely-matching entry is about to be rendered, so the truncation hint never
@@ -1293,6 +1354,7 @@ namespace settings {
           displayTitle = sectionLabel(entry.section);
         }
         activeSection = makeSection(displayTitle, entry.section);
+        activeGroupBody = activeSection;
         if (ctx.config.shell.offlineMode && settingsSectionNeedsOfflineModeNotice(entry.section)) {
           const bool showDisableHint = entry.section != SettingsSection::Security;
           activeSection->addChild(
@@ -1300,15 +1362,42 @@ namespace settings {
           );
         }
       }
-      if (activeSection != nullptr) {
+      if (activeSection != nullptr && activeGroupBody != nullptr) {
         if (entry.group != activeGroupKey) {
           const bool isFirstGroup = activeGroupKey.empty();
           activeGroupKey = entry.group;
           activeKeybindRow = nullptr;
           activeKeybindRowCount = 0;
-          addGroupLabel(*activeSection, groupLabel(entry.group), isFirstGroup);
+          if (collapsibleGroups && !entry.group.empty()) {
+            activeGroupBody = addSettingsGroupCard(
+                SettingsGroupCardProps{
+                    .parent = *activeSection,
+                    .group = entry.group,
+                    .title = groupLabel(entry.group),
+                    .scale = scale,
+                    .expandedGroups = *expandedGroups,
+                    .pill = pillByGroup[entry.group],
+                    .scrollToTop = ctx.scrollContentToTop,
+                }
+            );
+          } else if (!entry.group.empty()) {
+            activeGroupBody = addSettingsCard(*activeSection, groupLabel(entry.group), scale);
+          } else {
+            addGroupLabel(*activeSection, groupLabel(entry.group), isFirstGroup);
+            activeGroupBody = activeSection;
+          }
           if (entry.section == SettingsSection::Power && entry.group == "idle") {
-            addIdleLiveStatusPanel(*activeSection, ctx, scale);
+            addIdleLiveStatusPanel(*activeGroupBody, ctx, scale);
+          }
+          if (entry.section == SettingsSection::Screenshot && entry.group == "screenshot-output") {
+            activeGroupBody->addChild(
+                ui::label({
+                    .text = i18n::tr("settings.schema.shell.screenshot-output.description"),
+                    .fontSize = Style::fontSizeBody * scale,
+                    .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
+                    .maxLines = 0,
+                })
+            );
           }
         }
         if (!std::holds_alternative<KeybindListSetting>(entry.control)) {
@@ -1317,12 +1406,14 @@ namespace settings {
         }
         if (const auto* list = std::get_if<ListSetting>(&entry.control)) {
           if (isFirstBarWidgetListPath(entry.path)) {
-            addBarWidgetLaneEditor(*activeSection, entry, barWidgetEditorCtx);
+            addBarWidgetLaneEditor(*activeGroupBody, entry, barWidgetEditorCtx);
           } else if (!isBarWidgetListPath(entry.path)) {
-            makeListBlock(*activeSection, entry, *list);
+            makeListBlock(*activeGroupBody, entry, *list);
           }
+        } else if (const auto* map = std::get_if<StringMapSetting>(&entry.control)) {
+          factory.makeStringMapBlock(*activeGroupBody, entry, *map);
         } else if (const auto* shortcuts = std::get_if<ShortcutListSetting>(&entry.control)) {
-          makeShortcutListBlock(*activeSection, entry, *shortcuts);
+          makeShortcutListBlock(*activeGroupBody, entry, *shortcuts);
         } else if (const auto* keybindList = std::get_if<KeybindListSetting>(&entry.control)) {
           if (activeKeybindRow == nullptr || activeKeybindRowCount >= kKeybindsPerRow) {
             auto row = ui::row({
@@ -1330,25 +1421,25 @@ namespace settings {
                 .gap = Style::spaceMd * scale,
                 .fillWidth = true,
             });
-            activeKeybindRow = static_cast<Flex*>(activeSection->addChild(std::move(row)));
+            activeKeybindRow = static_cast<Flex*>(activeGroupBody->addChild(std::move(row)));
             activeKeybindRowCount = 0;
           }
           makeKeybindListBlock(*activeKeybindRow, entry, *keybindList);
           ++activeKeybindRowCount;
         } else if (const auto* sessionActs = std::get_if<SessionPanelActionsSetting>(&entry.control)) {
-          makeSessionActionsInlineBlock(*activeSection, entry, *sessionActs);
+          makeSessionActionsInlineBlock(*activeGroupBody, entry, *sessionActs);
         } else if (const auto* idle = std::get_if<IdleBehaviorsSetting>(&entry.control)) {
-          makeIdleBehaviorsInlineBlock(*activeSection, entry, *idle);
+          makeIdleBehaviorsInlineBlock(*activeGroupBody, entry, *idle);
         } else if (const auto* filters = std::get_if<NotificationFiltersSetting>(&entry.control)) {
-          makeNotificationFiltersInlineBlock(*activeSection, entry, *filters);
+          makeNotificationFiltersInlineBlock(*activeGroupBody, entry, *filters);
         } else if (const auto* picker = std::get_if<SearchPickerSetting>(&entry.control)) {
-          makeRow(*activeSection, entry, makeSearchPickerButton(entry, *picker));
+          makeRow(*activeGroupBody, entry, makeSearchPickerButton(entry, *picker));
         } else if (const auto* multi = std::get_if<MultiSelectSetting>(&entry.control)) {
-          makeMultiSelectBlock(*activeSection, entry, *multi);
+          makeMultiSelectBlock(*activeGroupBody, entry, *multi);
         } else if (const auto* templates = std::get_if<TemplateGridSetting>(&entry.control)) {
-          makeTemplateGridBlock(*activeSection, entry, *templates);
+          makeTemplateGridBlock(*activeGroupBody, entry, *templates);
         } else {
-          makeRow(*activeSection, entry, makeControl(entry));
+          makeRow(*activeGroupBody, entry, makeControl(entry));
         }
         ++visibleEntries;
       }
@@ -1356,7 +1447,7 @@ namespace settings {
 
     if (activeKeybindRow != nullptr && activeKeybindRowCount > 0 && activeKeybindRowCount < kKeybindsPerRow) {
       while (activeKeybindRowCount < kKeybindsPerRow) {
-        activeKeybindRow->addChild(ui::row({.fillWidth = true, .flexGrow = 1.0f}));
+        activeKeybindRow->addChild(ui::row({.fillWidth = true, .flexGrow = 1.0F}));
         ++activeKeybindRowCount;
       }
     }
@@ -1368,14 +1459,14 @@ namespace settings {
           {.align = FlexAlign::Center,
            .justify = FlexJustify::Center,
            .gap = Style::spaceSm * scale,
-           .padding = (Style::spaceLg * 2.0f) * scale,
-           .fill = colorSpecFromRole(ColorRole::SurfaceVariant, 0.24f),
+           .padding = (Style::spaceLg * 2.0F) * scale,
+           .fill = colorSpecFromRole(ColorRole::SurfaceVariant, 0.24F),
            .radius = Style::scaledRadiusMd(scale),
            .border = colorSpecFromRole(ColorRole::Outline),
-           .minWidth = 360.0f * scale,
-           .minHeight = 160.0f * scale,
+           .minWidth = 360.0F * scale,
+           .minHeight = 160.0F * scale,
            .fillWidth = true,
-           .flexGrow = 2.0f},
+           .flexGrow = 2.0F},
           makeLabel(
               i18n::tr("settings.window.no-results"), Style::fontSizeHeader * scale,
               colorSpecFromRole(ColorRole::OnSurface), FontWeight::Bold
@@ -1388,8 +1479,8 @@ namespace settings {
 
       content.addChild(
           ui::row(
-              {.align = FlexAlign::Center, .fillWidth = true}, ui::box({.flexGrow = 0.5f}), std::move(emptyState),
-              ui::box({.flexGrow = 0.5f})
+              {.align = FlexAlign::Center, .fillWidth = true}, ui::box({.flexGrow = 0.5F}), std::move(emptyState),
+              ui::box({.flexGrow = 0.5F})
           )
       );
     }

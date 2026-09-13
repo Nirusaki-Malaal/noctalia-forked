@@ -32,7 +32,7 @@ namespace {
 
 PluginDesktopWidget::PluginDesktopWidget(scripting::PluginRuntimeContext context, std::string outputName)
     : m_entryId(std::move(context.entryId)), m_sourcePath(std::move(context.sourcePath)),
-      m_pluginDir(m_sourcePath.parent_path()), m_outputName(std::move(outputName)), m_scriptApi(context.scriptApi),
+      m_pluginDir(std::move(context.pluginDir)), m_outputName(std::move(outputName)), m_scriptApi(context.scriptApi),
       m_settings(std::move(context.settings)), m_fileWatcher(context.fileWatcher), m_httpClient(context.httpClient),
       m_clipboard(context.clipboard) {
   scripting::PluginIpcRouter::instance().registerEndpoint(this);
@@ -61,7 +61,7 @@ void PluginDesktopWidget::create() {
   m_reconciler.setCallbackSink([this](const ui::UiTreeReconciler::ControlCallback& callback) {
     if (m_runtime != nullptr) {
       (void)m_runtime->enqueueCallStrings(
-          callback.fn, callback.arg1, callback.arg2, makeScriptSnapshot(), callback.coalesce
+          callback.fn, callback.arg1, callback.arg2, makeScriptSnapshot(), callback.coalesce, callback.coalesceKey
       );
     }
   });
@@ -86,6 +86,9 @@ void PluginDesktopWidget::create() {
     auto token = alive.lock();
     if (token == nullptr || !*token) {
       return;
+    }
+    if (result.modulePathsKnown) {
+      m_scriptWatcher.setModulePaths(result.modulePaths);
     }
     handleScriptResult(std::move(result));
   });
@@ -123,7 +126,7 @@ void PluginDesktopWidget::onFrameTick(float deltaMs, Renderer& renderer) {
   }
   // Coalesced like onAudioSpectrum: a slow script only ever sees the latest frame.
   (void)m_runtime->enqueueCallStrings(
-      "onFrameTick", std::format("{:.3f}", deltaMs), {}, makeScriptSnapshot(), /*coalesce=*/true
+      "onFrameTick", std::format("{:.3F}", deltaMs), {}, makeScriptSnapshot(), /*coalesce=*/true
   );
   requestRedraw(); // keep the frame loop alive while animating
 }
@@ -213,19 +216,10 @@ void PluginDesktopWidget::startUpdateTimer() {
 }
 
 void PluginDesktopWidget::setupScriptWatch() {
-  if (m_sourcePath.empty() || m_fileWatcher == nullptr) {
-    return;
-  }
-  m_watchId = m_fileWatcher->watch(m_sourcePath, [this] { reloadScript(); }, FileWatcher::WatchTrigger::WriteCompleted);
+  m_scriptWatcher.start(m_fileWatcher, m_sourcePath, [this] { reloadScript(); });
 }
 
-void PluginDesktopWidget::teardownScriptWatch() {
-  if (m_watchId == 0 || m_fileWatcher == nullptr) {
-    return;
-  }
-  m_fileWatcher->unwatch(m_watchId);
-  m_watchId = 0;
-}
+void PluginDesktopWidget::teardownScriptWatch() { m_scriptWatcher.stop(); }
 
 void PluginDesktopWidget::reloadScript() {
   std::string source = readFile(m_sourcePath);

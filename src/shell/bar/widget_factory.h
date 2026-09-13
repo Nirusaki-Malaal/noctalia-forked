@@ -15,6 +15,7 @@ class HttpClient;
 class IdleInhibitor;
 class LockKeysService;
 class MprisService;
+class ModemManagerService;
 class BluetoothService;
 class BrightnessService;
 class ClipboardService;
@@ -45,8 +46,8 @@ public:
   ~WidgetFactory();
 
   [[nodiscard]] std::unique_ptr<Widget> create(
-      const std::string& name, wl_output* output, float contentScale = 1.0f, const std::string& barPosition = "top",
-      const std::string& barName = "default", float widgetSpacing = 6.0f
+      const std::string& name, wl_output* output, float contentScale = 1.0F, const std::string& barPosition = "top",
+      const std::string& barName = "default", float widgetSpacing = 6.0F, bool enableScroll = true
   ) const;
 
 private:
@@ -61,6 +62,7 @@ private:
   SystemMonitorService* m_sysmon;
   PowerProfilesService* m_powerProfiles;
   INetworkService* m_network;
+  ModemManagerService* m_modem;
   ExternalIpService* m_externalIp;
   IdleInhibitor* m_idleInhibitor;
   MprisService* m_mpris;

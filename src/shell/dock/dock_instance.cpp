@@ -123,11 +123,11 @@ namespace shell::dock {
     if (instance.slideRoot == nullptr) {
       return;
     }
-    if (dockUsesSlideAutoHide(cfg, instance) || instance.hideOpacity < 0.999f) {
-      const float t = 1.0f - instance.hideOpacity;
+    if (dockUsesSlideAutoHide(cfg, instance) || instance.hideOpacity < 0.999F) {
+      const float t = 1.0F - instance.hideOpacity;
       instance.slideRoot->setPosition(instance.slideHiddenDx * t, instance.slideHiddenDy * t);
     } else {
-      instance.slideRoot->setPosition(0.0f, 0.0f);
+      instance.slideRoot->setPosition(0.0F, 0.0F);
     }
   }
 
@@ -146,18 +146,22 @@ namespace shell::dock {
     }
 
     if (!dockUsesAnyAutoHide(cfg)) {
-      instance.surface->setInputRegion(shell::dock::computeInputRegion(cfg, panelGeometry, surfW, surfH, false));
+      instance.surface->setInputRegion(
+          shell::dock::computeInputRegion(cfg, panelGeometry, surfW, surfH, false, instance.fractionalScale)
+      );
       return;
     }
 
     const bool fullSurface = instance.pointerInside
-        || instance.hideOpacity > 0.5f
+        || instance.hideOpacity > 0.5F
         || (cfg.smartAutoHide && instance.smartAutoHidePinnedVisible);
     if (fullSurface) {
       instance.surface->setInputRegion({InputRect{0, 0, surfW, surfH}});
       return;
     }
-    instance.surface->setInputRegion(shell::dock::computeInputRegion(cfg, DockPanelGeometry{}, surfW, surfH, true));
+    instance.surface->setInputRegion(
+        shell::dock::computeInputRegion(cfg, DockPanelGeometry{}, surfW, surfH, true, instance.fractionalScale)
+    );
   }
 
   void applyDockCompositorBlur(DockInstance& instance, const DockConfig& cfg) {
@@ -166,7 +170,7 @@ namespace shell::dock {
     }
     // Compositor blur is independent of scene opacity — clear it while auto-hide
     // has faded the dock out so a transparent buffer does not leave a blur halo.
-    constexpr float kBlurVisibleOpacity = 0.02f;
+    constexpr float kBlurVisibleOpacity = 0.02F;
     if (dockUsesAnyAutoHide(cfg) && instance.hideOpacity < kBlurVisibleOpacity) {
       instance.surface->clearBlurRegion();
       return;
@@ -175,8 +179,8 @@ namespace shell::dock {
       return;
     }
     const auto concave = dockConcaveShape(cfg);
-    float absX = 0.0f;
-    float absY = 0.0f;
+    float absX = 0.0F;
+    float absY = 0.0F;
     Node::absolutePosition(instance.panel, absX, absY);
 
     const float insetL = concave.logicalInset.left;
@@ -197,6 +201,8 @@ namespace shell::dock {
       return;
     }
 
+    Renderer& renderer = instance.surface->renderTarget().renderer();
+
     const auto& cfg = deps.config.config().dock;
     const bool vert = shell::dock::isVerticalEdge(cfg.position);
 
@@ -211,7 +217,7 @@ namespace shell::dock {
       instance.sceneRoot = ui::node({});
       instance.sceneRoot->setAnimationManager(&instance.animations);
       instance.sceneRoot->setSize(w, h);
-      instance.sceneRoot->setOpacity(1.0f);
+      instance.sceneRoot->setOpacity(1.0F);
 
       auto slide = ui::node({});
       slide->setParticipatesInLayout(false);
@@ -257,14 +263,14 @@ namespace shell::dock {
       if (dockUsesAnyAutoHide(cfg)) {
         instance.smartAutoHidePinnedVisible =
             cfg.smartAutoHide && smartAutoHideWantsPinnedVisible(deps.platform, instance.output);
-        instance.slideRoot->setOpacity(1.0f);
+        instance.slideRoot->setOpacity(1.0F);
         const bool startHidden = cfg.smartAutoHide ? !instance.smartAutoHidePinnedVisible : cfg.autoHide;
-        instance.hideOpacity = startHidden ? 0.0f : 1.0f;
+        instance.hideOpacity = startHidden ? 0.0F : 1.0F;
       } else {
-        instance.slideRoot->setOpacity(0.0f);
-        instance.hideOpacity = 1.0f;
+        instance.slideRoot->setOpacity(0.0F);
+        instance.hideOpacity = 1.0F;
         instance.animations.animate(
-            0.0f, 1.0f, Style::animSlow, Easing::EaseOutCubic,
+            0.0F, 1.0F, Style::animSlow, Easing::EaseOutCubic,
             [slide = instance.slideRoot](float v) { slide->setOpacity(v); }, {}, instance.slideRoot
         );
       }
@@ -319,7 +325,7 @@ namespace shell::dock {
     // Row matches the pill; hover spread is clamped to stay inside the background.
     instance.row->setPosition(panelGeometry.panelX, panelGeometry.panelY);
     instance.row->setSize(panelGeometry.panelW, panelGeometry.panelH);
-    instance.row->layout(deps.renderContext);
+    instance.row->layout(renderer);
     shell::dock::syncDockItemRestPositions(instance, cfg);
 
     if (dockUsesAnyAutoHide(cfg)) {
@@ -327,8 +333,8 @@ namespace shell::dock {
       instance.slideHiddenDx = hiddenDelta.first;
       instance.slideHiddenDy = hiddenDelta.second;
     } else {
-      instance.slideHiddenDx = 0.0f;
-      instance.slideHiddenDy = 0.0f;
+      instance.slideHiddenDx = 0.0F;
+      instance.slideHiddenDy = 0.0F;
     }
     syncDockSlideLayerTransform(instance, cfg);
     syncDockAutoHideInputRegion(instance, cfg, panelGeometry);
@@ -361,7 +367,7 @@ namespace shell::dock {
     }
 
     const auto surfaceGeometry = shell::dock::computeSurfaceGeometry(
-        cfg, shadowConfig, instance.items.size() + shell::dock::dockLauncherButtonCount(cfg)
+        cfg, shadowConfig, instance.items.size() + shell::dock::dockLauncherButtonCount(cfg), instance.fractionalScale
     );
 
     if (instance.surface->width() != surfaceGeometry.surfaceW
@@ -381,7 +387,7 @@ namespace shell::dock {
       inst.hideAnimId = 0;
     }
 
-    constexpr float kSettledThreshold = 0.999f;
+    constexpr float kSettledThreshold = 0.999F;
     const float current = inst.hideOpacity;
     if (current >= kSettledThreshold) {
       syncDockAutoHideInputRegion(inst, cfg, DockPanelGeometry{});
@@ -390,7 +396,7 @@ namespace shell::dock {
     }
 
     inst.hideAnimId = inst.animations.animate(
-        current, 1.0f, Style::animNormal, Easing::EaseOutCubic,
+        current, 1.0F, Style::animNormal, Easing::EaseOutCubic,
         [&inst, &config](float v) {
           inst.hideOpacity = v;
           const auto& dockCfg = config.config().dock;
@@ -404,13 +410,16 @@ namespace shell::dock {
   }
 
   void startHideFadeOut(DockInstance& inst, ConfigService& config) {
+    // xdg tooltips are not parent-transformed with the slide; destroy immediately
+    // so they cannot remain pinned after auto-hide starts (#4177).
+    TooltipManager::instance().forceDestroy();
     if (inst.hideAnimId != 0) {
       inst.animations.cancel(inst.hideAnimId);
       inst.hideAnimId = 0;
     }
     const float current = inst.hideOpacity;
     inst.hideAnimId = inst.animations.animate(
-        current, 0.0f, Style::animNormal, Easing::EaseInQuad,
+        current, 0.0F, Style::animNormal, Easing::EaseInQuad,
         [&inst, &config](float v) {
           inst.hideOpacity = v;
           const auto& cfg = config.config().dock;

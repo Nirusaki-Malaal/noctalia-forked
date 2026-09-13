@@ -11,6 +11,7 @@
 
 class Renderer;
 class ScrollView;
+struct ScrollViewState;
 
 // Adapter that drives a VirtualListView from an external data source.
 //
@@ -39,12 +40,16 @@ public:
 
   // Adapter is non-owning and must outlive the list.
   void setAdapter(VirtualListAdapter* adapter);
+  // State is non-owning and must outlive the list.
+  void bindScrollState(ScrollViewState* state);
 
   void notifyDataChanged();
   void notifyItemChanged(std::size_t index);
 
   void setItemGap(float gap);
   void setOverscanItems(std::size_t items);
+  // Content scale of the hosting surface; scales the scrollbar geometry.
+  void setContentScale(float scale);
   void scrollToIndex(std::size_t index);
 
   [[nodiscard]] ScrollView& scrollView() noexcept { return *m_scroll; }
@@ -62,7 +67,7 @@ private:
     std::uint64_t key = 0;
     std::uint64_t revision = 0;
     int widthKey = 0;
-    float height = 0.0f;
+    float height = 0.0F;
     bool valid = false;
   };
 
@@ -90,9 +95,9 @@ private:
   std::vector<float> m_itemHeights;
   std::vector<float> m_itemOffsets;
 
-  float m_itemGap = 0.0f;
-  float m_virtualWidth = 0.0f;
-  float m_virtualHeight = 0.0f;
+  float m_itemGap = 0.0F;
+  float m_virtualWidth = 0.0F;
+  float m_virtualHeight = 0.0F;
   std::size_t m_overscanItems = 3;
   std::size_t m_itemCount = 0;
   std::optional<std::size_t> m_hoveredIndex;

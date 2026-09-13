@@ -1,6 +1,7 @@
 #pragma once
 
 #include "wayland/ext_foreign_toplevels.h"
+#include "wayland/output_scale.h"
 #include "wayland/wayland_seat.h"
 #include "wayland/wayland_toplevels.h"
 
@@ -13,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct wl_compositor;
@@ -45,8 +47,13 @@ struct hyprland_focus_grab_manager_v1;
 struct hyprland_toplevel_mapping_manager_v1;
 struct zwlr_gamma_control_manager_v1;
 struct zwlr_screencopy_manager_v1;
+struct ext_image_copy_capture_manager_v1;
+struct ext_output_image_capture_source_manager_v1;
 struct wp_fractional_scale_manager_v1;
 struct wp_viewporter;
+struct zwlr_output_manager_v1;
+struct zwlr_output_head_v1;
+struct zwlr_output_mode_v1;
 class ClipboardService;
 class FocusGrabService;
 struct DataControlOps;
@@ -58,6 +65,10 @@ struct WaylandOutput {
   std::string interfaceName;
   std::string connectorName;
   std::string description;
+  // From wlr-output-management-unstable-v1; wl_output has no serial. May stay empty.
+  std::string make;
+  std::string model;
+  std::string serialNumber;
   std::uint32_t version = 0;
   wl_output* output = nullptr;
   std::int32_t scale = 1;
@@ -70,6 +81,15 @@ struct WaylandOutput {
   std::int32_t transform = 0;
   zxdg_output_v1* xdgOutput = nullptr;
   bool done = false;
+  // wlr-output-management fixed scale factor for this output (0 == not reported).
+  double headScaleFactor = 0.0;
+  // Canonical published render scale as a /120 numerator (120 == 1.0). Resolved
+  // from head scale, then mode/logical ratio, then integer wl_output.scale.
+  std::int32_t configuredScaleNumerator = wayland::kScaleNumeratorBase;
+
+  [[nodiscard]] float configuredScale() const noexcept {
+    return static_cast<float>(configuredScaleNumerator) / static_cast<float>(wayland::kScaleNumeratorBase);
+  }
 
   [[nodiscard]] std::int32_t effectiveLogicalWidth() const noexcept {
     if (logicalWidth > 0) {
@@ -96,6 +116,16 @@ struct WaylandOutput {
   [[nodiscard]] bool hasUsableGeometry() const noexcept {
     return effectiveLogicalWidth() > 0 && effectiveLogicalHeight() > 0;
   }
+};
+
+// Accumulates head fields until matched to a WaylandOutput, keyed by head proxy.
+struct WaylandOutputHeadInfo {
+  std::string name;
+  std::string make;
+  std::string model;
+  std::string serialNumber;
+  // wlr-output-management fixed scale factor (0 == not reported by this head).
+  double scaleFactor = 0.0;
 };
 
 class WaylandConnection {
@@ -152,8 +182,11 @@ public:
   [[nodiscard]] bool hasIdleInhibitManager() const noexcept;
   [[nodiscard]] bool hasFractionalScale() const noexcept;
   [[nodiscard]] bool hasGammaControl() const noexcept;
+  [[nodiscard]] bool hasOutputManagement() const noexcept;
   [[nodiscard]] bool hasScreencopy() const noexcept;
   [[nodiscard]] zwlr_screencopy_manager_v1* screencopyManager() const noexcept;
+  [[nodiscard]] ext_image_copy_capture_manager_v1* imageCopyCaptureManager() const noexcept;
+  [[nodiscard]] ext_output_image_capture_source_manager_v1* outputImageCaptureSourceManager() const noexcept;
   [[nodiscard]] bool hasBackgroundEffectBlur() const noexcept;
   [[nodiscard]] zwlr_gamma_control_manager_v1* gammaControlManager() const noexcept;
   [[nodiscard]] ext_background_effect_manager_v1* backgroundEffectManager() const noexcept;
@@ -166,6 +199,7 @@ public:
   [[nodiscard]] std::string describeDisplayError(int operationErrno = 0) const;
   [[nodiscard]] wl_compositor* compositor() const noexcept;
   [[nodiscard]] wl_seat* seat() const noexcept;
+  [[nodiscard]] wl_pointer* pointer() const noexcept;
   [[nodiscard]] wl_shm* shm() const noexcept;
   [[nodiscard]] wl_subcompositor* subcompositor() const noexcept;
   [[nodiscard]] zwlr_layer_shell_v1* layerShell() const noexcept;
@@ -195,6 +229,7 @@ public:
   [[nodiscard]] std::vector<ToplevelInfo> windowsWithoutAppId(wl_output* outputFilter = nullptr) const;
   [[nodiscard]] std::vector<ToplevelInfo>
   extWindowsForApp(const std::string& idLower, const std::string& wmClassLower) const;
+  [[nodiscard]] std::vector<ToplevelInfo> extWindowsWithoutAppId() const;
   [[nodiscard]] bool containsWlrToplevelHandle(zwlr_foreign_toplevel_handle_v1* handle) const;
   template <typename Fn> void visitExtToplevelHandles(Fn&& fn) const {
     m_extForeignToplevels.visitExtHandles(std::forward<Fn>(fn));
@@ -210,6 +245,7 @@ public:
   [[nodiscard]] wl_output* lastPointerOutput() const noexcept;
   [[nodiscard]] wl_surface* lastPointerSurface() const noexcept;
   [[nodiscard]] wl_surface* lastKeyboardSurface() const noexcept;
+  [[nodiscard]] std::uint32_t keyboardModifiers() const noexcept;
   [[nodiscard]] bool hasPointerPosition() const noexcept;
   [[nodiscard]] double lastPointerX() const noexcept;
   [[nodiscard]] double lastPointerY() const noexcept;
@@ -238,6 +274,24 @@ public:
   void onBackgroundEffectCapabilities(std::uint32_t capabilities) noexcept;
   void notifyIdleCapabilitiesReady();
 
+  // wlr-output-management-unstable-v1 entrypoints
+  void onOutputManagerHead(zwlr_output_head_v1* head);
+  void onOutputManagerDone();
+  void onOutputManagerFinished(zwlr_output_manager_v1* manager);
+  void onOutputHeadName(zwlr_output_head_v1* head, const char* name);
+  void onOutputHeadMake(zwlr_output_head_v1* head, const char* make);
+  void onOutputHeadModel(zwlr_output_head_v1* head, const char* model);
+  void onOutputHeadSerialNumber(zwlr_output_head_v1* head, const char* serialNumber);
+  void onOutputHeadMode(zwlr_output_head_v1* head, zwlr_output_mode_v1* mode);
+  void onOutputHeadScale(zwlr_output_head_v1* head, double scaleFactor);
+  void onOutputModeFinished(zwlr_output_mode_v1* mode);
+  void onOutputHeadFinished(zwlr_output_head_v1* head);
+  // wl_output.name and the done event race; call from both sides to match either order.
+  void matchPendingOutputHeads();
+  // Recompute out.configuredScaleNumerator from current head/mode/logical/wl-scale
+  // data. Returns true when the published numerator changed.
+  bool recomputeConfiguredScale(WaylandOutput& out);
+
 private:
   void bindGlobal(wl_registry* registry, std::uint32_t name, const char* interface, std::uint32_t version);
   void bindClipboardService();
@@ -265,6 +319,11 @@ private:
   hyprland_focus_grab_manager_v1* m_hyprlandFocusGrabManager = nullptr;
   zwlr_gamma_control_manager_v1* m_gammaControlManager = nullptr;
   zwlr_screencopy_manager_v1* m_screencopyManager = nullptr;
+  ext_image_copy_capture_manager_v1* m_imageCopyCaptureManager = nullptr;
+  ext_output_image_capture_source_manager_v1* m_outputImageCaptureSourceManager = nullptr;
+  zwlr_output_manager_v1* m_outputManager = nullptr;
+  std::unordered_map<zwlr_output_head_v1*, WaylandOutputHeadInfo> m_outputHeads;
+  std::unordered_set<zwlr_output_mode_v1*> m_outputModes;
   std::unique_ptr<FocusGrabService> m_focusGrabService;
   wp_viewporter* m_viewporter = nullptr;
   bool m_backgroundEffectBlurSupported = false;

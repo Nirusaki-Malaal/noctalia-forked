@@ -22,8 +22,9 @@ public:
   void setUnlockCallback(SessionLockCallback callback);
 
   void setSessionLockIntegrationEnabled(bool enabled);
-  void syncSessionLocked();
-  void syncSessionUnlocked();
+  // Sleep-delay inhibit for lock-before-suspend. Released when session lock integration is off.
+  void setLockBeforeSuspendEnabled(bool enabled);
+  void setSessionLockedHint(bool locked);
 
   [[nodiscard]] bool supportsIdleInhibit() const noexcept;
   [[nodiscard]] bool hasIdleInhibit() const noexcept;

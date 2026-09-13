@@ -8,11 +8,13 @@
 #include <vector>
 
 class BrightnessService;
+class Button;
 class ConfigService;
 class Flex;
 class Glyph;
 class Label;
 class Renderer;
+class ScrollView;
 class Slider;
 
 class MonitorTab : public Tab {
@@ -20,6 +22,7 @@ public:
   MonitorTab(BrightnessService* brightness, ConfigService* config);
 
   std::unique_ptr<Flex> create() override;
+  std::unique_ptr<Flex> createHeaderActions() override;
   void setActive(bool active) override;
   void onClose() override;
   [[nodiscard]] bool dragging() const noexcept;
@@ -27,6 +30,7 @@ public:
 private:
   void doLayout(Renderer& renderer, float contentWidth, float bodyHeight) override;
   void doUpdate(Renderer& renderer) override;
+  void syncHeaderActions();
   void rebuildCards(Renderer& renderer);
   void queueBrightness(const std::string& displayId, float value);
   void flushPendingBrightness(bool force = false);
@@ -42,19 +46,22 @@ private:
     Glyph* icon = nullptr;
     Slider* slider = nullptr;
     Label* valueLabel = nullptr;
-    float lastBrightness = -1.0f;
+    float lastBrightness = -1.0F;
     bool lastControllable = true;
     std::string lastDisplayInfo;
   };
 
   Flex* m_rootLayout = nullptr;
   Flex* m_emptyState = nullptr;
+  ScrollView* m_cardsScroll = nullptr;
+  Flex* m_cardsLayout = nullptr;
+  Button* m_rescanButton = nullptr;
   std::vector<DisplayCard> m_cards;
   std::string m_lastDisplayListKey;
 
   std::string m_pendingDisplayId;
-  float m_pendingBrightness = -1.0f;
-  float m_lastSentBrightness = -1.0f;
+  float m_pendingBrightness = -1.0F;
+  float m_lastSentBrightness = -1.0F;
   std::chrono::steady_clock::time_point m_lastCommitAt;
   std::chrono::steady_clock::time_point m_ignoreStateUntil;
   Timer m_debounceTimer;

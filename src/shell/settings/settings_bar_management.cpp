@@ -59,8 +59,8 @@ namespace settings {
           .padding = Style::spaceSm * scale,
           .configure = [scale](Flex& panel) {
             panel.setRadius(Style::scaledRadiusSm(scale));
-            panel.setFill(colorSpecFromRole(ColorRole::Error, 0.10f));
-            panel.setBorder(colorSpecFromRole(ColorRole::Error, 0.5f), Style::borderWidth);
+            panel.setFill(colorSpecFromRole(ColorRole::Error, 0.10F));
+            panel.setBorder(colorSpecFromRole(ColorRole::Error, 0.5F), Style::borderWidth);
           },
       });
     }
@@ -79,24 +79,44 @@ namespace settings {
       return std::ranges::contains(cfg.bars, name, &BarConfig::name);
     }
 
+    // Management is an action banner, not a settings group: no collapsible card, Secondary tint, and the
+    // same horizontal inset the registry page sections give their group cards.
     Flex* makeSection(Flex& content, std::string_view title, float scale) {
-      auto section = ui::column(
+      Flex* banner = nullptr;
+      auto wrapper = ui::column(
           {
               .align = FlexAlign::Stretch,
-              .gap = Style::spaceSm * scale,
-              .configure =
-                  [scale](Flex& container) {
-                    container.setPadding(Style::spaceSm * scale, Style::spaceMd * scale);
-                    container.setCardStyle(scale, 1.0f);
-                    container.setFill(colorSpecFromRole(ColorRole::Surface));
-                  },
+              .configure = [scale](Flex& container) { container.setPadding(0.0F, Style::spaceLg * scale); },
           },
-          makeLabel(title, Style::fontSizeTitle * scale, colorSpecFromRole(ColorRole::OnSurface), FontWeight::Bold)
+          ui::column(
+              {
+                  .out = &banner,
+                  .align = FlexAlign::Stretch,
+                  .gap = Style::spaceSm * scale,
+                  .configure =
+                      [scale](Flex& container) {
+                        container.setPadding(Style::spaceSm * scale, Style::spaceMd * scale);
+                        container.setRadius(Style::scaledRadiusMd(scale));
+                        container.setFill(colorSpecFromRole(ColorRole::Secondary, 0.10F));
+                        container.setBorder(colorSpecFromRole(ColorRole::Secondary, 0.45F), Style::borderWidth);
+                      },
+              },
+              ui::row(
+                  {.align = FlexAlign::Center, .gap = Style::spaceXs * scale},
+                  ui::glyph({
+                      .glyph = "settings",
+                      .glyphSize = Style::fontSizeBody * scale,
+                      .color = colorSpecFromRole(ColorRole::Secondary),
+                  }),
+                  makeLabel(
+                      title, Style::fontSizeBody * scale, colorSpecFromRole(ColorRole::Secondary), FontWeight::Bold
+                  )
+              )
+          )
       );
 
-      auto* raw = section.get();
-      content.addChild(std::move(section));
-      return raw;
+      content.addChild(std::move(wrapper));
+      return banner;
     }
 
     void addMonitorManagement(Flex& content, SettingsBarManagementContext& ctx) {
@@ -125,9 +145,9 @@ namespace settings {
               .fontSize = Style::fontSizeBody * ctx.scale,
               .controlHeight = Style::controlHeight * ctx.scale,
               .horizontalPadding = Style::spaceSm * ctx.scale,
-              .width = 190.0f * ctx.scale,
+              .width = 190.0F * ctx.scale,
               .height = Style::controlHeight * ctx.scale,
-              .flexGrow = 1.0f,
+              .flexGrow = 1.0F,
           });
 
           std::vector<std::string> existingMatches;
@@ -294,9 +314,9 @@ namespace settings {
               .fontSize = Style::fontSizeBody * ctx.scale,
               .controlHeight = Style::controlHeight * ctx.scale,
               .horizontalPadding = Style::spaceSm * ctx.scale,
-              .width = 190.0f * ctx.scale,
+              .width = 190.0F * ctx.scale,
               .height = Style::controlHeight * ctx.scale,
-              .flexGrow = 1.0f,
+              .flexGrow = 1.0F,
           });
 
           auto doRename = [&renamingBarName = ctx.renamingBarName, config = ctx.config, barName,

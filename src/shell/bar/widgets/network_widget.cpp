@@ -1,7 +1,8 @@
 #include "shell/bar/widgets/network_widget.h"
 
+#include "dbus/modem/modem_manager_service.h"
 #include "dbus/network/external_ip_service.h"
-#include "dbus/network/network_glyphs.h"
+#include "dbus/network/network_display.h"
 #include "i18n/i18n.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
@@ -20,12 +21,18 @@ namespace {
 
   constexpr auto kTooltipRefreshInterval = std::chrono::seconds(1);
 
-  std::string labelForState(const NetworkState& s) {
+  std::string labelForState(const NetworkState& s, const CellularModemInfo* modem) {
     if (s.kind == NetworkConnectivity::Wireless && s.connected && !s.ssid.empty()) {
       return s.ssid;
     }
     if (s.kind == NetworkConnectivity::Wired && s.connected) {
       return s.interfaceName.empty() ? i18n::tr("bar.widgets.network.wired") : s.interfaceName;
+    }
+    if (s.kind == NetworkConnectivity::Cellular && s.connected) {
+      if (modem != nullptr && !modem->operatorName.empty()) {
+        return modem->operatorName;
+      }
+      return i18n::tr("bar.widgets.network.cellular");
     }
     return {};
   }
@@ -58,10 +65,10 @@ namespace {
 } // namespace
 
 NetworkWidget::NetworkWidget(
-    INetworkService* network, ExternalIpService* externalIp, SystemMonitorService* monitor, wl_output* /*output*/,
-    Options options
+    INetworkService* network, ExternalIpService* externalIp, SystemMonitorService* monitor, ModemManagerService* modem,
+    wl_output* /*output*/, Options options
 )
-    : m_network(network), m_externalIp(externalIp), m_monitor(monitor), m_showLabel(options.showLabel),
+    : m_network(network), m_externalIp(externalIp), m_monitor(monitor), m_modem(modem), m_showLabel(options.showLabel),
       m_showVpnLabel(options.showVpnLabel), m_vpnStatusMode(options.vpnStatusMode) {}
 
 void NetworkWidget::create() {
@@ -101,7 +108,7 @@ void NetworkWidget::create() {
       ui::spinner({
           .out = &m_spinner,
           .color = widgetIconColorOr(colorSpecFromRole(ColorRole::OnSurface)),
-          .spinnerSize = Style::baseGlyphSize * 0.8f * m_contentScale,
+          .spinnerSize = Style::baseGlyphSize * 0.8F * m_contentScale,
           .visible = false,
       })
   );
@@ -112,7 +119,7 @@ void NetworkWidget::create() {
   area->addChild(
       ui::label({
           .out = &m_label,
-          .fontSize = Style::fontSizeBody * m_contentScale,
+          .fontSize = Style::fontSizeBody * fontScale(),
           .fontWeight = labelFontWeight(),
           .fontFamily = labelFontFamily(),
       })
@@ -122,7 +129,7 @@ void NetworkWidget::create() {
   area->addChild(
       ui::label({
           .out = &m_vpnLabel,
-          .fontSize = Style::fontSizeBody * m_contentScale,
+          .fontSize = Style::fontSizeBody * fontScale(),
           .fontWeight = labelFontWeight(),
           .fontFamily = labelFontFamily(),
           .visible = false,
@@ -149,7 +156,7 @@ void NetworkWidget::doLayout(Renderer& renderer, float containerWidth, float con
     m_label->measure(renderer);
   }
   if (m_vpnLabel != nullptr && m_vpnLabel->visible()) {
-    m_vpnLabel->setFontSize((m_isVertical ? Style::fontSizeCaption : Style::fontSizeBody) * m_contentScale);
+    m_vpnLabel->setFontSize((m_isVertical ? Style::fontSizeCaption : Style::fontSizeBody) * fontScale());
     m_vpnLabel->measure(renderer);
   }
 
@@ -159,7 +166,7 @@ void NetworkWidget::doLayout(Renderer& renderer, float containerWidth, float con
 
   const bool vpnVisible = m_vpnGlyph != nullptr && m_vpnGlyph->visible();
   const bool vpnLabelVisible = m_vpnLabel != nullptr && m_vpnLabel->visible();
-  const bool networkLabelVisible = m_label != nullptr && m_label->width() > 0.0f && m_label->visible();
+  const bool networkLabelVisible = m_label != nullptr && m_label->width() > 0.0F && m_label->visible();
 
   if (m_isVertical) {
     // Vertical: stack everything centered, top to bottom
@@ -178,31 +185,31 @@ void NetworkWidget::doLayout(Renderer& renderer, float containerWidth, float con
       return maxW;
     }();
 
-    float y = 0.0f;
+    float y = 0.0F;
     if (vpnVisible) {
-      m_vpnGlyph->setPosition(std::round((w - m_vpnGlyph->width()) * 0.5f), y);
+      m_vpnGlyph->setPosition(std::round((w - m_vpnGlyph->width()) * 0.5F), y);
       y += m_vpnGlyph->height();
     }
     if (vpnLabelVisible) {
-      m_vpnLabel->setPosition(std::round((w - m_vpnLabel->width()) * 0.5f), y);
+      m_vpnLabel->setPosition(std::round((w - m_vpnLabel->width()) * 0.5F), y);
       y += m_vpnLabel->height();
     }
     if (vpnVisible) {
       y += Style::spaceXs;
     }
-    icon->setPosition(std::round((w - icon->width()) * 0.5f), y);
+    icon->setPosition(std::round((w - icon->width()) * 0.5F), y);
     y += icon->height();
     if (networkLabelVisible) {
-      m_label->setPosition(std::round((w - m_label->width()) * 0.5f), y);
+      m_label->setPosition(std::round((w - m_label->width()) * 0.5F), y);
       y += m_label->height();
     }
     rootNode->setSize(w, y);
   } else {
     // Horizontal: vpnGlyph + vpnLabel | space | networkGlyph + networkLabel
     const float vpnGroupWidth =
-        vpnVisible ? m_vpnGlyph->width() + (vpnLabelVisible ? Style::spaceXs + m_vpnLabel->width() : 0.0f) : 0.0f;
-    const float networkGroupWidth = icon->width() + (networkLabelVisible ? Style::spaceXs + m_label->width() : 0.0f);
-    const float gap = vpnVisible ? Style::spaceXs : 0.0f;
+        vpnVisible ? m_vpnGlyph->width() + (vpnLabelVisible ? Style::spaceXs + m_vpnLabel->width() : 0.0F) : 0.0F;
+    const float networkGroupWidth = icon->width() + (networkLabelVisible ? Style::spaceXs + m_label->width() : 0.0F);
+    const float gap = vpnVisible ? Style::spaceXs : 0.0F;
     const float totalWidth = vpnGroupWidth + gap + networkGroupWidth;
     const float h = [&]() {
       float maxH = icon->height();
@@ -218,20 +225,20 @@ void NetworkWidget::doLayout(Renderer& renderer, float containerWidth, float con
       return maxH;
     }();
 
-    float x = 0.0f;
+    float x = 0.0F;
     if (vpnVisible) {
-      m_vpnGlyph->setPosition(x, std::round((h - m_vpnGlyph->height()) * 0.5f));
+      m_vpnGlyph->setPosition(x, std::round((h - m_vpnGlyph->height()) * 0.5F));
       x += m_vpnGlyph->width();
       if (vpnLabelVisible) {
-        m_vpnLabel->setPosition(x + Style::spaceXs, std::round((h - m_vpnLabel->height()) * 0.5f));
+        m_vpnLabel->setPosition(x + Style::spaceXs, std::round((h - m_vpnLabel->height()) * 0.5F));
         x += Style::spaceXs + m_vpnLabel->width();
       }
     }
     x += gap;
-    icon->setPosition(x, std::round((h - icon->height()) * 0.5f));
+    icon->setPosition(x, std::round((h - icon->height()) * 0.5F));
     x += icon->width();
     if (networkLabelVisible) {
-      m_label->setPosition(x + Style::spaceXs, std::round((h - m_label->height()) * 0.5f));
+      m_label->setPosition(x + Style::spaceXs, std::round((h - m_label->height()) * 0.5F));
     }
     rootNode->setSize(totalWidth, h);
   }
@@ -245,13 +252,29 @@ void NetworkWidget::syncState(Renderer& renderer) {
   }
 
   const NetworkState& s = m_network->state();
-  if (m_haveLastState && s == m_lastState && m_isVertical == m_lastVertical) {
+  const CellularModemInfo* modem = m_modem != nullptr ? m_modem->primaryModem() : nullptr;
+  const bool cellularPresent = modem != nullptr;
+  const bool cellularEnabled = cellularPresent && modem->enabled();
+  const std::uint8_t cellularSignal = cellularPresent ? modem->signalQuality : 0;
+  const std::string cellularOperator = cellularPresent ? modem->operatorName : std::string{};
+  if (m_haveLastState
+      && s == m_lastState
+      && m_isVertical == m_lastVertical
+      && cellularPresent == m_lastCellularPresent
+      && cellularEnabled == m_lastCellularEnabled
+      && cellularSignal == m_lastCellularSignal
+      && cellularOperator == m_lastCellularOperator) {
     return;
   }
   m_lastState = s;
   m_haveLastState = true;
   m_lastVertical = m_isVertical;
+  m_lastCellularPresent = cellularPresent;
+  m_lastCellularEnabled = cellularEnabled;
+  m_lastCellularSignal = cellularSignal;
+  m_lastCellularOperator = cellularOperator;
 
+  const bool cellularPrimary = s.kind == NetworkConnectivity::Cellular;
   const bool showSpinner = s.kind == NetworkConnectivity::Wired && s.resolving;
 
   // VPN glyph (both mode): show shield icon next to network icon
@@ -259,19 +282,25 @@ void NetworkWidget::syncState(Renderer& renderer) {
     const bool showVpn = m_vpnStatusMode == VpnStatusMode::Both && s.vpnActive;
     m_vpnGlyph->setVisible(showVpn);
     if (showVpn) {
-      m_vpnGlyph->setGlyph(network_glyphs::vpnGlyph());
+      m_vpnGlyph->setGlyph(network_display::vpnGlyph());
       m_vpnGlyph->setGlyphSize(Style::baseGlyphSize * m_contentScale);
       m_vpnGlyph->setColor(widgetIconColorOr(colorSpecFromRole(ColorRole::OnSurface)));
       m_vpnGlyph->measure(renderer);
     }
   }
 
-  // Main network glyph: replace mode uses the VPN icon when active.
+  // Main network glyph: replace mode uses the VPN icon when active; a primary
+  // cellular connection shows live ModemManager signal bars.
   m_glyph->setVisible(!showSpinner);
   if (m_vpnStatusMode == VpnStatusMode::Replace && s.vpnActive) {
-    m_glyph->setGlyph(network_glyphs::vpnGlyph());
+    m_glyph->setGlyph(network_display::vpnGlyph());
+  } else if (cellularPrimary && modem != nullptr) {
+    m_glyph->setGlyph(
+        modem->enabled() ? network_display::cellularGlyphForSignal(modem->signalQuality)
+                         : network_display::cellularOffGlyph()
+    );
   } else {
-    m_glyph->setGlyph(network_glyphs::glyphForState(s));
+    m_glyph->setGlyph(network_display::glyphForState(s));
   }
   m_glyph->setGlyphSize(Style::baseGlyphSize * m_contentScale);
   m_glyph->setColor(widgetIconColorOr(colorSpecFromRole(ColorRole::OnSurface)));
@@ -279,7 +308,7 @@ void NetworkWidget::syncState(Renderer& renderer) {
 
   if (m_spinner != nullptr) {
     m_spinner->setVisible(showSpinner);
-    m_spinner->setSpinnerSize(Style::baseGlyphSize * 0.8f * m_contentScale);
+    m_spinner->setSpinnerSize(Style::baseGlyphSize * 0.8F * m_contentScale);
     if (showSpinner && !m_spinner->spinning()) {
       m_spinner->start();
     } else if (!showSpinner && m_spinner->spinning()) {
@@ -291,7 +320,7 @@ void NetworkWidget::syncState(Renderer& renderer) {
     const bool showLabel = m_showLabel;
     m_label->setVisible(showLabel);
     if (showLabel) {
-      std::string text = labelForState(s);
+      std::string text = labelForState(s, modem);
       // In replace mode, vpn_label overrides the network label.
       if (m_vpnStatusMode == VpnStatusMode::Replace && m_showVpnLabel && s.vpnActive) {
         if (std::string vpnName = firstActiveVpnName(m_network->vpnConnections()); !vpnName.empty()) {
@@ -301,7 +330,7 @@ void NetworkWidget::syncState(Renderer& renderer) {
       if (m_isVertical && text.size() > 3) {
         text = text.substr(0, 3);
       }
-      m_label->setFontSize((m_isVertical ? Style::fontSizeCaption : Style::fontSizeBody) * m_contentScale);
+      m_label->setFontSize((m_isVertical ? Style::fontSizeCaption : Style::fontSizeBody) * fontScale());
       m_label->setText(text);
       m_label->setColor(widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface)));
       m_label->measure(renderer);
@@ -317,7 +346,7 @@ void NetworkWidget::syncState(Renderer& renderer) {
       if (m_isVertical && vpnText.size() > 3) {
         vpnText = vpnText.substr(0, 3);
       }
-      m_vpnLabel->setFontSize((m_isVertical ? Style::fontSizeCaption : Style::fontSizeBody) * m_contentScale);
+      m_vpnLabel->setFontSize((m_isVertical ? Style::fontSizeCaption : Style::fontSizeBody) * fontScale());
       m_vpnLabel->setText(vpnText);
       m_vpnLabel->setColor(widgetForegroundOr(colorSpecFromRole(ColorRole::OnSurface)));
       m_vpnLabel->measure(renderer);
@@ -325,7 +354,7 @@ void NetworkWidget::syncState(Renderer& renderer) {
   }
 
   if (auto* rootNode = root(); rootNode != nullptr) {
-    rootNode->setOpacity(1.0f);
+    rootNode->setOpacity(1.0F);
     static_cast<InputArea*>(rootNode)->requestTooltipRefresh();
   }
 
@@ -338,16 +367,50 @@ std::vector<TooltipRow> NetworkWidget::buildTooltipRows() const {
     return rows;
   }
 
+  // Only an enabled modem earns rows on a non-cellular connection; an idle WWAN
+  // card would otherwise add "Cellular: Off" to every tooltip.
+  const CellularModemInfo* modem = m_modem != nullptr ? m_modem->primaryModem() : nullptr;
+  const CellularModemInfo* secondaryModem = (modem != nullptr && modem->enabled()) ? modem : nullptr;
+
+  auto appendCellularRows = [&rows](const CellularModemInfo& m) {
+    rows.push_back({i18n::tr("bar.widgets.network.cellular"), cellularStateText(m.state)});
+    if (!m.operatorName.empty()) {
+      rows.push_back({i18n::tr("bar.widgets.network.operator"), m.operatorName});
+    }
+    rows.push_back({i18n::tr("bar.widgets.network.signal"), std::to_string(m.signalQuality) + "%"});
+    if (const char* tech = cellularAccessTechnologyName(m.accessTechnologies); tech[0] != '\0') {
+      rows.push_back({i18n::tr("bar.widgets.network.technology"), tech});
+    }
+  };
+
   const NetworkState& s = m_network->state();
   if (s.connected) {
     if (s.kind == NetworkConnectivity::Wireless && !s.ssid.empty()) {
       rows.push_back({i18n::tr("bar.widgets.network.network"), s.ssid});
       rows.push_back({i18n::tr("bar.widgets.network.signal"), std::to_string(s.signalStrength) + "%"});
+      if (const char* band = network_display::wifiFrequencyBandLabel(s.frequencyMhz); band != nullptr) {
+        rows.push_back({i18n::tr("bar.widgets.network.band"), band});
+      }
       if (!s.interfaceName.empty()) {
         rows.push_back({i18n::tr("bar.widgets.network.interface"), s.interfaceName});
       }
     } else if (s.kind == NetworkConnectivity::Wired) {
       rows.push_back({i18n::tr("bar.widgets.network.network"), i18n::tr("bar.widgets.network.wired")});
+      if (!s.interfaceName.empty()) {
+        rows.push_back({i18n::tr("bar.widgets.network.interface"), s.interfaceName});
+      }
+    } else if (s.kind == NetworkConnectivity::Cellular) {
+      rows.push_back(
+          {i18n::tr("bar.widgets.network.network"),
+           (modem != nullptr && !modem->operatorName.empty()) ? modem->operatorName
+                                                              : i18n::tr("bar.widgets.network.cellular")}
+      );
+      if (modem != nullptr) {
+        rows.push_back({i18n::tr("bar.widgets.network.signal"), std::to_string(modem->signalQuality) + "%"});
+        if (const char* tech = cellularAccessTechnologyName(modem->accessTechnologies); tech[0] != '\0') {
+          rows.push_back({i18n::tr("bar.widgets.network.technology"), tech});
+        }
+      }
       if (!s.interfaceName.empty()) {
         rows.push_back({i18n::tr("bar.widgets.network.interface"), s.interfaceName});
       }
@@ -392,6 +455,9 @@ std::vector<TooltipRow> NetworkWidget::buildTooltipRows() const {
     if (s.kind == NetworkConnectivity::Wireless) {
       rows.push_back({i18n::tr("bar.widgets.network.networks"), networkCountText(m_network->accessPoints().size())});
     }
+    if (s.kind != NetworkConnectivity::Cellular && secondaryModem != nullptr) {
+      appendCellularRows(*secondaryModem);
+    }
     return rows;
   }
 
@@ -402,6 +468,9 @@ std::vector<TooltipRow> NetworkWidget::buildTooltipRows() const {
   }
   if (s.wirelessEnabled) {
     rows.push_back({i18n::tr("bar.widgets.network.networks"), networkCountText(m_network->accessPoints().size())});
+  }
+  if (secondaryModem != nullptr) {
+    appendCellularRows(*secondaryModem);
   }
   if (s.vpnActive) {
     rows.push_back({i18n::tr("bar.widgets.network.vpn"), i18n::tr("bar.widgets.network.active")});

@@ -15,8 +15,7 @@
 namespace {
 
   constexpr Logger kLog("sound");
-  constexpr float kUiSoundGainCeiling = 0.20f;
-  constexpr float kUiSoundGamma = 2.2f;
+  constexpr float kUiSoundGamma = 2.2F;
 
   const pw_stream_events kStreamEvents = [] {
     pw_stream_events events{};
@@ -128,7 +127,7 @@ void SoundPlayer::playPluginSound(std::uint64_t ownerId, const std::string& name
 }
 
 void SoundPlayer::playBuffer(const std::string& name, const std::shared_ptr<const SoundBuffer>& buffer) {
-  if (m_loop == nullptr || m_volume <= 0.0f || buffer->samples.empty()) {
+  if (m_loop == nullptr || m_volume <= 0.0F || buffer->samples.empty()) {
     return;
   }
 
@@ -184,7 +183,7 @@ void SoundPlayer::playBuffer(const std::string& name, const std::shared_ptr<cons
   m_active.push_back(std::move(active));
 }
 
-void SoundPlayer::setVolume(float volume) { m_volume = std::clamp(volume, 0.0f, 1.0f); }
+void SoundPlayer::setVolume(float volume) { m_volume = std::clamp(volume, 0.0F, 1.0F); }
 
 void SoundPlayer::onProcess(void* userdata) {
   auto* streamState = static_cast<ActiveStream*>(userdata);
@@ -244,7 +243,7 @@ void SoundPlayer::processStream(ActiveStream& streamState) {
   const std::size_t remaining =
       (streamState.cursor < sampleCount && !streamState.draining) ? (sampleCount - streamState.cursor) : 0;
   const std::size_t copySamples = std::min(capacitySamples, remaining);
-  const float playbackGain = std::pow(m_volume, kUiSoundGamma) * kUiSoundGainCeiling;
+  const float playbackGain = std::pow(m_volume, kUiSoundGamma);
 
   for (std::size_t i = 0; i < copySamples; ++i) {
     dst[i] = src[streamState.cursor + i] * playbackGain;

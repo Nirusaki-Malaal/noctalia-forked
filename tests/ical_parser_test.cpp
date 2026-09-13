@@ -1,4 +1,5 @@
 #include "calendar/ical_parser.h"
+#include "render/core/color.h"
 
 #include <algorithm>
 #include <chrono>
@@ -150,6 +151,24 @@ namespace {
     return true;
   }
 
+  bool expectOneEventUrl(
+      const std::string& ics, system_clock::time_point start, system_clock::time_point end, const std::string& url,
+      const char* message
+  ) {
+    ICalParseResult result = parseEvents(ics, start, end);
+    if (result.status != ICalParseStatus::Complete || result.events.size() != 1) {
+      std::println(stderr, "ical_parser_test: {}: expected exactly one parsed event", message);
+      return false;
+    }
+    if (result.events.front().url != url) {
+      std::println(
+          stderr, R"(ical_parser_test: {}: url was "{}", expected "{}")", message, result.events.front().url, url
+      );
+      return false;
+    }
+    return true;
+  }
+
 } // namespace
 
 int main() {
@@ -177,6 +196,33 @@ int main() {
                             "LOCATION:Main\\, Room\r\n"
                             "DTSTART:20240101T090000Z\r\nDTEND:20240101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     ok = expectOneEventText(ics, start, end, "Planning\nSession", "Main, Room", "escaped text values") && ok;
+  }
+
+  // A meeting link in LOCATION becomes the event's clickable url, and wins over the URL property.
+  {
+    const std::string ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:meet\r\nSUMMARY:Daily Sync\r\n"
+                            "LOCATION:https://meet.google.com/abc-defg-hij\r\n"
+                            "URL:https://calendar.example/event/1\r\n"
+                            "DTSTART:20240101T090000Z\r\nDTEND:20240101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    ok =
+        expectOneEventUrl(ics, start, end, "https://meet.google.com/abc-defg-hij", "location link wins over url") && ok;
+  }
+
+  // With no link in LOCATION the URL property is used.
+  {
+    const std::string ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:url\r\nSUMMARY:Review\r\n"
+                            "LOCATION:Meeting Room 3\r\n"
+                            "URL:https://calendar.example/event/2\r\n"
+                            "DTSTART:20240101T090000Z\r\nDTEND:20240101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    ok = expectOneEventUrl(ics, start, end, "https://calendar.example/event/2", "url property fallback") && ok;
+  }
+
+  // An event with neither carries no link.
+  {
+    const std::string ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:plain\r\nSUMMARY:Dentist\r\n"
+                            "LOCATION:Kyiv\r\n"
+                            "DTSTART:20240101T090000Z\r\nDTEND:20240101T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    ok = expectOneEventUrl(ics, start, end, "", "no link") && ok;
   }
 
   // Malformed/incomplete VEVENTs are skipped instead of producing epoch-placeholder events.
@@ -448,7 +494,7 @@ int main() {
   // All-day (VALUE=DATE) MONTHLY on the 1st, over a one-year window, is exactly 12 - one per month.
   // The old code derived the day-of-month from floor<days> of the UTC instant, which for a zone east
   // of UTC rolls back to the previous civil day (the 31st of Dec), so months without a 31st were
-  // dropped. Correct behaviour is zone-independent. Window is padded ±half-month so each local-midnight
+  // dropped. Correct behavior is zone-independent. Window is padded ±half-month so each local-midnight
   // occurrence lands inside regardless of the running zone's UTC offset.
   {
     const std::string ics = "BEGIN:VEVENT\r\nUID:ad\r\nSUMMARY:s\r\nDTSTART;VALUE=DATE:20240101\r\n"
@@ -604,6 +650,47 @@ int main() {
         && ok;
   }
 
+  // Responses that are not iCalendar at all must be distinguishable from an empty calendar, so a
+  // captive portal or expired share link cannot overwrite cached events with nothing.
+  {
+    const std::vector<std::string> invalid = {
+        "<!DOCTYPE html>\r\n<html><body><h1>Sign in</h1></body></html>\r\n",
+        R"({"error":"expired share"})",
+        "not a calendar at all\r\n",
+        "",
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:a\r\n",
+        // The envelope survived but every content line inside the event was mangled, so nothing
+        // usable came out. Distinct from a calendar that is legitimately empty.
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
+        "DTSTART 20240115T100000Z\r\nSUMMARY Team Meeting\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+    };
+    for (const std::string& ics : invalid) {
+      ok = expect(
+               parseEvents(ics, start, end).status == ICalParseStatus::InvalidCalendar,
+               "non-calendar response was not reported as invalid"
+           )
+          && ok;
+    }
+
+    const ICalParseResult empty = parseEvents("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n", start, end);
+    ok = expect(empty.status == ICalParseStatus::Complete, "empty calendar was not reported as complete") && ok;
+    ok = expect(empty.events.empty(), "empty calendar produced events") && ok;
+  }
+
+  // Libical replaces unparseable content lines with X-LIC-ERROR properties instead of rejecting the
+  // document, so a partially damaged feed still yields its readable events. Rejecting the whole
+  // calendar here would let one quirky line hide every event in a large feed.
+  {
+    const std::string ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Broken Corp//Bad Calendar//EN\r\n"
+                            "BEGIN:VEVENT\r\nUID:recovered\r\nDTSTART:20240115T100000Z\r\n"
+                            "DTEND 20240115T110000Z\r\n"
+                            "SUMMARY:Team Meeting\r\n"
+                            "Description This line has no colon separator\r\n"
+                            "END:VEVENT\r\nEND:VCALENDAR\r\n";
+    ok = expectOneEventText(ics, start, end, "Team Meeting", "", "damaged lines are skipped and the event survives")
+        && ok;
+  }
+
   {
     ICalParseControl control{.remainingRecurrenceWork = 1};
     const ICalParseResult result = calendar::parseICalEvents(wrap("RRULE:FREQ=DAILY;COUNT=3\r\n"), start, end, control);
@@ -634,6 +721,75 @@ int main() {
     ok = expect(
              steady_clock::now() - beforeCancellation < milliseconds{500},
              "cancelled recurrence expansion did not stop promptly"
+         )
+        && ok;
+  }
+
+  {
+    const std::string icsRfcColor = wrap("COLOR:#336699\r\n");
+    const ICalParseResult res1 = parseEvents(icsRfcColor, start, end);
+    ok = expect(res1.status == ICalParseStatus::Complete, "RFC COLOR parse failed") && ok;
+    ok = expect(!res1.events.empty() && res1.events[0].colorHex == "#336699", "RFC COLOR not extracted") && ok;
+
+    const std::string icsCssColor = wrap("COLOR:blue\r\n");
+    const ICalParseResult res2 = parseEvents(icsCssColor, start, end);
+    ok = expect(res2.status == ICalParseStatus::Complete, "CSS COLOR parse failed") && ok;
+    ok = expect(!res2.events.empty() && res2.events[0].colorHex == "#0000FF", "CSS COLOR not converted to hex") && ok;
+
+    const std::string icsAppleColor = wrap("X-APPLE-CALENDAR-COLOR:#FF5500\r\n");
+    const ICalParseResult res3 = parseEvents(icsAppleColor, start, end);
+    ok = expect(res3.status == ICalParseStatus::Complete, "Apple color parse failed") && ok;
+    ok = expect(!res3.events.empty() && res3.events[0].colorHex == "#FF5500", "Apple color not extracted") && ok;
+
+    const std::string icsAppleMixedCase = wrap("X-Apple-Calendar-Color:#FF5500\r\n");
+    const ICalParseResult res4 = parseEvents(icsAppleMixedCase, start, end);
+    ok = expect(res4.status == ICalParseStatus::Complete, "mixed-case Apple color parse failed") && ok;
+    ok = expect(!res4.events.empty() && res4.events[0].colorHex == "#FF5500", "mixed-case Apple color not extracted")
+        && ok;
+
+    const std::string icsXColor = wrap("X-COLOR:#12AB34\r\n");
+    const ICalParseResult res5 = parseEvents(icsXColor, start, end);
+    ok = expect(res5.status == ICalParseStatus::Complete, "X-COLOR parse failed") && ok;
+    ok = expect(!res5.events.empty() && res5.events[0].colorHex == "#12AB34", "X-COLOR not extracted") && ok;
+
+    const std::string icsOutlookColor = wrap("X-OUTLOOK-COLOR:#A1B2C3\r\n");
+    const ICalParseResult res6 = parseEvents(icsOutlookColor, start, end);
+    ok = expect(res6.status == ICalParseStatus::Complete, "X-OUTLOOK-COLOR parse failed") && ok;
+    ok = expect(!res6.events.empty() && res6.events[0].colorHex == "#A1B2C3", "X-OUTLOOK-COLOR not extracted") && ok;
+
+    const std::string icsPrecedence = wrap("COLOR:blue\r\nX-COLOR:#FF0000\r\n");
+    const ICalParseResult res7 = parseEvents(icsPrecedence, start, end);
+    ok = expect(res7.status == ICalParseStatus::Complete, "color precedence parse failed") && ok;
+    ok = expect(!res7.events.empty() && res7.events[0].colorHex == "#0000FF", "RFC COLOR did not win") && ok;
+
+    const std::string icsInvalidRfcColor = wrap("COLOR:not-a-color\r\nX-COLOR:#0A0B0C\r\n");
+    const ICalParseResult res8 = parseEvents(icsInvalidRfcColor, start, end);
+    ok = expect(res8.status == ICalParseStatus::Complete, "invalid RFC color parse failed") && ok;
+    ok = expect(
+             !res8.events.empty() && res8.events[0].colorHex == "#0A0B0C",
+             "vendor color was not used after invalid RFC COLOR"
+         )
+        && ok;
+
+    const std::string icsModernNamedColor = wrap("COLOR:rebeccapurple\r\n");
+    const ICalParseResult res9 = parseEvents(icsModernNamedColor, start, end);
+    ok = expect(res9.status == ICalParseStatus::Complete, "modern named color parse failed") && ok;
+    ok = expect(!res9.events.empty() && res9.events[0].colorHex == "#663399", "modern named color was not converted")
+        && ok;
+
+    const std::string icsNoColor = wrap("");
+    const ICalParseResult res10 = parseEvents(icsNoColor, start, end);
+    ok = expect(res10.status == ICalParseStatus::Complete, "No-color parse failed") && ok;
+    ok = expect(!res10.events.empty() && res10.events[0].colorHex.empty(), "No-color event has non-empty colorHex")
+        && ok;
+  }
+
+  {
+    Color color;
+    ok = expect(!tryParseCssColor("red", color), "strict CSS parser accepted a named color") && ok;
+    ok = expect(
+             tryParseCssColorWithNamedColors("ReBeccAPurple", color) && color == hex("#663399"),
+             "named CSS parser rejected rebeccapurple"
          )
         && ok;
   }
