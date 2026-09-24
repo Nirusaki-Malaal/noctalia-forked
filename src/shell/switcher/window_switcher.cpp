@@ -925,7 +925,9 @@ void WindowSwitcher::syncSelection(bool animate) {
     bool hideOnComplete = false;
   };
 
-  if (m_instance->carouselAnimId != 0) {
+  const std::vector<WindowSwitcherCardTarget> previousTargets = m_instance->styleLayout.cards;
+  const bool interrupted = m_instance->carouselAnimId != 0;
+  if (interrupted) {
     m_instance->animations.cancel(m_instance->carouselAnimId);
     m_instance->carouselAnimId = 0;
   }
@@ -960,6 +962,7 @@ void WindowSwitcher::syncSelection(bool animate) {
     const float oldVisualY = tile->y() + (tile->height() - oldVisualH) * 0.5F;
     const float oldOpacity = tile->opacity();
     const WindowSwitcherCardTarget& target = targets[windowIndex];
+    const bool wasTargetVisible = windowIndex < previousTargets.size() && previousTargets[windowIndex].visible;
 
     if (target.visible) {
       tile->bind(
@@ -987,6 +990,10 @@ void WindowSwitcher::syncSelection(bool animate) {
         startVisualX = target.x + target.direction * target.width * Style::windowSwitcherIncomingCardSlide;
         startVisualY = target.y + (target.height - startVisualH) * 0.5F;
         startOpacity = 0.0F;
+      } else if (interrupted && wasTargetVisible) {
+        // A card that entered during the cancelled step now occupies a stable
+        // slot and must not remain transparent through successive repeats.
+        startOpacity = target.opacity;
       }
 
       CardTransition transition;
@@ -1003,7 +1010,7 @@ void WindowSwitcher::syncSelection(bool animate) {
       continue;
     }
 
-    if (!wasVisible || !animate) {
+    if (!wasVisible || !animate || (interrupted && !wasTargetVisible)) {
       tile->setVisible(false);
       tile->setScale(1.0F);
       continue;
