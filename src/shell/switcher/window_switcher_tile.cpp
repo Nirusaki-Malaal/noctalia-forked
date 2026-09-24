@@ -97,7 +97,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
           .glyph = "close",
           .glyphSize = Style::fontSizeCaption * m_contentScale,
           .controlHeight = Style::controlHeightSm * m_contentScale,
-          .variant = ButtonVariant::Ghost,
+          .variant = ButtonVariant::Default,
           .padding = 0.0F,
           .width = Style::controlHeightSm * m_contentScale,
           .height = Style::controlHeightSm * m_contentScale,
@@ -306,7 +306,7 @@ void WindowSwitcherTile::applyVisualState() {
   if (m_shadow != nullptr) {
     m_shadow->setVisible(m_selected && m_shadowConfigured);
   }
-  const bool showClose = m_selected && m_pointerHovered;
+  const bool showClose = m_selected || m_pointerHovered;
   m_close->setVisible(showClose);
   m_close->setEnabled(showClose);
 }
@@ -373,7 +373,7 @@ void WindowSwitcherTile::layoutContent(Renderer& renderer) {
 
   if (m_captionBadge != nullptr && m_captionVisible && m_showCaption) {
     const float captionPad = Style::spaceLg * m_contentScale;
-    const float captionMargin = (m_wideCaption ? Style::spaceSm : Style::spaceLg) * m_contentScale;
+    const float captionMargin = m_wideCaption ? 0.0F : Style::spaceLg * m_contentScale;
     const float maxCaptionW = std::max(0.0F, m_cardWidth - captionMargin * 2.0F);
     m_title->setMaxWidth(std::max(0.0F, maxCaptionW - captionPad * 2.0F));
     m_subtitle->setMaxWidth(std::max(0.0F, maxCaptionW - captionPad * 2.0F));

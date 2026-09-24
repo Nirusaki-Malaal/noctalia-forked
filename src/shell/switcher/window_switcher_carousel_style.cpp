@@ -103,6 +103,7 @@ WindowSwitcherStyleLayout computeWindowSwitcherCarouselLayout(const WindowSwitch
     WindowSwitcherCardTarget& target = layout.cards[windowIndex];
     target.visible = true;
     target.showCaption = context.showCaption && distance == 0;
+    target.wideCaption = target.showCaption;
     target.iconPlacement = relativeSlot > 0 ? WindowSwitcherIconPlacement::Right : WindowSwitcherIconPlacement::Left;
     target.depth = distance == 0 ? WindowSwitcherTileDepth::Selected
                                  : (distance == 1 ? WindowSwitcherTileDepth::Near : WindowSwitcherTileDepth::Far);
