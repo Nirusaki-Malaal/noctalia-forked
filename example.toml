@@ -110,7 +110,11 @@ prefix = "win"
 blacklist = []                      # ignore MPRIS players by bus/identity/desktop entry token
 
 [shell.window_switcher]
+style = "carousel"                    # "carousel" (depth layout) or "compact" (boxed strip)
 mru = false                         # order windows by most recently used (Alt+Tab) instead of workspace layout
+show_caption = true                 # show window titles and application names below previews
+show_count = true                   # show the current and total window count above the previews
+show_app_icon = true                # show application icons over window previews
 
 # ── Wallpaper ─────────────────────────────────────────────────────────────────
 

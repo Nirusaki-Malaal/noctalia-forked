@@ -507,6 +507,11 @@ location = "https://example.invalid/bad"
         LauncherProviderConfig{"session", "s", true}, LauncherProviderConfig{"wallpaper", "w"}
     };
     c.shell.keyboardLayout.customLabels = {{"English (US)", "US"}, {"German", "DE"}};
+    c.shell.windowSwitcher.style = ShellConfig::WindowSwitcherStyle::Compact;
+    c.shell.windowSwitcher.mru = true;
+    c.shell.windowSwitcher.showCaption = false;
+    c.shell.windowSwitcher.showCount = false;
+    c.shell.windowSwitcher.showAppIcon = false;
     c.shell.screenCorners.enabled = true;
     c.shell.screenCorners.size = 24;
     c.shell.mpris.blacklist = {"firefox"};

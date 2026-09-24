@@ -1547,6 +1547,10 @@
           "soft": "Soft",
           "solid": "Solid"
         },
+        "window-switcher-style": {
+          "carousel": "Carousel",
+          "compact": "Compact"
+        },
         "password-style": {
           "filled-circles": "Filled Circles",
           "random-icons": "Random Icons"
@@ -3281,6 +3285,22 @@
         "window-switcher-mru": {
           "description": "Order windows in the switcher by most recently used rather than workspace and screen layout",
           "label": "Most Recently Used Order"
+        },
+        "window-switcher-style": {
+          "description": "Choose the freestanding depth carousel or the boxed compact strip",
+          "label": "Switcher Style"
+        },
+        "window-switcher-show-app-icon": {
+          "description": "Show each application's icon over its window preview",
+          "label": "Show Application Icon"
+        },
+        "window-switcher-show-caption": {
+          "description": "Show window titles and application names below their previews",
+          "label": "Show Caption"
+        },
+        "window-switcher-show-count": {
+          "description": "Show the current position and total window count above the previews",
+          "label": "Show Window Count"
         }
       },
       "system": {
@@ -4840,6 +4860,8 @@
     }
   },
   "window-switcher": {
+    "count": "{count} window",
+    "count-plural": "{count} windows",
     "empty": "No open windows",
     "hint": "Tab · Shift+Tab · Arrow keys · Release Alt to switch · Esc to cancel",
     "title": "Windows"
