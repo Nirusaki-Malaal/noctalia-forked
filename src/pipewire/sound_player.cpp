@@ -101,31 +101,35 @@ namespace {
       return {};
     }
 
-    // Find sounds.
+    // Find sounds, stripping trailing dash components from the event name until one matches.
     std::vector<std::string> directories{"stereo"};
     if (const auto listed = parsed->file.value("Sound Theme", "Directories"); listed.has_value()) {
       directories = splitList(*listed);
     }
-    for (const auto& baseDir : baseDirs) {
-      const fs::path root = baseDir / theme;
-      if (!fs::is_directory(root)) {
-        continue;
-      }
-      for (const auto& directory : directories) {
-        if (parsed->file.value(directory, "OutputProfile").value_or("stereo") != "stereo") {
+    for (std::string_view name = event; !name.empty();) {
+      for (const auto& baseDir : baseDirs) {
+        const fs::path root = baseDir / theme;
+        if (!fs::is_directory(root)) {
           continue;
         }
-        for (const auto extension : kExtensions) {
-          const fs::path path = root / directory / (std::string(event) + std::string(extension));
-          if (!fs::is_regular_file(path)) {
+        for (const auto& directory : directories) {
+          if (parsed->file.value(directory, "OutputProfile").value_or("stereo") != "stereo") {
             continue;
           }
-          if (extension == ".disabled") {
-            return {.state = ThemeSoundLookupState::Disabled};
+          for (const auto extension : kExtensions) {
+            const fs::path path = root / directory / (std::string(name) + std::string(extension));
+            if (!fs::is_regular_file(path)) {
+              continue;
+            }
+            if (extension == ".disabled") {
+              return {.state = ThemeSoundLookupState::Disabled};
+            }
+            return {.state = ThemeSoundLookupState::Found, .path = path};
           }
-          return {.state = ThemeSoundLookupState::Found, .path = path};
         }
       }
+      const auto dash = name.rfind('-');
+      name = dash == std::string_view::npos ? std::string_view{} : name.substr(0, dash);
     }
 
     if (const auto inherits = parsed->file.value("Sound Theme", "Inherits"); inherits.has_value()) {
@@ -193,7 +197,7 @@ void SoundPlayer::setTheme(std::string theme) {
 
   std::unordered_map<std::string, std::shared_ptr<const SoundBuffer>> buffers;
   for (const std::string_view event :
-       {"message", "audio-volume-change", "power-plug", "power-unplug", "screen-capture"}) {
+       {"message-new-instant", "audio-volume-change", "power-plug", "power-unplug", "screen-capture"}) {
     const auto result = findThemeSound(event, theme);
     if (result.state == ThemeSoundLookupState::Disabled) {
       kLog.info("sound theme '{}': event '{}' is disabled", theme, event);
