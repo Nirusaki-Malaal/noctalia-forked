@@ -1065,7 +1065,7 @@ void WindowSwitcher::syncSelection(bool animate) {
   InputArea* animationOwner = instance->strip;
   instance->carouselAnimId = instance->animations.animate(
       0.0F, 1.0F, Style::animNormal, Easing::EaseOutCubic,
-      [transitions](float progress) {
+      [instance, transitions](float progress) {
         for (const CardTransition& transition : transitions) {
           transition.tile->setPosition(
               std::lerp(transition.fromX, transition.toX, progress),
@@ -1076,6 +1076,9 @@ void WindowSwitcher::syncSelection(bool animate) {
               std::lerp(transition.fromScaleY, transition.toScaleY, progress)
           );
           transition.tile->setOpacity(std::lerp(transition.fromOpacity, transition.toOpacity, progress));
+        }
+        if (instance->pointerInside) {
+          instance->inputDispatcher.syncPointerHover();
         }
       },
       [this, instance, transitions]() {
@@ -1088,6 +1091,9 @@ void WindowSwitcher::syncSelection(bool animate) {
             transition.tile->setVisible(false);
             transition.tile->setScale(1.0F);
           }
+        }
+        if (instance->pointerInside) {
+          instance->inputDispatcher.syncPointerHover();
         }
         if (instance->contentSyncPending) {
           requestSceneUpdate();
@@ -1392,6 +1398,9 @@ void WindowSwitcher::prepareFrame(Instance& instance, bool /*needsUpdate*/, bool
       instance.sceneRoot->layout(renderer);
     }
     positionPanel(instance, static_cast<float>(width), static_cast<float>(height));
+  }
+  if (instance.pointerInside) {
+    instance.inputDispatcher.syncPointerHover();
   }
 }
 

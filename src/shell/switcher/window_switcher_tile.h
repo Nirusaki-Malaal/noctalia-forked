@@ -86,8 +86,6 @@ protected:
   bool m_showAppIcon = true;
   WindowSwitcherIconPlacement m_iconPlacement = WindowSwitcherIconPlacement::Left;
   WindowSwitcherTileDepth m_depth = WindowSwitcherTileDepth::Far;
-  float m_hoverProgress = 0.0F;
-  std::uint32_t m_hoverAnimId = 0;
   RoundedRectStyle m_shadowStyle;
   std::string m_iconPath;
   int m_iconTargetSize = 0;

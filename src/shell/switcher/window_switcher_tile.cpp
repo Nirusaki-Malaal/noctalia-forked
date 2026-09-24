@@ -1,7 +1,6 @@
 #include "shell/switcher/window_switcher_tile.h"
 
 #include "cursor-shape-v1-client-protocol.h"
-#include "render/animation/animation_manager.h"
 #include "render/core/renderer.h"
 #include "render/core/texture_manager.h"
 #include "ui/builders.h"
@@ -15,7 +14,6 @@
 
 namespace {
 
-  constexpr float kHoverLift = Style::spaceXs;
   constexpr float kNearToneAlpha = Style::disabledOutlineAlpha * 0.25F;
   constexpr float kFarToneAlpha = Style::disabledOutlineAlpha * 0.5F;
 
@@ -254,26 +252,9 @@ void WindowSwitcherTile::setPointerHovered(bool hovered) {
   m_pointerHovered = hovered;
   applyVisualState();
 
-  const float target = hovered ? 1.0F : 0.0F;
-  auto applyProgress = [this](float progress) {
-    m_hoverProgress = progress;
-    markLayoutDirty();
-    if (m_onInvalidate) {
-      m_onInvalidate();
-    }
-  };
-  AnimationManager* animations = animationManager();
-  if (animations == nullptr) {
-    applyProgress(target);
-    return;
+  if (m_onInvalidate) {
+    m_onInvalidate();
   }
-  if (m_hoverAnimId != 0) {
-    animations->cancel(m_hoverAnimId);
-  }
-  m_hoverAnimId = animations->animate(
-      m_hoverProgress, target, Style::animFast, Easing::EaseOutCubic, std::move(applyProgress),
-      [this]() { m_hoverAnimId = 0; }, this
-  );
 }
 
 bool WindowSwitcherTile::refreshIcon(Renderer& renderer) {
@@ -300,6 +281,10 @@ void WindowSwitcherTile::applyVisualState() {
   if (m_selected) {
     m_frame->setFill(colorSpecFromRole(ColorRole::Surface));
     m_frame->setBorder(colorSpecFromRole(ColorRole::Primary), Style::emphasizedBorderWidth);
+    m_previewHost->setFill(colorSpecFromRole(ColorRole::SurfaceVariant));
+  } else if (m_pointerHovered) {
+    m_frame->setFill(colorSpecFromRole(ColorRole::Surface));
+    m_frame->setBorder(colorSpecFromRole(ColorRole::Hover), Style::emphasizedBorderWidth);
     m_previewHost->setFill(colorSpecFromRole(ColorRole::SurfaceVariant));
   } else {
     m_frame->setFill(colorSpecFromRole(ColorRole::Surface));
@@ -333,14 +318,13 @@ void WindowSwitcherTile::layoutContent(Renderer& renderer) {
       : 0.0F;
   const float captionGap = captionH > 0.0F ? Style::spaceMd * m_contentScale : 0.0F;
   const float frameH = std::max(0.0F, m_cardHeight - captionGap - captionH);
-  const float liftY = -kHoverLift * m_contentScale * m_hoverProgress;
   const float previewH = std::max(0.0F, frameH - outerPad * 2.0F);
 
   if (m_shadow != nullptr) {
-    m_shadow->setPosition(m_shadowStyle.shadowCutoutOffsetX, liftY + m_shadowStyle.shadowCutoutOffsetY);
+    m_shadow->setPosition(m_shadowStyle.shadowCutoutOffsetX, m_shadowStyle.shadowCutoutOffsetY);
     m_shadow->setFrameSize(m_cardWidth, frameH);
   }
-  m_frame->setPosition(0.0F, liftY);
+  m_frame->setPosition(0.0F, 0.0F);
   m_frame->setFrameSize(m_cardWidth, frameH);
   m_previewHost->setPosition(outerPad, outerPad);
   m_previewHost->setFrameSize(innerW, previewH);
@@ -397,7 +381,7 @@ void WindowSwitcherTile::layoutContent(Renderer& renderer) {
     const float contentCaptionW = std::max(m_title->width(), m_subtitle->width()) + captionPad * 2.0F;
     const float captionW = m_wideCaption ? maxCaptionW : std::min(maxCaptionW, contentCaptionW);
     const float captionX = (m_cardWidth - captionW) * 0.5F;
-    const float captionY = liftY + frameH + captionGap;
+    const float captionY = frameH + captionGap;
     m_captionBadge->setPosition(captionX, captionY);
     m_captionBadge->setFrameSize(captionW, captionH);
     m_caption->setPosition(captionPad, 0.0F);
