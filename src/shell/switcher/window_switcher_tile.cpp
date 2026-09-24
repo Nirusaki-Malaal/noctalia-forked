@@ -102,7 +102,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
           .glyph = "close",
           .glyphSize = Style::fontSizeCaption * m_contentScale,
           .controlHeight = (Style::controlHeightSm - Style::spaceSm) * m_contentScale,
-          .variant = ButtonVariant::Destructive,
+          .variant = ButtonVariant::Outline,
           .padding = 0.0F,
           .width = (Style::controlHeightSm - Style::spaceSm) * m_contentScale,
           .height = (Style::controlHeightSm - Style::spaceSm) * m_contentScale,
