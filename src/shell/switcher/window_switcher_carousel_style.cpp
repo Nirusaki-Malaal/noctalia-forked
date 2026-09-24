@@ -121,11 +121,13 @@ WindowSwitcherStyleLayout computeWindowSwitcherCarouselLayout(const WindowSwitch
       const float nearRight = selectedX + selectedWidth - overlap;
       target.x = relativeSlot < 0 ? nearLeft - farWidth + overlap : nearRight + nearWidth - overlap;
     }
-    target.height = previewFrameHeight(target.width, context.scale);
+    const float previewHeight = previewFrameHeight(target.width, context.scale);
+    target.height = previewHeight;
     if (target.showCaption) {
       target.height += captionGap + captionHeight;
     }
-    target.y = (layout.stripHeight - target.height) * 0.5F;
+    const float selectedPreviewHeight = previewFrameHeight(selectedWidth, context.scale);
+    target.y = (selectedPreviewHeight - previewHeight) * 0.5F;
   }
   return layout;
 }

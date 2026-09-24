@@ -62,15 +62,15 @@ namespace Style {
   // Window switcher carousel geometry and depth treatment.
   inline constexpr float windowSwitcherDimOpacity = 0.3F;
   inline constexpr float windowSwitcherSelectedCardWidth = 500.0F;
-  inline constexpr float windowSwitcherNearCardWidth = 240.0F;
-  inline constexpr float windowSwitcherFarCardWidth = 190.0F;
+  inline constexpr float windowSwitcherNearCardWidth = 380.0F;
+  inline constexpr float windowSwitcherFarCardWidth = 280.0F;
   inline constexpr float windowSwitcherCompactCardWidth = 220.0F;
   inline constexpr float windowSwitcherPreviewAspect = 1.6F;
-  inline constexpr float windowSwitcherCardOverlap = spaceLg + spaceSm;
+  inline constexpr float windowSwitcherCardOverlap = controlHeightLg + spaceLg;
   inline constexpr float windowSwitcherNarrowLayoutThreshold = 0.72F;
   inline constexpr float windowSwitcherPreviewIconScale = 0.12F;
   inline constexpr float windowSwitcherFallbackIconScale = 0.28F;
-  inline constexpr float windowSwitcherCaptionHeight = controlHeight;
+  inline constexpr float windowSwitcherCaptionHeight = controlHeightLg;
   inline constexpr float windowSwitcherCaptionLineGap = -spaceXs;
   inline constexpr float windowSwitcherIncomingCardScale = 0.9F;
   inline constexpr float windowSwitcherIncomingCardSlide = 0.25F;

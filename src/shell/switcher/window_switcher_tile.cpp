@@ -18,7 +18,6 @@ namespace {
   constexpr float kHoverLift = Style::spaceXs;
   constexpr float kNearToneAlpha = Style::disabledOutlineAlpha * 0.25F;
   constexpr float kFarToneAlpha = Style::disabledOutlineAlpha * 0.5F;
-  constexpr float kMinimumImageAspect = 0.01F;
 
 } // namespace
 
@@ -351,29 +350,14 @@ void WindowSwitcherTile::layoutContent(Renderer& renderer) {
     m_icon->setVisible(false);
     m_fallbackGlyph->setVisible(false);
   }
-  float imageX = 0.0F;
-  float imageY = 0.0F;
-  float imageW = innerW;
-  float imageH = previewH;
-  if (hasThumbnail) {
-    const float sourceAspect = std::max(kMinimumImageAspect, m_thumbnail->aspectRatio());
-    const float hostAspect = previewH > 0.0F ? innerW / previewH : sourceAspect;
-    if (hostAspect > sourceAspect) {
-      imageW = previewH * sourceAspect;
-      imageX = (innerW - imageW) * 0.5F;
-    } else {
-      imageH = innerW / sourceAspect;
-      imageY = (previewH - imageH) * 0.5F;
-    }
-  }
   const float overlayInset = Style::spaceSm * m_contentScale;
   float iconX = (innerW - iconSize) * 0.5F;
   if (hasThumbnail && m_iconPlacement == WindowSwitcherIconPlacement::Left) {
-    iconX = imageX + overlayInset;
+    iconX = overlayInset;
   } else if (hasThumbnail && m_iconPlacement == WindowSwitcherIconPlacement::Right) {
-    iconX = imageX + imageW - iconSize - overlayInset;
+    iconX = innerW - iconSize - overlayInset;
   }
-  const float iconY = hasThumbnail ? imageY + imageH - iconSize - overlayInset : (previewH - iconSize) * 0.5F;
+  const float iconY = hasThumbnail ? previewH - iconSize - overlayInset : (previewH - iconSize) * 0.5F;
   m_icon->setSize(iconSize, iconSize);
   m_icon->setPosition(std::round(iconX), std::round(iconY));
   m_fallbackGlyph->setGlyphSize(iconSize);
@@ -388,7 +372,7 @@ void WindowSwitcherTile::layoutContent(Renderer& renderer) {
   m_close->setSize(closeSize, closeSize);
 
   if (m_captionBadge != nullptr && m_captionVisible && m_showCaption) {
-    const float captionPad = Style::spaceMd * m_contentScale;
+    const float captionPad = Style::spaceLg * m_contentScale;
     const float captionMargin = (m_wideCaption ? Style::spaceSm : Style::spaceLg) * m_contentScale;
     const float maxCaptionW = std::max(0.0F, m_cardWidth - captionMargin * 2.0F);
     m_title->setMaxWidth(std::max(0.0F, maxCaptionW - captionPad * 2.0F));
@@ -407,6 +391,6 @@ void WindowSwitcherTile::layoutContent(Renderer& renderer) {
 }
 
 void WindowSwitcherTile::doLayout(Renderer& renderer) {
-  InputArea::doLayout(renderer);
   layoutContent(renderer);
+  InputArea::doLayout(renderer);
 }
