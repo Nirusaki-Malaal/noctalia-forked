@@ -42,9 +42,11 @@ namespace calendar {
 
     using ICalRecurPtr = std::unique_ptr<icalrecur_iterator, ICalRecurDeleter>;
 
+    // Days and weeks count as fixed 24h spans. libical 4's icaldurationtype_as_seconds() returns 0
+    // for any duration with days or weeks.
     int durationSeconds(const icaldurationtype& duration) {
 #if ICAL_CHECK_VERSION(4, 0, 0)
-      return icaldurationtype_as_seconds(duration);
+      return icaldurationtype_as_utc_seconds(duration);
 #else
       return icaldurationtype_as_int(duration);
 #endif
