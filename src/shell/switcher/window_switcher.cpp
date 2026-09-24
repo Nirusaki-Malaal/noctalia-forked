@@ -298,14 +298,15 @@ namespace {
     return entry;
   }
 
-  void
-  indexLiveToplevelsByWindowId(const CompositorPlatform& platform, std::unordered_map<std::string, ToplevelInfo>& out) {
+  void indexLiveToplevelsByWindowId(
+      const CompositorPlatform& platform, wl_output* outputFilter, std::unordered_map<std::string, ToplevelInfo>& out
+  ) {
     std::unordered_set<std::uintptr_t> seenWlrHandles;
     std::unordered_set<std::uintptr_t> seenExtHandles;
 
-    for (const auto& appId : platform.runningAppIds()) {
+    for (const auto& appId : platform.runningAppIds(outputFilter)) {
       const std::string lower = StringUtils::toLower(appId);
-      for (const auto& info : platform.enrichedWindowsForApp(lower, lower)) {
+      for (const auto& info : platform.enrichedWindowsForApp(lower, lower, outputFilter)) {
         const std::uintptr_t wlrHandle = wlrHandleForToplevel(info);
         const std::uintptr_t extHandle = extHandleForToplevel(info);
         if (wlrHandle != 0 && seenWlrHandles.contains(wlrHandle)) {
@@ -347,7 +348,7 @@ namespace {
     }
 
     std::unordered_map<std::string, ToplevelInfo> liveToplevelById;
-    indexLiveToplevelsByWindowId(platform, liveToplevelById);
+    indexLiveToplevelsByWindowId(platform, nullptr, liveToplevelById);
     for (const auto& live : liveToplevelById) {
       keys.insert(live.first);
     }
@@ -356,12 +357,12 @@ namespace {
 
   void buildWindowEntries(
       const CompositorPlatform& platform, const WaylandConnection& wayland, IconResolver& iconResolver, int iconSize,
-      std::vector<WindowSwitcherEntry>& out, const std::optional<std::string>& focusedId,
+      wl_output* outputFilter, std::vector<WindowSwitcherEntry>& out, const std::optional<std::string>& focusedId,
       const std::deque<std::string>* mruKeys
   ) {
     std::unordered_map<std::string, WorkspaceWindowAssignment> assignmentById;
     assignmentById.reserve(32);
-    for (const auto& assignment : platform.workspaceWindowAssignments()) {
+    for (const auto& assignment : platform.workspaceWindowAssignments(outputFilter)) {
       if (assignment.windowId.empty()) {
         continue;
       }
@@ -373,7 +374,7 @@ namespace {
     }
 
     std::unordered_map<std::string, ToplevelInfo> liveToplevelById;
-    indexLiveToplevelsByWindowId(platform, liveToplevelById);
+    indexLiveToplevelsByWindowId(platform, outputFilter, liveToplevelById);
 
     std::unordered_set<std::string> seenKeys;
     std::vector<WindowSwitcherCandidate> candidates;
@@ -626,9 +627,9 @@ void WindowSwitcher::show(wl_output* output) {
   if (!wasActive) {
     recordFocusedWindow();
   }
+  m_output = output;
   refreshWindows();
 
-  m_output = output;
   if (wasActive) {
     cycleSelection(1);
   } else {
@@ -684,9 +685,10 @@ void WindowSwitcher::refreshWindows() {
   }
 
   const int iconSize = static_cast<int>(std::round((Style::controlHeightLg + Style::spaceLg) * shellUiScale(m_config)));
+  const bool allOutputs = m_config == nullptr || m_config->config().shell.windowSwitcher.showAllOutputs;
   buildWindowEntries(
-      *m_platform, *m_wayland, m_iconResolver, iconSize, m_windows, m_platform->focusedCompositorWindowId(),
-      mruEnabled() ? &m_mruKeys : nullptr
+      *m_platform, *m_wayland, m_iconResolver, iconSize, allOutputs ? nullptr : m_output, m_windows,
+      m_platform->focusedCompositorWindowId(), mruEnabled() ? &m_mruKeys : nullptr
   );
 
   for (auto& entry : m_windows) {

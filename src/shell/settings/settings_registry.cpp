@@ -2029,6 +2029,12 @@ namespace settings {
         "window switcher alt tab application app icon"
     ));
     entries.push_back(makeEntry(
+        SettingsSection::Shell, "window-switcher", tr("settings.schema.shell.window-switcher-show-all-outputs.label"),
+        tr("settings.schema.shell.window-switcher-show-all-outputs.description"),
+        {"shell", "window_switcher", "show_all_outputs"}, ToggleSetting{cfg.shell.windowSwitcher.showAllOutputs},
+        "window switcher alt tab monitor display output screen all current"
+    ));
+    entries.push_back(makeEntry(
         SettingsSection::Osd, "osd", tr("settings.schema.shell.osd-enabled.label"),
         tr("settings.schema.shell.osd-enabled.description"), {"osd", "enabled"}, ToggleSetting{cfg.osd.enabled},
         "hud overlay master enable disable all"

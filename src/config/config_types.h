@@ -1115,6 +1115,7 @@ struct ShellConfig {
     bool showCaption = true;
     bool showCount = true;
     bool showAppIcon = true;
+    bool showAllOutputs = true;
 
     bool operator==(const WindowSwitcherConfig&) const = default;
   };

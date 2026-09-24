@@ -3290,6 +3290,10 @@
           "description": "Choose the freestanding depth carousel or the boxed compact strip",
           "label": "Switcher Style"
         },
+        "window-switcher-show-all-outputs": {
+          "description": "List windows from every monitor; turn off to list only windows on the monitor showing the switcher",
+          "label": "Show All Monitors"
+        },
         "window-switcher-show-app-icon": {
           "description": "Show each application's icon over its window preview",
           "label": "Show Application Icon"
