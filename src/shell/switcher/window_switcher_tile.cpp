@@ -64,6 +64,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
       ui::image({
           .out = &m_thumbnail,
           .fit = ImageFit::Contain,
+          .radius = Style::scaledRadiusLg(m_contentScale),
           .visible = false,
           .participatesInLayout = false,
       })
@@ -72,6 +73,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
       ui::box({
           .out = &m_toneOverlay,
           .fill = clearColorSpec(),
+          .radius = Style::scaledRadiusLg(m_contentScale),
           .participatesInLayout = false,
       })
   );
@@ -96,11 +98,11 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
           .out = &m_close,
           .glyph = "close",
           .glyphSize = Style::fontSizeCaption * m_contentScale,
-          .controlHeight = Style::controlHeightSm * m_contentScale,
-          .variant = ButtonVariant::Default,
+          .controlHeight = (Style::controlHeightSm - Style::spaceSm) * m_contentScale,
+          .variant = ButtonVariant::Destructive,
           .padding = 0.0F,
-          .width = Style::controlHeightSm * m_contentScale,
-          .height = Style::controlHeightSm * m_contentScale,
+          .width = (Style::controlHeightSm - Style::spaceSm) * m_contentScale,
+          .height = (Style::controlHeightSm - Style::spaceSm) * m_contentScale,
           .participatesInLayout = false,
           .onClick = [this]() {
             if (m_onClose) {
@@ -108,6 +110,15 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
             }
           },
       })
+  );
+  const float closeHitSlop = Style::spaceXs * m_contentScale;
+  m_close->inputArea()->setHitTestOutset(
+      HitTestOutset{
+          .left = closeHitSlop,
+          .top = closeHitSlop,
+          .right = closeHitSlop,
+          .bottom = closeHitSlop,
+      }
   );
   m_close->setOnEnter([this]() { setPointerHovered(true); });
   m_close->setOnLeave([this]() { setPointerHovered(false); });
@@ -306,7 +317,7 @@ void WindowSwitcherTile::applyVisualState() {
   if (m_shadow != nullptr) {
     m_shadow->setVisible(m_selected && m_shadowConfigured);
   }
-  const bool showClose = m_selected || m_pointerHovered;
+  const bool showClose = m_pointerHovered;
   m_close->setVisible(showClose);
   m_close->setEnabled(showClose);
 }
@@ -367,8 +378,9 @@ void WindowSwitcherTile::layoutContent(Renderer& renderer) {
       std::round(iconY + (iconSize - m_fallbackGlyph->height()) * 0.5F)
   );
 
-  const float closeSize = Style::controlHeightSm * m_contentScale;
-  m_close->setPosition(std::round(innerW - closeSize - overlayInset), std::round(overlayInset));
+  const float closeSize = (Style::controlHeightSm - Style::spaceSm) * m_contentScale;
+  const float closeInset = Style::spaceXs * m_contentScale;
+  m_close->setPosition(std::round(innerW - closeSize - closeInset), std::round(closeInset));
   m_close->setSize(closeSize, closeSize);
 
   if (m_captionBadge != nullptr && m_captionVisible && m_showCaption) {
