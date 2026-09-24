@@ -23,6 +23,9 @@ namespace {
 
 WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* asyncTextures)
     : m_contentScale(contentScale), m_asyncTextures(asyncTextures) {
+  const float cardRadius = Style::scaledRadiusXl(m_contentScale);
+  const float previewRadius = std::max(0.0F, cardRadius - Style::spaceXs * m_contentScale);
+
   setAcceptedButtons(InputArea::buttonMask(BTN_LEFT));
   setCursorShape(WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER);
   setOnClick([this](const InputArea::PointerData&) {
@@ -46,7 +49,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
       ui::box({
           .out = &m_frame,
           .fill = colorSpecFromRole(ColorRole::Surface),
-          .radius = Style::scaledRadiusXl(m_contentScale),
+          .radius = cardRadius,
           .participatesInLayout = false,
           .configure = [](Box& box) { box.setClipChildren(true); },
       })
@@ -55,7 +58,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
       ui::box({
           .out = &m_previewHost,
           .fill = colorSpecFromRole(ColorRole::SurfaceVariant),
-          .radius = Style::scaledRadiusLg(m_contentScale),
+          .radius = previewRadius,
           .participatesInLayout = false,
           .configure = [](Box& box) { box.setClipChildren(true); },
       })
@@ -64,7 +67,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
       ui::image({
           .out = &m_thumbnail,
           .fit = ImageFit::Contain,
-          .radius = Style::scaledRadiusLg(m_contentScale),
+          .radius = previewRadius,
           .visible = false,
           .participatesInLayout = false,
       })
@@ -73,7 +76,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
       ui::box({
           .out = &m_toneOverlay,
           .fill = clearColorSpec(),
-          .radius = Style::scaledRadiusLg(m_contentScale),
+          .radius = previewRadius,
           .participatesInLayout = false,
       })
   );
@@ -128,7 +131,7 @@ WindowSwitcherTile::WindowSwitcherTile(float contentScale, AsyncTextureCache* as
       .fill = colorSpecFromRole(ColorRole::Surface),
       .border = scaleAlpha(colorSpecFromRole(ColorRole::Outline), Style::disabledOutlineAlpha),
       .borderWidth = Style::borderWidth,
-      .radius = Style::scaledRadiusLg(m_contentScale),
+      .radius = cardRadius,
       .visible = false,
       .participatesInLayout = false,
   });
