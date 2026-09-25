@@ -1436,6 +1436,7 @@ bool CalendarService::parseCache(std::span<const std::uint8_t> contents) {
       event.colorHex = item.value("color", std::string{});
       event.location = item.value("location", std::string{});
       event.url = calendar::resolveEventLink(event.location, {}, item.value("url", std::string{}));
+      event.webUrl = calendar::resolveEventLink({}, {}, item.value("web_url", std::string{}));
       event.start = fromUnix(item.value("start", std::int64_t{0}));
       event.end = fromUnix(item.value("end", std::int64_t{0}));
       event.allDay = item.value("all_day", false);
@@ -1476,6 +1477,7 @@ void CalendarService::saveCache() {
           {"color", event.colorHex},
           {"location", event.location},
           {"url", event.url},
+          {"web_url", event.webUrl},
           {"start", toUnix(event.start)},
           {"end", toUnix(event.end)},
           {"all_day", event.allDay},

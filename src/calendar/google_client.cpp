@@ -118,6 +118,7 @@ namespace calendar {
         if (event.url.empty()) {
           event.url = resolveEventLink({}, item.value("description", std::string{}), {});
         }
+        event.webUrl = resolveEventLink({}, {}, item.value("htmlLink", std::string{}));
         event.calendarName = meta.name;
         const std::string colorId = item.value("colorId", std::string{});
         if (!colorId.empty()) {
