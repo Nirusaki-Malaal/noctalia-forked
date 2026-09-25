@@ -31,6 +31,7 @@
 <!-- Mark what applies to this PR. -->
 
 - [ ] Tested on Niri
+- [ ] Tested on Umbriel
 - [ ] Tested on Hyprland
 - [ ] Tested on Sway
 - [ ] Tested on another compositor:

@@ -58,7 +58,8 @@ private:
     Unknown,
     // TODO: Remove LegacyId after Noctalia drops support for Hyprland v0.56.2 and older.
     LegacyId,
-    StableIdentity,
+    TypedIdentity,
+    NormalIdentity,
   };
 
   enum class WorkspaceKind {
@@ -120,6 +121,7 @@ private:
   [[nodiscard]] static std::optional<IpcSchema> detectIpcSchema(const nlohmann::json& workspaces);
   [[nodiscard]] static std::optional<WorkspaceIdentity>
   parseJsonWorkspaceIdentity(const nlohmann::json& json, IpcSchema schema);
+  [[nodiscard]] static bool isAddressIdentitySchema(IpcSchema schema) noexcept;
   [[nodiscard]] std::optional<WorkspaceIdentity>
   parseEventWorkspaceIdentity(std::string_view selector, std::string_view displayName = {}) const;
   [[nodiscard]] static std::optional<std::uint64_t> parseHexAddress(std::string_view value);

@@ -39,7 +39,7 @@
       "color-white": "White",
       "color-yellow": "Yellow",
       "copy": "Copy the annotated image (Ctrl+C)",
-      "cursor": "Show captured pointer (P)",
+      "cursor": "Show the pointer captured with the screen (p)",
       "cursor-capture-failed": "Pointer toggle unavailable: the compositor could not provide a separate cursor image",
       "cursor-live": "Freeze the screen first to change the captured pointer (F)",
       "cursor-not-captured": "Pointer toggle unavailable: this compositor does not support separate cursor capture",
@@ -748,6 +748,7 @@
       "unpin-from-dock": "Unpin from Dock"
     },
     "empty": {
+      "loading": "Loading results...",
       "no-results": "No results found",
       "type-to-search": "Type to search…"
     },
@@ -771,6 +772,20 @@
       },
       "emoji": {
         "title": "Emoji"
+      },
+      "panel": {
+        "builtin": {
+          "clipboard": "Clipboard",
+          "control-center": "Control Center",
+          "launcher": "Launcher",
+          "polkit": "Authentication Prompt",
+          "session": "Session",
+          "setup-wizard": "Setup Wizard",
+          "test": "Test Panel",
+          "tray-drawer": "Tray Drawer",
+          "wallpaper": "Wallpaper"
+        },
+        "title": "Panels"
       },
       "session": {
         "action-subtitle": "Run session action",
@@ -831,6 +846,8 @@
       "calendar": "Calendar",
       "calendar-credential-locked-body": "Unlock the keyring used by Secret Service, then retry in Settings. With GNOME Keyring, make an automatically unlocked keyring such as Login the default.",
       "calendar-credential-locked-title": "Calendar keyring is locked",
+      "calendar-digest-more": "+{count} more",
+      "calendar-digest-title": "All-day today",
       "calendar-google-connect-browser-failed": "No browser opener could be launched for Google authorization. Check your default browser or xdg-open setup.",
       "calendar-google-connect-credential-store-failed": "Authorization completed, but the refresh token could not be saved. Unlock or start Secret Service, then connect again.",
       "calendar-google-connect-expired": "Google authorization expired before sign-in finished. Start the connection again.",
@@ -841,6 +858,13 @@
       "calendar-google-connect-start-failed": "Could not start Google authorization. Check your network connection and try again.",
       "calendar-google-connect-start-http": "Could not start Google authorization. The OAuth broker returned HTTP {status}.",
       "calendar-google-connect-timeout": "Google authorization timed out. Start the connection again when you are ready to sign in.",
+      "calendar-reminder-catchup-body": "{count} more events are starting soon.",
+      "calendar-reminder-catchup-title": "More upcoming events",
+      "calendar-reminder-in": "Starts in {minutes} min · {time}",
+      "calendar-reminder-now": "Starts now · {time}",
+      "calendar-reminder-open": "Open",
+      "calendar-reminder-untitled": "Untitled event",
+      "calendar-reminder-with-location": "{when}\n{location}",
       "config-migration-body": "Update {path} in the source file. Noctalia is applying this replacement only temporarily. Run noctalia config validate to list every required change.",
       "config-migration-title": "Configuration update needed",
       "dbus-disabled": "DBus notifications disabled",
@@ -1069,13 +1093,16 @@
       },
       "monitor-override": {
         "create": "Create",
+        "custom": "Custom",
         "delete": "Delete",
         "delete-confirm-desc": "This GUI-created monitor override will be removed from settings.toml.",
         "delete-confirm-title": "Delete \"{name}\"?",
+        "exists": "An override for this monitor already exists.",
         "label": "Monitor: {name}",
         "management": "Monitor Override",
         "match-placeholder": "Monitor match",
         "new": "Monitor Override",
+        "new-title": "New Monitor Override",
         "rename": "Rename",
         "rename-save": "Save"
       },
@@ -1280,7 +1307,8 @@
         "borders": "Borders",
         "brightness": "Brightness",
         "built-in": "Built-In",
-        "calendar": "Calendar",
+        "calendar-accounts": "Accounts",
+        "calendar-reminders": "Reminders",
         "capsules": "Capsules",
         "clipboard": "Clipboard",
         "community": "Community",
@@ -1328,6 +1356,7 @@
         "providers": "Providers",
         "screen-corners": "Screen Corners",
         "screen-time": "Screen Time",
+        "screenshot": "Screenshot",
         "screenshot-annotation": "Annotation",
         "screenshot-capture": "Capture",
         "screenshot-output": "Output",
@@ -1350,6 +1379,7 @@
         "appearance": "Appearance",
         "backdrop": "Backdrop",
         "bar": "Bar",
+        "calendar": "Calendar",
         "control-center": "Control Center",
         "desktop": "Desktop",
         "dock": "Dock",
@@ -1370,6 +1400,7 @@
         "shell": "Shell",
         "system": "System",
         "templates": "Templates",
+        "umbriel": "Umbriel",
         "wallpaper": "Wallpaper"
       }
     },
@@ -1465,6 +1496,16 @@
         "overlay": "Overlay",
         "top": "Top"
       },
+      "lockscreen": {
+        "transition": {
+          "disc": "Disc",
+          "fade": "Fade",
+          "honeycomb": "Honeycomb",
+          "stripes": "Stripes",
+          "wipe": "Wipe",
+          "zoom": "Zoom"
+        }
+      },
       "notification-urgency": {
         "critical": "Critical",
         "low": "Low",
@@ -1508,6 +1549,10 @@
           "glass": "Glass",
           "soft": "Soft",
           "solid": "Solid"
+        },
+        "window-switcher-style": {
+          "carousel": "Carousel",
+          "compact": "Compact"
         },
         "password-style": {
           "filled-circles": "Filled Circles",
@@ -1605,6 +1650,8 @@
         "incompatible-plugin-api": "incompatible plugin API",
         "remove": "Remove plugin",
         "requires": "Requires: {dependencies}",
+        "search-empty": "No plugins match \"{query}\".",
+        "search-placeholder": "Search installed plugins",
         "title": "Plugins",
         "update-all": "Update all ({count})",
         "update-available": "update available",
@@ -2287,6 +2334,10 @@
           "description": "Use a snapshot of the desktop as the lock screen background",
           "label": "Desktop Capture"
         },
+        "edge-smoothness": {
+          "description": "Feathering of the lock screen transition edges",
+          "label": "Transition Edge Smoothness"
+        },
         "enabled": {
           "description": "Enable session lock, logind integration, and lock actions",
           "label": "Lock Screen"
@@ -2306,6 +2357,14 @@
         "tint-intensity": {
           "description": "Surface-color tint over the lock screen background",
           "label": "Tint Intensity"
+        },
+        "transition-duration": {
+          "description": "Length of the lock and unlock animations in milliseconds",
+          "label": "Transition Duration"
+        },
+        "transitions": {
+          "description": "Effects available when locking and unlocking (one is picked at random)",
+          "label": "Transition Effects"
         },
         "wallpaper": {
           "description": "Custom image for the lock screen background; leave empty to use the desktop wallpaper",
@@ -2476,6 +2535,10 @@
           "description": "Also show emoji results in unprefixed search",
           "label": "Emoji in Global Search"
         },
+        "launcher-global-panels": {
+          "description": "Also show panels in unprefixed search",
+          "label": "Panels in Global Search"
+        },
         "launcher-global-session": {
           "description": "Also show session actions in unprefixed search",
           "label": "Session in Global Search"
@@ -2487,6 +2550,10 @@
         "launcher-global-windows": {
           "description": "Also show open windows in unprefixed search",
           "label": "Windows in Global Search"
+        },
+        "launcher-ignored-panels": {
+          "description": "Panels the panel provider never lists (e.g. authentication prompts, the setup wizard)",
+          "label": "Panels Ignored"
         },
         "launcher-pinned-apps": {
           "description": "Desktop entry IDs of apps pinned to the launcher; they appear first when the launcher opens",
@@ -2503,6 +2570,10 @@
         "launcher-prefix-emoji": {
           "description": "Trigger prefix for emoji search",
           "label": "Emoji Prefix"
+        },
+        "launcher-prefix-panels": {
+          "description": "Trigger prefix for panel search",
+          "label": "Panels Prefix"
         },
         "launcher-prefix-session": {
           "description": "Trigger prefix for session power actions",
@@ -2659,6 +2730,10 @@
           "description-unavailable": "No Secret Service provider is available in this session",
           "label": "Calendar Credential Storage"
         },
+        "calendar-digest-time": {
+          "description": "Time of day for a single notification listing all-day events. Leave empty to disable.",
+          "label": "All-Day Digest Time"
+        },
         "calendar-edit": {
           "button": "Edit",
           "button-reconnect": "Reconnect",
@@ -2678,6 +2753,18 @@
         "calendar-refresh-interval": {
           "description": "How often to sync calendar events (minutes)",
           "label": "Refresh Interval"
+        },
+        "calendar-reminder-lead": {
+          "description": "How far ahead to notify for events that set no reminder of their own.",
+          "label": "Default Reminder Lead"
+        },
+        "calendar-reminder-use-event": {
+          "description": "Honor the reminder set on each event. When off, every event uses the default lead time.",
+          "label": "Use Event Reminders"
+        },
+        "calendar-reminders": {
+          "description": "Notify before an event starts.",
+          "label": "Calendar Reminders"
         },
         "calendar-storage": {
           "button": "Retry",
@@ -2754,6 +2841,11 @@
         "shell-sounds": {
           "description": "Play sound effects for shell events",
           "label": "Shell Sounds"
+        },
+        "sound-theme": {
+          "default": "Default",
+          "description": "Sound theme used for shell sound effects",
+          "label": "Sound Theme"
         },
         "sound-volume": {
           "description": "Volume for shell sound effects",
@@ -3108,57 +3200,65 @@
           "label": "Reset Screen Time Data"
         },
         "screenshot-annotate": {
-          "description": "Open screenshots in the annotation editor before applying the output actions",
-          "label": "Edit Before Saving or Copying"
+          "description": "Open the annotation editor on every screenshot; Done applies the save, clipboard, and pipe settings",
+          "label": "Annotate Before Delivering"
         },
         "screenshot-close-on-copy": {
           "description": "Close after a successful copy from the editor, including when opened directly",
           "label": "Close Editor After Copying"
         },
+        "screenshot-close-on-save": {
+          "description": "Close after a successful save from the editor, including when opened directly",
+          "label": "Close Editor After Saving"
+        },
         "screenshot-confirm-region": {
-          "description": "Wait for Enter or Space after selecting a region",
-          "label": "Confirm Region Selection"
+          "description": "After drawing a region, keep the overlay open until you confirm with Enter or Space",
+          "label": "Confirm Region"
         },
         "screenshot-copy-to-clipboard": {
-          "description": "Copy the screenshot as a PNG image, ready to paste into another app",
+          "description": "Place the captured PNG on the clipboard selection",
           "label": "Copy to Clipboard"
         },
         "screenshot-directory": {
-          "description": "Folder for saved PNG files, including the editor's Save action; leave empty to use the standard Pictures folder",
-          "label": "Save Folder",
+          "description": "Folder for saved PNG files; leave empty to use the standard XDG Pictures directory",
+          "label": "Output Directory",
           "placeholder": "XDG Pictures directory"
         },
         "screenshot-filename-pattern": {
-          "description": "Filename format for all saved screenshots, including the editor's Save action; uses strftime tokens without the .png extension",
+          "description": "strftime pattern without extension (.png is added); use %s for unix epoch",
           "label": "Filename Pattern"
         },
         "screenshot-freeze-screen": {
-          "description": "Keep the desktop still while choosing a region",
-          "label": "Freeze During Region Selection"
+          "description": "Capture the desktop before region selection so moving content stays still",
+          "label": "Freeze Screen"
         },
         "screenshot-output": {
           "description": "Actions applied after capture, or when you choose Done in the annotation editor."
         },
         "screenshot-pipe-command": {
-          "description": "Shell command that receives the PNG image on standard input, for example an external editor or uploader",
-          "label": "Command",
+          "description": "Command run as /bin/sh -lc with the PNG on stdin; for annotators or uploaders (for example: swappy -f - or satty -f -)",
+          "label": "Pipe Command",
           "placeholder": "swappy -f -"
         },
         "screenshot-pipe-to-command": {
-          "description": "Run a shell command with the PNG image on standard input",
-          "label": "Run Command"
+          "description": "Send the captured PNG to a shell command on stdin",
+          "label": "Pipe to Command"
         },
         "screenshot-remember-last-region": {
-          "description": "Pre-select the previous region on the next capture, including after cancelling",
+          "description": "Pre-select the last region (including after cancel) on the next region screenshot",
           "label": "Remember Last Region"
         },
         "screenshot-save-to-file": {
-          "description": "Save the screenshot as a PNG file in the save folder",
+          "description": "Write screenshots as PNG files to the output directory",
           "label": "Save to File"
         },
         "screenshot-show-cursor": {
-          "description": "Show the mouse pointer initially; change it per capture when the compositor supports separate cursor capture",
-          "label": "Include Mouse Pointer"
+          "description": "Include the mouse pointer in screenshots",
+          "label": "Show Cursor"
+        },
+        "screenshot-skip-annotate-on-copy-save": {
+          "description": "Copy and Save in the region overlay deliver immediately; Enter and Space still open the editor",
+          "label": "Skip Editor on Copy or Save"
         },
         "settings-window-translucent": {
           "description": "Make the Settings background translucent for compositor effects",
@@ -3181,9 +3281,33 @@
           "description": "Default time format for shell UI without its own setting",
           "label": "Time Format"
         },
+        "umbriel-overview-type-to-launch": {
+          "description": "Open the launcher when typing in umbriel overview; uses a tiny keyboard-focus surface while overview is open",
+          "label": "Type to Launch"
+        },
         "window-switcher-mru": {
           "description": "Order windows in the switcher by most recently used rather than workspace and screen layout",
           "label": "Most Recently Used Order"
+        },
+        "window-switcher-style": {
+          "description": "Choose the freestanding depth carousel or the boxed compact strip",
+          "label": "Switcher Style"
+        },
+        "window-switcher-show-all-outputs": {
+          "description": "List windows from every monitor; turn off to list only windows on the monitor showing the switcher",
+          "label": "Show All Monitors"
+        },
+        "window-switcher-show-app-icon": {
+          "description": "Show each application's icon over its window preview",
+          "label": "Show Application Icon"
+        },
+        "window-switcher-show-caption": {
+          "description": "Show window titles and application names below their previews",
+          "label": "Show Caption"
+        },
+        "window-switcher-show-count": {
+          "description": "Show the current position and total window count above the previews",
+          "label": "Show Window Count"
         }
       },
       "system": {
@@ -4008,6 +4132,10 @@
           "description": "Tint the custom image with the widget Icon Color setting",
           "label": "Colorize Custom Image"
         },
+        "custom-label": {
+          "description": "Custom text shown beside the glyph or custom image; remains visible when Show Glyph is disabled",
+          "label": "Custom Label"
+        },
         "detached-panel": {
           "description": "Open the drawer as a floating panel instead of anchoring it to the bar edge",
           "label": "Detached Panel"
@@ -4082,7 +4210,7 @@
           "volume-description": "Custom icon glyph; leave empty to use the built-in dynamic icons"
         },
         "glyph-position": {
-          "description": "In which order to display the glyph in relation to the text/graph/gauge",
+          "description": "Place the glyph or custom image and custom label relative to the value or visualization",
           "label": "Glyph Position"
         },
         "group-by-workspace": {
@@ -4538,6 +4666,7 @@
       "no-results-hint": "Try a different setting name or config key.",
       "offline-mode-notice": {
         "appearance": "Community palette downloads will not work.",
+        "calendar": "Calendar account sync will not work.",
         "calendar-account": "Calendar discovery and sync will not work.",
         "disable-hint": "Disable Offline Mode in the Security section.",
         "launcher": "Currency exchange rate fetching will not work.",
@@ -4545,7 +4674,6 @@
         "plugin-store": "Remote plugin catalog and download requests will not work.",
         "plugins": "Plugin HTTP requests will not work. Git sources can still update.",
         "security": "External IP lookup and telemetry will not work.",
-        "services": "Calendar account sync will not work.",
         "template-store": "Community template downloads will not work.",
         "templates": "Community template downloads and updates will not work.",
         "title": "Offline Mode"
@@ -4739,6 +4867,8 @@
     }
   },
   "window-switcher": {
+    "count": "{count} window",
+    "count-plural": "{count} windows",
     "empty": "No open windows",
     "hint": "Tab · Shift+Tab · Arrow keys · Release Alt to switch · Esc to cancel",
     "title": "Windows"

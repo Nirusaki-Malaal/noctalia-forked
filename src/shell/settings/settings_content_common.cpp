@@ -315,9 +315,10 @@ namespace settings {
     case SettingsSection::Templates:
     case SettingsSection::Launcher:
     case SettingsSection::Security:
-    case SettingsSection::Services:
     case SettingsSection::Location:
+    case SettingsSection::Calendar:
       return true;
+    case SettingsSection::Services:
     case SettingsSection::Wallpaper:
     case SettingsSection::Desktop:
     case SettingsSection::Dock:
@@ -332,6 +333,7 @@ namespace settings {
     case SettingsSection::Power:
     case SettingsSection::Hooks:
     case SettingsSection::Niri:
+    case SettingsSection::Umbriel:
     case SettingsSection::Bar:
     case SettingsSection::Plugins:
       return false;
@@ -349,10 +351,11 @@ namespace settings {
       return i18n::tr("settings.window.offline-mode-notice.launcher");
     case SettingsSection::Security:
       return i18n::tr("settings.window.offline-mode-notice.security");
-    case SettingsSection::Services:
-      return i18n::tr("settings.window.offline-mode-notice.services");
+    case SettingsSection::Calendar:
+      return i18n::tr("settings.window.offline-mode-notice.calendar");
     case SettingsSection::Location:
       return i18n::tr("settings.window.offline-mode-notice.location");
+    case SettingsSection::Services:
     case SettingsSection::Wallpaper:
     case SettingsSection::Desktop:
     case SettingsSection::Dock:
@@ -367,6 +370,7 @@ namespace settings {
     case SettingsSection::Power:
     case SettingsSection::Hooks:
     case SettingsSection::Niri:
+    case SettingsSection::Umbriel:
     case SettingsSection::Bar:
     case SettingsSection::Plugins:
       return {};

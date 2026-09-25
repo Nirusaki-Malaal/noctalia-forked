@@ -372,16 +372,16 @@ HyprlandWorkspaceBackend::WorkspaceRefreshResult HyprlandWorkspaceBackend::refre
       const std::string workspaceAddress = namedWorkspace ? workspaceString.substr(5) : std::string{};
       const auto legacyNumber =
           schema == IpcSchema::LegacyId && !namedWorkspace ? parseInt(workspaceString) : std::optional<int>{};
-      const auto stableNumber = schema == IpcSchema::StableIdentity && !namedWorkspace ? parseUnsigned(workspaceString)
-                                                                                       : std::optional<std::uint32_t>{};
-      const bool numberedWorkspace = legacyNumber.has_value() ? *legacyNumber > 0 : stableNumber.has_value();
+      const auto addressNumber = isAddressIdentitySchema(schema) && !namedWorkspace ? parseUnsigned(workspaceString)
+                                                                                    : std::optional<std::uint32_t>{};
+      const bool numberedWorkspace = legacyNumber.has_value() ? *legacyNumber > 0 : addressNumber.has_value();
       if ((namedWorkspace && workspaceAddress.empty()) || (!namedWorkspace && !numberedWorkspace)) {
         continue;
       }
 
       WorkspaceIdentity identity;
       if (numberedWorkspace) {
-        const auto number = schema == IpcSchema::LegacyId ? static_cast<std::uint32_t>(*legacyNumber) : *stableNumber;
+        const auto number = schema == IpcSchema::LegacyId ? static_cast<std::uint32_t>(*legacyNumber) : *addressNumber;
         identity.key = std::to_string(number);
         identity.selector = identity.key;
         identity.address = identity.key;
@@ -419,7 +419,7 @@ HyprlandWorkspaceBackend::WorkspaceRefreshResult HyprlandWorkspaceBackend::refre
       WorkspaceState workspace;
       workspace.identity = std::move(identity);
       workspace.name = namedWorkspace
-          ? (schema == IpcSchema::StableIdentity && !defaultName.empty() ? defaultName : workspaceAddress)
+          ? (isAddressIdentitySchema(schema) && !defaultName.empty() ? defaultName : workspaceAddress)
           : defaultName;
       workspace.monitor = item.value("monitor", "");
 
@@ -824,7 +824,7 @@ void HyprlandWorkspaceBackend::handleEvent(std::string_view event, std::string_v
     if (!address.has_value() || workspaceName.empty()) {
       return;
     }
-    if (m_ipcSchema == IpcSchema::StableIdentity) {
+    if (isAddressIdentitySchema(m_ipcSchema)) {
       refreshClients();
       recomputeWorkspaceFlags();
       notifyChanged();
@@ -960,38 +960,20 @@ HyprlandWorkspaceBackend::detectIpcSchema(const nlohmann::json& workspaces) {
     return std::nullopt;
   }
 
-  std::optional<IpcSchema> schema;
-  for (const auto& workspace : workspaces) {
-    if (!workspace.is_object()) {
+  std::optional<IpcSchema> detected;
+  for (const auto candidate : {IpcSchema::LegacyId, IpcSchema::TypedIdentity, IpcSchema::NormalIdentity}) {
+    const bool matches = std::ranges::all_of(workspaces, [candidate](const nlohmann::json& workspace) {
+      return parseJsonWorkspaceIdentity(workspace, candidate).has_value();
+    });
+    if (!matches) {
+      continue;
+    }
+    if (detected.has_value()) {
       return std::nullopt;
     }
-
-    const auto idIt = workspace.find("id");
-    const auto addressIt = workspace.find("address");
-    const auto typeIt = workspace.find("type");
-    const bool legacy = idIt != workspace.end()
-        && idIt->is_number_integer()
-        && addressIt == workspace.end()
-        && typeIt == workspace.end();
-    const bool stable = idIt == workspace.end()
-        && addressIt != workspace.end()
-        && addressIt->is_string()
-        && typeIt != workspace.end()
-        && typeIt->is_string();
-    if (legacy == stable) {
-      return std::nullopt;
-    }
-
-    const IpcSchema itemSchema = legacy ? IpcSchema::LegacyId : IpcSchema::StableIdentity;
-    if (schema.has_value() && *schema != itemSchema) {
-      return std::nullopt;
-    }
-    if (!parseJsonWorkspaceIdentity(workspace, itemSchema).has_value()) {
-      return std::nullopt;
-    }
-    schema = itemSchema;
+    detected = candidate;
   }
-  return schema;
+  return detected;
 }
 
 std::optional<HyprlandWorkspaceBackend::WorkspaceIdentity>
@@ -1032,17 +1014,13 @@ HyprlandWorkspaceBackend::parseJsonWorkspaceIdentity(const nlohmann::json& json,
     return identity;
   }
 
-  if (schema != IpcSchema::StableIdentity) {
+  if (!isAddressIdentitySchema(schema)) {
     return std::nullopt;
   }
 
   const auto addressIt = json.find("address");
   const auto typeIt = json.find("type");
-  if (json.contains("id")
-      || addressIt == json.end()
-      || !addressIt->is_string()
-      || typeIt == json.end()
-      || !typeIt->is_string()) {
+  if (addressIt == json.end() || !addressIt->is_string() || typeIt == json.end() || !typeIt->is_string()) {
     return std::nullopt;
   }
   identity.address = addressIt->get<std::string>();
@@ -1051,7 +1029,10 @@ HyprlandWorkspaceBackend::parseJsonWorkspaceIdentity(const nlohmann::json& json,
     return std::nullopt;
   }
 
-  if (type == "numbered") {
+  if (schema == IpcSchema::TypedIdentity && type == "numbered") {
+    if (json.contains("id")) {
+      return std::nullopt;
+    }
     identity.number = parseUnsigned(identity.address);
     if (!identity.number.has_value()) {
       return std::nullopt;
@@ -1059,18 +1040,58 @@ HyprlandWorkspaceBackend::parseJsonWorkspaceIdentity(const nlohmann::json& json,
     identity.kind = WorkspaceKind::Numbered;
     identity.key = identity.address;
     identity.selector = identity.address;
-  } else if (type == "named") {
+  } else if (schema == IpcSchema::TypedIdentity && type == "named") {
+    if (json.contains("id")) {
+      return std::nullopt;
+    }
     identity.kind = WorkspaceKind::Named;
     identity.key = "name:" + identity.address;
     identity.selector = identity.key;
   } else if (type == "special") {
+    if (json.contains("id")) {
+      return std::nullopt;
+    }
     identity.kind = WorkspaceKind::Special;
+    identity.key = identity.address;
+    identity.selector = identity.address;
+  } else if (schema == IpcSchema::NormalIdentity && type == "normal") {
+    const auto idIt = json.find("id");
+    if (idIt == json.end()) {
+      identity.kind = WorkspaceKind::Named;
+      identity.key = "name:" + identity.address;
+      identity.selector = identity.key;
+      return identity;
+    }
+    const auto id = [&]() -> std::optional<std::uint64_t> {
+      if (idIt->is_number_unsigned()) {
+        return idIt->get<std::uint64_t>();
+      }
+      if (idIt->is_number_integer()) {
+        const auto signedId = idIt->get<std::int64_t>();
+        if (signedId > 0) {
+          return static_cast<std::uint64_t>(signedId);
+        }
+      }
+      return std::nullopt;
+    }();
+    if (!id.has_value()
+        || *id == 0
+        || *id > std::numeric_limits<std::uint32_t>::max()
+        || identity.address != std::to_string(*id)) {
+      return std::nullopt;
+    }
+    identity.number = static_cast<std::uint32_t>(*id);
+    identity.kind = WorkspaceKind::Numbered;
     identity.key = identity.address;
     identity.selector = identity.address;
   } else {
     return std::nullopt;
   }
   return identity;
+}
+
+bool HyprlandWorkspaceBackend::isAddressIdentitySchema(IpcSchema schema) noexcept {
+  return schema == IpcSchema::TypedIdentity || schema == IpcSchema::NormalIdentity;
 }
 
 std::optional<HyprlandWorkspaceBackend::WorkspaceIdentity>
@@ -1213,7 +1234,7 @@ bool HyprlandWorkspaceBackend::isSpecial(const WorkspaceState& state) {
   return state.identity.kind == WorkspaceKind::Special;
 }
 
-// Stable-identity Hyprland traverses named workspaces newest-first, followed by numbered workspaces.
+// Address-identity Hyprland traverses named workspaces newest-first, followed by numbered workspaces.
 bool HyprlandWorkspaceBackend::workspaceOrderLess(const WorkspaceState* a, const WorkspaceState* b) {
   if (a->identity.legacyId.has_value() && b->identity.legacyId.has_value()) {
     return *a->identity.legacyId < *b->identity.legacyId;

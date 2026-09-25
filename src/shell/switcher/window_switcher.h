@@ -1,6 +1,7 @@
 #pragma once
 
 #include "shell/switcher/window_switcher_tile.h"
+#include "system/icon_resolver.h"
 #include "wayland/wayland_seat.h"
 
 #include <cstddef>
@@ -15,13 +16,14 @@ class CompositorPlatform;
 class ConfigService;
 class IpcService;
 class RenderContext;
+class ToplevelThumbnailCapture;
 class WaylandConnection;
 struct wl_output;
 
-// Fullscreen Alt+Tab style window switcher with a centered 5×5 grid.
+// Fullscreen Alt+Tab switcher with selectable preview presentations.
 class WindowSwitcher {
 public:
-  WindowSwitcher() = default;
+  WindowSwitcher();
   ~WindowSwitcher();
 
   void initialize(
@@ -29,6 +31,7 @@ public:
       AsyncTextureCache* asyncTextures
   );
   void registerIpc(IpcService& ipc);
+  void onConfigReload();
   void onOutputChange();
   void onToplevelChange();
   void show(wl_output* output);
@@ -44,18 +47,22 @@ private:
   void refreshWindows();
   void setSelectedIndex(std::size_t index);
   void cycleSelection(int delta);
-  void navigateGrid(int colDelta, int rowDelta);
+  void navigateList(int delta);
   void activateSelected();
   void closeWindowAt(std::size_t index);
   void requestSceneUpdate();
+  void startThumbnailCaptures();
+  void captureNextThumbnail();
+  void cancelThumbnailCaptures();
   [[nodiscard]] bool matchesTrigger(const KeyboardEvent& event) const noexcept;
   [[nodiscard]] bool isModifierRelease(const KeyboardEvent& event) const noexcept;
   void ensureSurface();
   void destroySurface();
   void prepareFrame(Instance& instance, bool needsUpdate, bool needsLayout);
   void buildScene(Instance& instance, std::uint32_t width, std::uint32_t height);
-  void positionGrid(Instance& instance, float screenW, float screenH);
-  void syncGridSelection();
+  void positionPanel(Instance& instance, float screenW, float screenH);
+  void syncSelection(bool animate);
+  void prioritizeSelectedThumbnail();
   [[nodiscard]] bool mruEnabled() const;
   void recordFocusedWindow();
   void promoteMruKey(const std::string& key);
@@ -67,10 +74,16 @@ private:
   AsyncTextureCache* m_asyncTextures = nullptr;
 
   Instance* m_instance = nullptr;
+  IconResolver m_iconResolver;
   std::vector<WindowSwitcherEntry> m_windows;
+  struct ThumbnailRequest {
+    std::string windowKey;
+    std::uintptr_t captureHandle = 0;
+  };
+  std::unique_ptr<ToplevelThumbnailCapture> m_thumbnailCapture;
+  std::deque<ThumbnailRequest> m_thumbnailQueue;
   std::deque<std::string> m_mruKeys;
   std::size_t m_selectedIndex = 0;
-  std::size_t m_gridColumns = 5;
   wl_output* m_output = nullptr;
   bool m_active = false;
 };

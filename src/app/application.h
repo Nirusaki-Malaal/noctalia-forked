@@ -3,6 +3,8 @@
 #include "app/deferred_call_poll_source.h"
 #include "app/timer_poll_source.h"
 #include "calendar/calendar_poll_source.h"
+#include "calendar/calendar_reminder_monitor.h"
+#include "calendar/calendar_reminder_poll_source.h"
 #include "calendar/calendar_service.h"
 #include "capture/screenshot_service.h"
 #include "compositors/compositor_platform.h"
@@ -200,6 +202,13 @@ private:
   // so the first credential lookups report "no provider". Watch the bus name and re-drive the
   // consumers that gave up once an owner appears.
   void installSecretServiceNameWatch();
+  // The provider may be present but its collection still locked at startup (PAM holds the password
+  // but only opens the store on first request; or a fingerprint/autologin session unlocks it a few
+  // seconds later). Watch the collection set and re-drive consumers once the default collection is
+  // actually unlocked, so a lookup that lost the startup race recovers without restarting Noctalia.
+  void installSecretServiceCollectionWatch();
+  void onSecretServiceCollectionChanged();
+  [[nodiscard]] bool defaultSecretCollectionUnlocked();
   void retrySecretServiceConsumers();
   void scheduleNotificationShellRefresh();
   void syncPolkitAgent();
@@ -247,6 +256,7 @@ private:
   LockKeysService m_lockKeysService;
   NotificationManager m_notificationManager;
   CalendarService m_calendarService;
+  CalendarReminderMonitor m_calendarReminderMonitor{m_configService, m_notificationManager};
   std::unique_ptr<SessionBus> m_bus;
   std::unique_ptr<SystemBus> m_systemBus;
   std::unique_ptr<LogindService> m_logindService;
@@ -262,6 +272,7 @@ private:
   IdleInhibitor m_idleInhibitor;
   IdleManager m_idleManager;
   IdleGraceOverlay m_idleGraceOverlay;
+  std::uint64_t m_idleGraceOverlayGeneration = 0;
   HookManager m_hookManager;
   DependencyService m_dependencyService;
   GammaService m_gammaService;
@@ -286,6 +297,7 @@ private:
   bool m_notificationShellRefreshScheduled = false;
   BatteryHookState m_batteryHookState;
   BatteryWarningMonitor m_batteryWarningMonitor;
+  std::optional<bool> m_prevBatteryPluggedForEvents;
   std::optional<bool> m_prevWirelessEnabledForEvents;
   std::optional<bool> m_prevBluetoothPoweredForEvents;
   std::optional<std::string> m_prevPowerProfileActiveForEvents;
@@ -297,6 +309,8 @@ private:
   bool m_notificationBusNameWatchInstalled = false;
   std::unique_ptr<sdbus::IProxy> m_secretServiceNameWatchProxy;
   bool m_secretServiceNameWatchInstalled = false;
+  std::unique_ptr<sdbus::IProxy> m_secretServiceCollectionWatchProxy;
+  bool m_secretServiceCollectionWatchInstalled = false;
   bool m_secretServiceOwned = false;
   bool m_storageKeyAutoRetried = false;
   bool m_calendarCredentialAutoRetried = false;
@@ -378,6 +392,7 @@ private:
   LocationPollSource m_locationPollSource{m_locationService};
   WeatherPollSource m_weatherPollSource{m_weatherService};
   CalendarPollSource m_calendarPollSource{m_calendarService};
+  CalendarReminderPollSource m_calendarReminderPollSource{m_calendarReminderMonitor};
   Timer m_trayInitTimer;
   Timer m_polkitInitTimer;
   Timer m_polkitIdleCloseTimer;
