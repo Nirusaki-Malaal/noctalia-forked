@@ -624,6 +624,7 @@ void WindowSwitcher::show(wl_output* output) {
   }
 
   const bool wasActive = m_active;
+  const bool outputChanged = output != m_output;
   if (!wasActive) {
     recordFocusedWindow();
   }
@@ -643,7 +644,7 @@ void WindowSwitcher::show(wl_output* output) {
     return;
   }
   requestSceneUpdate();
-  if (!wasActive) {
+  if (!wasActive || outputChanged) {
     startThumbnailCaptures();
   }
 }
@@ -728,7 +729,7 @@ void WindowSwitcher::startThumbnailCaptures() {
     queued[index] = true;
     const WindowSwitcherEntry& entry = m_windows[index];
     const std::string key = identityKeyForEntry(entry);
-    if (!key.empty() && entry.captureHandle != 0) {
+    if (!key.empty() && entry.captureHandle != 0 && entry.thumbnail == nullptr) {
       m_thumbnailQueue.push_back(ThumbnailRequest{.windowKey = key, .captureHandle = entry.captureHandle});
     }
   };
